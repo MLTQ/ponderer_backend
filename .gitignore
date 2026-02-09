@@ -1,0 +1,9 @@
+# Configuration files with API keys
+ponderer_config.toml
+
+# Cargo build artifacts
+target/
+Cargo.lock
+
+# Database files
+*.db

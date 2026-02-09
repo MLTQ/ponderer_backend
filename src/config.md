@@ -1,0 +1,44 @@
+# config.rs
+
+## Purpose
+Defines all configuration for the Ponderer agent, including LLM connection, identity, polling behavior, image generation (ComfyUI), character card fields, and self-reflection settings. Supports loading from TOML files with environment variable fallback.
+
+## Components
+
+### `AgentConfig`
+- **Does**: Top-level config struct holding all runtime settings (LLM, Graphchan, identity, reflection, image gen, character, avatars)
+- **Interacts with**: `main.rs` (loaded at startup), `agent::Agent` (drives behavior), `ui::app::AgentApp` (display/edit)
+
+### `AgentConfig::load()`
+- **Does**: Loads config from `ponderer_config.toml` next to the executable, falls back to `agent_config.toml`, then environment variables
+- **Rationale**: Supports portable deployment (config travels with binary) and backward compatibility with legacy config filenames
+
+### `AgentConfig::save()`
+- **Does**: Serializes config to `ponderer_config.toml` via `toml::to_string_pretty`
+- **Interacts with**: UI settings panel for persisting changes
+
+### `AgentConfig::from_env()`
+- **Does**: Populates config from environment variables (`GRAPHCHAN_API_URL`, `LLM_API_URL`, `LLM_MODEL`, `LLM_API_KEY`, `AGENT_CHECK_INTERVAL`, `AGENT_NAME`)
+- **Rationale**: Legacy support for env-var-only configuration
+
+### `ComfyUIConfig`
+- **Does**: Holds ComfyUI connection and generation parameters (model, dimensions, sampler, scheduler, CFG, steps)
+- **Interacts with**: `comfy_client.rs`, `agent::image_gen`
+
+### `RespondTo`
+- **Does**: Controls response behavior (`response_type`: "all" or "selective") with optional separate `decision_model`
+- **Interacts with**: `agent::reasoning` for deciding whether to reply
+
+## Contracts
+
+| Dependent | Expects | Breaking changes |
+|-----------|---------|------------------|
+| `main.rs` | `AgentConfig::load()` returns valid config | Changing `load()` return type |
+| `agent::Agent` | Fields: `llm_api_url`, `llm_model`, `llm_api_key`, `system_prompt`, `poll_interval_secs`, `enable_self_reflection`, `enable_image_generation`, `guiding_principles` | Renaming/removing any of these fields |
+| `comfy_client.rs` | `comfyui.api_url` is a valid HTTP URL | Changing `ComfyUIConfig` structure |
+| TOML file | Serde field names and aliases (`agent_name` -> `username`, `check_interval_seconds` -> `poll_interval_secs`) | Removing serde aliases breaks existing config files |
+
+## Notes
+- Config path resolution uses `current_exe().parent()`, so the config file must sit next to the binary.
+- Default LLM is `llama3.2` at `localhost:11434` (Ollama).
+- Default Graphchan URL derives from `GRAPHCHAN_PORT` env var if set.
