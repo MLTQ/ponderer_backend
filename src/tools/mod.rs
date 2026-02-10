@@ -9,7 +9,10 @@
 //! function definitions for the LLM.
 
 pub mod agentic;
+pub mod approval;
+pub mod files;
 pub mod safety;
+pub mod shell;
 
 use anyhow::Result;
 use async_trait::async_trait;

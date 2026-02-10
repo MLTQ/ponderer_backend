@@ -57,9 +57,20 @@ fn main() {
 
     tracing::info!("Loaded {} skill(s)", skill_list.len());
 
-    // Create tool registry (tools will be registered by the agent or added later)
+    // Create tool registry and register built-in tools
     let tool_registry = Arc::new(ToolRegistry::new());
-    tracing::info!("Tool registry initialized");
+    {
+        use tools::{shell::ShellTool, files::{ReadFileTool, WriteFileTool, ListDirectoryTool, PatchFileTool}};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            tool_registry.register(Arc::new(ShellTool::new())).await;
+            tool_registry.register(Arc::new(ReadFileTool::new())).await;
+            tool_registry.register(Arc::new(WriteFileTool::new())).await;
+            tool_registry.register(Arc::new(ListDirectoryTool::new())).await;
+            tool_registry.register(Arc::new(PatchFileTool::new())).await;
+        });
+    }
+    tracing::info!("Tool registry initialized with 5 built-in tools");
 
     // Create event channel
     let (event_tx, event_rx) = flume::unbounded();
