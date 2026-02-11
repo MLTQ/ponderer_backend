@@ -99,10 +99,23 @@ pub struct CharacterCard {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: String,
+    pub conversation_id: String,
     pub role: String, // "operator" or "agent"
     pub content: String,
     pub created_at: DateTime<Utc>,
     pub processed: bool, // Has the agent seen/responded to this?
+}
+
+pub const DEFAULT_CHAT_CONVERSATION_ID: &str = "default";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatConversation {
+    pub id: String,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub message_count: usize,
+    pub last_message_at: Option<DateTime<Utc>>,
 }
 
 pub struct AgentDatabase {
@@ -136,6 +149,42 @@ impl AgentDatabase {
         if self.get_memory_design_version()?.is_none() {
             self.set_memory_design_version(&self.memory_backend.design_version())?;
         }
+        Ok(())
+    }
+
+    fn ensure_chat_messages_conversation_column(&self, conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(chat_messages)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        if !columns.iter().any(|name| name == "conversation_id") {
+            conn.execute(
+                "ALTER TABLE chat_messages ADD COLUMN conversation_id TEXT NOT NULL DEFAULT 'default'",
+                [],
+            )?;
+        }
+
+        conn.execute(
+            "UPDATE chat_messages SET conversation_id = ?1 WHERE conversation_id IS NULL OR TRIM(conversation_id) = ''",
+            [DEFAULT_CHAT_CONVERSATION_ID],
+        )?;
+
+        Ok(())
+    }
+
+    fn ensure_default_chat_conversation(&self, conn: &Connection) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_conversations (id, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                DEFAULT_CHAT_CONVERSATION_ID,
+                "Default chat",
+                now.clone(),
+                now
+            ],
+        )?;
         Ok(())
     }
 
@@ -291,6 +340,17 @@ impl AgentDatabase {
             [],
         )?;
 
+        // Conversation metadata for private operator chat
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS chat_conversations (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"#,
+            [],
+        )?;
+
         // Private chat between operator and agent
         conn.execute(
             r#"CREATE TABLE IF NOT EXISTS chat_messages (
@@ -303,10 +363,18 @@ impl AgentDatabase {
             [],
         )?;
 
+        self.ensure_chat_messages_conversation_column(&conn)?;
+
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at ASC)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_created_at ON chat_messages(conversation_id, created_at ASC)",
+            [],
+        )?;
+
+        self.ensure_default_chat_conversation(&conn)?;
 
         Ok(())
     }
@@ -1108,20 +1176,135 @@ impl AgentDatabase {
 
     /// Add a chat message
     pub fn add_chat_message(&self, role: &str, content: &str) -> Result<String> {
+        self.add_chat_message_in_conversation(DEFAULT_CHAT_CONVERSATION_ID, role, content)
+    }
+
+    /// Add a chat message to a specific conversation.
+    pub fn add_chat_message_in_conversation(
+        &self,
+        conversation_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
+        let conversation_id = if conversation_id.trim().is_empty() {
+            DEFAULT_CHAT_CONVERSATION_ID
+        } else {
+            conversation_id.trim()
+        };
+        let now = Utc::now().to_rfc3339();
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO chat_messages (id, role, content, created_at, processed) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, role, content, Utc::now().to_rfc3339(), 0],
+            "INSERT OR IGNORE INTO chat_conversations (id, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![conversation_id, "Conversation", now.clone(), now.clone()],
+        )?;
+        conn.execute(
+            "INSERT INTO chat_messages (id, conversation_id, role, content, created_at, processed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, conversation_id, role, content, now.clone(), 0],
+        )?;
+        conn.execute(
+            "UPDATE chat_conversations
+             SET updated_at = ?2
+             WHERE id = ?1",
+            params![conversation_id, now],
         )?;
         Ok(id)
+    }
+
+    /// Create a new conversation and return it.
+    pub fn create_chat_conversation(&self, title: Option<&str>) -> Result<ChatConversation> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let title = title
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Chat {}", now.format("%Y-%m-%d %H:%M")));
+
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO chat_conversations (id, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, title, now_str.clone(), now_str],
+        )?;
+
+        Ok(ChatConversation {
+            id,
+            title,
+            created_at: now,
+            updated_at: now,
+            message_count: 0,
+            last_message_at: None,
+        })
+    }
+
+    /// List recent conversations, newest activity first.
+    pub fn list_chat_conversations(&self, limit: usize) -> Result<Vec<ChatConversation>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT
+                   c.id,
+                   c.title,
+                   c.created_at,
+                   c.updated_at,
+                   COUNT(m.id) as message_count,
+                   MAX(m.created_at) as last_message_at
+               FROM chat_conversations c
+               LEFT JOIN chat_messages m ON m.conversation_id = c.id
+               GROUP BY c.id
+               ORDER BY COALESCE(MAX(m.created_at), c.updated_at) DESC
+               LIMIT ?1"#,
+        )?;
+
+        let conversations = stmt
+            .query_map([limit], |row| {
+                let created_at_str: String = row.get(2)?;
+                let updated_at_str: String = row.get(3)?;
+                let last_message_at_str: Option<String> = row.get(5)?;
+                let message_count = row.get::<_, i64>(4)? as usize;
+
+                Ok(ChatConversation {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    created_at: created_at_str.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    updated_at: updated_at_str.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    message_count,
+                    last_message_at: match last_message_at_str {
+                        Some(v) => Some(v.parse().map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?),
+                        None => None,
+                    },
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(conversations)
     }
 
     /// Get unprocessed messages from the operator
     pub fn get_unprocessed_operator_messages(&self) -> Result<Vec<ChatMessage>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, role, content, created_at, processed FROM chat_messages
+            "SELECT id, conversation_id, role, content, created_at, processed FROM chat_messages
              WHERE role = 'operator' AND processed = 0
              ORDER BY created_at ASC",
         )?;
@@ -1130,16 +1313,17 @@ impl AgentDatabase {
             .query_map([], |row| {
                 Ok(ChatMessage {
                     id: row.get(0)?,
-                    role: row.get(1)?,
-                    content: row.get(2)?,
-                    created_at: row.get::<_, String>(3)?.parse().map_err(|e| {
+                    conversation_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    created_at: row.get::<_, String>(4)?.parse().map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            3,
+                            4,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
                     })?,
-                    processed: row.get::<_, i64>(4)? != 0,
+                    processed: row.get::<_, i64>(5)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1158,7 +1342,7 @@ impl AgentDatabase {
     pub fn get_chat_history(&self, limit: usize) -> Result<Vec<ChatMessage>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, role, content, created_at, processed FROM chat_messages
+            "SELECT id, conversation_id, role, content, created_at, processed FROM chat_messages
              ORDER BY created_at DESC
              LIMIT ?1",
         )?;
@@ -1167,16 +1351,54 @@ impl AgentDatabase {
             .query_map([limit], |row| {
                 Ok(ChatMessage {
                     id: row.get(0)?,
-                    role: row.get(1)?,
-                    content: row.get(2)?,
-                    created_at: row.get::<_, String>(3)?.parse().map_err(|e| {
+                    conversation_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    created_at: row.get::<_, String>(4)?.parse().map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            3,
+                            4,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
                     })?,
-                    processed: row.get::<_, i64>(4)? != 0,
+                    processed: row.get::<_, i64>(5)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Reverse to get chronological order
+        Ok(messages.into_iter().rev().collect())
+    }
+
+    /// Get recent chat history for one conversation (chronological order).
+    pub fn get_chat_history_for_conversation(
+        &self,
+        conversation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ChatMessage>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, role, content, created_at, processed FROM chat_messages
+             WHERE conversation_id = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+
+        let messages = stmt
+            .query_map(params![conversation_id, limit], |row| {
+                Ok(ChatMessage {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    created_at: row.get::<_, String>(4)?.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    processed: row.get::<_, i64>(5)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1188,6 +1410,20 @@ impl AgentDatabase {
     /// Get chat history as formatted string for context
     pub fn get_chat_context(&self, limit: usize) -> Result<String> {
         let messages = self.get_chat_history(limit)?;
+        Self::format_chat_context(messages)
+    }
+
+    /// Get chat history as formatted string for one conversation.
+    pub fn get_chat_context_for_conversation(
+        &self,
+        conversation_id: &str,
+        limit: usize,
+    ) -> Result<String> {
+        let messages = self.get_chat_history_for_conversation(conversation_id, limit)?;
+        Self::format_chat_context(messages)
+    }
+
+    fn format_chat_context(messages: Vec<ChatMessage>) -> Result<String> {
         if messages.is_empty() {
             return Ok(String::new());
         }

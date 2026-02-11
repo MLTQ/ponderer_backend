@@ -1,62 +1,84 @@
 use eframe::egui::{self, Color32, RichText, ScrollArea};
+use serde::Deserialize;
 
 use crate::agent::AgentEvent;
 use crate::database::ChatMessage;
 
-pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
-    ScrollArea::vertical()
-        .stick_to_bottom(true)
-        .max_height(ui.available_height() - 60.0)
-        .show(ui, |ui| {
-            if events.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("Waiting for agent activity...")
-                            .weak()
-                            .italics(),
-                    );
-                });
-                return;
-            }
+const CHAT_TOOL_BLOCK_START: &str = "[tool_calls]";
+const CHAT_TOOL_BLOCK_END: &str = "[/tool_calls]";
+const CHAT_THINKING_BLOCK_START: &str = "[thinking]";
+const CHAT_THINKING_BLOCK_END: &str = "[/thinking]";
 
-            for event in events {
-                match event {
-                    AgentEvent::Observation(text) => {
-                        ui.label(RichText::new(text).color(Color32::LIGHT_BLUE));
-                        ui.add_space(4.0);
-                    }
-                    AgentEvent::ReasoningTrace(steps) => {
-                        ui.group(|ui| {
-                            ui.label(RichText::new("💭 Reasoning:").strong());
-                            for step in steps {
-                                ui.label(
-                                    RichText::new(format!("  • {}", step)).color(Color32::GRAY),
-                                );
-                            }
-                        });
-                        ui.add_space(6.0);
-                    }
-                    AgentEvent::ActionTaken { action, result } => {
-                        ui.label(
-                            RichText::new(format!("✅ {}: {}", action, result))
-                                .color(Color32::GREEN),
-                        );
-                        ui.add_space(4.0);
-                    }
-                    AgentEvent::Error(e) => {
-                        ui.label(RichText::new(format!("❌ Error: {}", e)).color(Color32::RED));
-                        ui.add_space(4.0);
-                    }
-                    AgentEvent::StateChanged(_) => {
-                        // State changes are shown in header, not in log
-                    }
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ChatToolCallDetail {
+    tool_name: String,
+    arguments_preview: String,
+    output_kind: String,
+    output_preview: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChatRenderPayload {
+    display_content: String,
+    tool_details: Vec<ChatToolCallDetail>,
+    thinking_details: Vec<String>,
+}
+
+pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
+    ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+        if events.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("Waiting for agent activity...")
+                        .weak()
+                        .italics(),
+                );
+            });
+            return;
+        }
+
+        for event in events {
+            match event {
+                AgentEvent::Observation(text) => {
+                    ui.label(RichText::new(text).color(Color32::LIGHT_BLUE));
+                    ui.add_space(4.0);
+                }
+                AgentEvent::ReasoningTrace(steps) => {
+                    ui.group(|ui| {
+                        ui.label(RichText::new("💭 Reasoning:").strong());
+                        for step in steps {
+                            ui.label(RichText::new(format!("  • {}", step)).color(Color32::GRAY));
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+                AgentEvent::ActionTaken { action, result } => {
+                    ui.label(
+                        RichText::new(format!("✅ {}: {}", action, result)).color(Color32::GREEN),
+                    );
+                    ui.add_space(4.0);
+                }
+                AgentEvent::Error(e) => {
+                    ui.label(RichText::new(format!("❌ Error: {}", e)).color(Color32::RED));
+                    ui.add_space(4.0);
+                }
+                AgentEvent::StateChanged(_) => {
+                    // State changes are shown in header, not in log
+                }
+                AgentEvent::ChatStreaming { .. } => {
+                    // Streaming text is rendered in the chat pane, not activity log.
                 }
             }
-        });
+        }
+    });
 }
 
 /// Render the private chat interface between operator and agent
-pub fn render_private_chat(ui: &mut egui::Ui, messages: &[ChatMessage]) {
+pub fn render_private_chat(
+    ui: &mut egui::Ui,
+    messages: &[ChatMessage],
+    streaming_preview: Option<&str>,
+) {
     ui.heading("Private Chat");
     ui.add_space(4.0);
     ui.label(
@@ -66,9 +88,11 @@ pub fn render_private_chat(ui: &mut egui::Ui, messages: &[ChatMessage]) {
     );
     ui.add_space(8.0);
 
+    // Reserve room for the composer section rendered below this panel in app.rs.
+    let chat_scroll_height = (ui.available_height() - 140.0).max(120.0);
     ScrollArea::vertical()
         .stick_to_bottom(true)
-        .max_height(ui.available_height() - 60.0)
+        .max_height(chat_scroll_height)
         .show(ui, |ui| {
             if messages.is_empty() {
                 ui.centered_and_justified(|ui| {
@@ -86,57 +110,357 @@ pub fn render_private_chat(ui: &mut egui::Ui, messages: &[ChatMessage]) {
             for msg in messages {
                 let is_operator = msg.role == "operator";
                 let time_str = msg.created_at.format("%H:%M").to_string();
+                let payload = parse_chat_payload(&msg.content);
+                let row_width = ui.available_width();
+                let max_bubble_width = row_width * 0.7;
+                let row_layout = if is_operator {
+                    egui::Layout::right_to_left(egui::Align::TOP)
+                } else {
+                    egui::Layout::left_to_right(egui::Align::TOP)
+                };
 
-                ui.horizontal(|ui| {
-                    if is_operator {
-                        // Operator message - right aligned (using indentation)
-                        ui.add_space(ui.available_width() * 0.3);
-                    }
-
-                    ui.group(|ui| {
-                        ui.set_max_width(ui.available_width() * 0.7);
-
-                        let (role_label, role_color, bg_color) = if is_operator {
-                            (
-                                "You",
-                                Color32::from_rgb(100, 149, 237),
-                                Color32::from_rgb(30, 40, 60),
-                            )
-                        } else {
-                            (
-                                "Agent",
-                                Color32::from_rgb(144, 238, 144),
-                                Color32::from_rgb(30, 50, 40),
-                            )
-                        };
-
-                        ui.visuals_mut().widgets.noninteractive.bg_fill = bg_color;
-
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(role_label).color(role_color).strong());
-                            ui.label(RichText::new(time_str).weak().small());
-                        });
-
-                        ui.label(&msg.content);
-
-                        // Show processing status for operator messages
-                        if is_operator && !msg.processed {
-                            ui.label(
-                                RichText::new("⏳ Waiting for agent...")
-                                    .weak()
-                                    .small()
-                                    .italics(),
-                            );
-                        }
-                    });
-
-                    if !is_operator {
-                        // Agent message - left aligned (add space on right)
-                        ui.add_space(ui.available_width());
-                    }
+                ui.allocate_ui_with_layout(egui::vec2(row_width, 0.0), row_layout, |ui| {
+                    render_chat_message_bubble(
+                        ui,
+                        msg,
+                        &time_str,
+                        &payload,
+                        is_operator,
+                        max_bubble_width,
+                    );
                 });
 
                 ui.add_space(8.0);
             }
+
+            if let Some(preview) = streaming_preview {
+                let trimmed = preview.trim();
+                if !trimmed.is_empty() {
+                    let row_width = ui.available_width();
+                    let max_bubble_width = row_width * 0.7;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(row_width, 0.0),
+                        egui::Layout::left_to_right(egui::Align::TOP),
+                        |ui| {
+                            render_streaming_preview_bubble(ui, trimmed, max_bubble_width);
+                        },
+                    );
+                    ui.add_space(8.0);
+                }
+            }
         });
+}
+
+fn render_chat_message_bubble(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    time_str: &str,
+    payload: &ChatRenderPayload,
+    is_operator: bool,
+    max_bubble_width: f32,
+) {
+    ui.group(|ui| {
+        ui.set_max_width(max_bubble_width);
+        ui.set_width(max_bubble_width);
+        let wrap_token_len = max_token_len_for_width(max_bubble_width);
+
+        let (role_label, role_color, bg_color) = if is_operator {
+            (
+                "You",
+                Color32::from_rgb(100, 149, 237),
+                Color32::from_rgb(30, 40, 60),
+            )
+        } else {
+            (
+                "Agent",
+                Color32::from_rgb(144, 238, 144),
+                Color32::from_rgb(30, 50, 40),
+            )
+        };
+
+        ui.visuals_mut().widgets.noninteractive.bg_fill = bg_color;
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(role_label).color(role_color).strong());
+            ui.label(RichText::new(time_str).weak().small());
+        });
+
+        ui.label(force_wrap_long_tokens(
+            payload.display_content.as_str(),
+            wrap_token_len,
+        ));
+
+        let has_thinking = !payload.thinking_details.is_empty();
+        let has_tool_calls = !payload.tool_details.is_empty();
+
+        if has_thinking || has_tool_calls {
+            ui.add_space(4.0);
+            if has_thinking && has_tool_calls {
+                ui.columns(2, |cols| {
+                    let col_wrap_len = max_token_len_for_width(cols[0].available_width());
+                    render_thinking_panel(
+                        &mut cols[0],
+                        &msg.id,
+                        &payload.thinking_details,
+                        col_wrap_len,
+                    );
+                    render_tool_calls_panel(
+                        &mut cols[1],
+                        &msg.id,
+                        &payload.tool_details,
+                        col_wrap_len,
+                    );
+                });
+            } else if has_thinking {
+                render_thinking_panel(ui, &msg.id, &payload.thinking_details, wrap_token_len);
+            } else {
+                render_tool_calls_panel(ui, &msg.id, &payload.tool_details, wrap_token_len);
+            }
+        }
+
+        // Show processing status for operator messages
+        if is_operator && !msg.processed {
+            ui.label(
+                RichText::new("⏳ Waiting for agent...")
+                    .weak()
+                    .small()
+                    .italics(),
+            );
+        }
+    });
+}
+
+fn render_thinking_panel(
+    ui: &mut egui::Ui,
+    message_id: &str,
+    thinking_details: &[String],
+    wrap_token_len: usize,
+) {
+    egui::CollapsingHeader::new(format!("Thinking ({})", thinking_details.len()))
+        .id_salt((message_id, "thinking"))
+        .default_open(false)
+        .show(ui, |ui| {
+            for thought in thinking_details {
+                ui.group(|ui| {
+                    ui.monospace(force_wrap_long_tokens(thought.trim(), wrap_token_len));
+                });
+                ui.add_space(4.0);
+            }
+        });
+}
+
+fn render_tool_calls_panel(
+    ui: &mut egui::Ui,
+    message_id: &str,
+    tool_details: &[ChatToolCallDetail],
+    wrap_token_len: usize,
+) {
+    egui::CollapsingHeader::new(format!("Tool calls ({})", tool_details.len()))
+        .id_salt((message_id, "tool_calls"))
+        .default_open(false)
+        .show(ui, |ui| {
+            for detail in tool_details {
+                ui.group(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} [{}]", detail.tool_name, detail.output_kind))
+                            .strong(),
+                    );
+                    if !detail.arguments_preview.trim().is_empty() {
+                        ui.label(
+                            RichText::new("Arguments")
+                                .small()
+                                .color(Color32::LIGHT_BLUE),
+                        );
+                        ui.monospace(force_wrap_long_tokens(
+                            detail.arguments_preview.trim(),
+                            wrap_token_len,
+                        ));
+                    }
+                    if !detail.output_preview.trim().is_empty() {
+                        ui.label(RichText::new("Output").small().color(Color32::LIGHT_GREEN));
+                        ui.monospace(force_wrap_long_tokens(
+                            detail.output_preview.trim(),
+                            wrap_token_len,
+                        ));
+                    }
+                });
+                ui.add_space(4.0);
+            }
+        });
+}
+
+fn render_streaming_preview_bubble(ui: &mut egui::Ui, preview: &str, max_bubble_width: f32) {
+    ui.group(|ui| {
+        ui.set_max_width(max_bubble_width);
+        ui.set_width(max_bubble_width);
+        let wrap_token_len = max_token_len_for_width(max_bubble_width);
+        ui.visuals_mut().widgets.noninteractive.bg_fill = Color32::from_rgb(30, 50, 40);
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Agent")
+                    .color(Color32::from_rgb(144, 238, 144))
+                    .strong(),
+            );
+            ui.label(RichText::new("live").weak().small().italics());
+        });
+
+        ui.label(force_wrap_long_tokens(preview, wrap_token_len));
+    });
+}
+
+fn max_token_len_for_width(width: f32) -> usize {
+    // Rough monospace-ish estimate to keep long unbroken tokens from expanding bubbles.
+    ((width / 7.5).floor() as usize).clamp(20, 140)
+}
+
+fn force_wrap_long_tokens(input: &str, max_token_len: usize) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut run_len = 0usize;
+
+    for ch in input.chars() {
+        if ch.is_whitespace() {
+            run_len = 0;
+            out.push(ch);
+            continue;
+        }
+
+        if run_len >= max_token_len {
+            out.push('\n');
+            run_len = 0;
+        }
+
+        out.push(ch);
+        run_len += 1;
+    }
+
+    out
+}
+
+fn parse_chat_payload(content: &str) -> ChatRenderPayload {
+    let (without_tools, raw_tools) =
+        extract_block(content, CHAT_TOOL_BLOCK_START, CHAT_TOOL_BLOCK_END);
+    let tool_details = raw_tools
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<ChatToolCallDetail>>(raw).ok())
+        .unwrap_or_default();
+
+    let (without_block_thinking, raw_thinking) = extract_block(
+        &without_tools,
+        CHAT_THINKING_BLOCK_START,
+        CHAT_THINKING_BLOCK_END,
+    );
+    let mut thinking_details = raw_thinking
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default();
+
+    let (display_content, inline_thinking) = strip_inline_thinking_tags(&without_block_thinking);
+    thinking_details.extend(inline_thinking);
+
+    ChatRenderPayload {
+        display_content: display_content.trim().to_string(),
+        tool_details,
+        thinking_details,
+    }
+}
+
+fn extract_block(content: &str, start_marker: &str, end_marker: &str) -> (String, Option<String>) {
+    let Some(start_idx) = content.find(start_marker) else {
+        return (content.to_string(), None);
+    };
+    let after_start = start_idx + start_marker.len();
+    let remaining = &content[after_start..];
+    let Some(relative_end) = remaining.find(end_marker) else {
+        return (content.to_string(), None);
+    };
+    let end_idx = after_start + relative_end;
+    let full_end = end_idx + end_marker.len();
+
+    let mut cleaned = String::new();
+    cleaned.push_str(content[..start_idx].trim_end());
+    if full_end < content.len() {
+        let suffix = content[full_end..].trim_start();
+        if !suffix.is_empty() {
+            if !cleaned.is_empty() {
+                cleaned.push('\n');
+            }
+            cleaned.push_str(suffix);
+        }
+    }
+
+    let raw = remaining[..relative_end].trim().to_string();
+    (cleaned, Some(raw))
+}
+
+fn strip_inline_thinking_tags(content: &str) -> (String, Vec<String>) {
+    fn strip_tag(text: String, open_tag: &str, close_tag: &str) -> (String, Vec<String>) {
+        let mut rest = text;
+        let mut extracted = Vec::new();
+
+        while let Some(start) = rest.find(open_tag) {
+            let inner_start = start + open_tag.len();
+            if let Some(rel_end) = rest[inner_start..].find(close_tag) {
+                let end = inner_start + rel_end;
+                let thought = rest[inner_start..end].trim();
+                if !thought.is_empty() {
+                    extracted.push(thought.to_string());
+                }
+                rest.replace_range(start..end + close_tag.len(), "");
+            } else {
+                let thought = rest[inner_start..].trim();
+                if !thought.is_empty() {
+                    extracted.push(thought.to_string());
+                }
+                rest.replace_range(start..rest.len(), "");
+            }
+        }
+
+        (rest, extracted)
+    }
+
+    let (without_thinking, mut thoughts_a) =
+        strip_tag(content.to_string(), "<thinking>", "</thinking>");
+    let (without_think, mut thoughts_b) = strip_tag(without_thinking, "<think>", "</think>");
+    thoughts_a.append(&mut thoughts_b);
+    (without_think, thoughts_a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_embedded_tool_details() {
+        let content = "Done.\n\n[tool_calls]\n[{\"tool_name\":\"shell\",\"arguments_preview\":\"{}\",\"output_kind\":\"text\",\"output_preview\":\"ok\"}]\n[/tool_calls]";
+        let payload = parse_chat_payload(content);
+        assert_eq!(payload.display_content, "Done.");
+        assert_eq!(payload.tool_details.len(), 1);
+        assert_eq!(payload.tool_details[0].tool_name, "shell");
+    }
+
+    #[test]
+    fn leaves_plain_message_unchanged() {
+        let content = "Hello there";
+        let payload = parse_chat_payload(content);
+        assert_eq!(payload.display_content, "Hello there");
+        assert!(payload.tool_details.is_empty());
+        assert!(payload.thinking_details.is_empty());
+    }
+
+    #[test]
+    fn parses_embedded_thinking_block() {
+        let content = "Answer\n\n[thinking]\n[\"step one\",\"step two\"]\n[/thinking]";
+        let payload = parse_chat_payload(content);
+        assert_eq!(payload.display_content, "Answer");
+        assert_eq!(payload.thinking_details.len(), 2);
+    }
+
+    #[test]
+    fn strips_inline_thinking_tags() {
+        let content = "<think>internal</think>\nVisible";
+        let payload = parse_chat_payload(content);
+        assert_eq!(payload.display_content, "Visible");
+        assert_eq!(payload.thinking_details, vec!["internal"]);
+    }
 }

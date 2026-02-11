@@ -441,15 +441,16 @@ fn extract_json(response: &str) -> Result<String> {
 fn strip_thinking_tags(text: &str) -> String {
     let mut result = text.to_string();
 
-    // Strip <think>...</think> tags (DeepSeek, R1, etc.)
-    while let Some(start) = result.find("<think>") {
-        if let Some(end) = result[start..].find("</think>") {
-            let end_pos = start + end + "</think>".len();
-            result.replace_range(start..end_pos, "");
-        } else {
-            // No closing tag found - just remove the opening tag and continue
-            // This allows JSON that comes after an unclosed tag to still be extracted
-            result.replace_range(start..start + "<think>".len(), "");
+    // Strip both <thinking>...</thinking> and <think>...</think> variants.
+    for (open_tag, close_tag) in [("<thinking>", "</thinking>"), ("<think>", "</think>")] {
+        while let Some(start) = result.find(open_tag) {
+            if let Some(end) = result[start..].find(close_tag) {
+                let end_pos = start + end + close_tag.len();
+                result.replace_range(start..end_pos, "");
+            } else {
+                // No closing tag found - just remove the opening tag and continue.
+                result.replace_range(start..start + open_tag.len(), "");
+            }
         }
     }
 
@@ -785,5 +786,15 @@ The JSON is: {"action": "reply", "post_id": "456", "content": "test", "reasoning
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["action"], "reply");
         assert_eq!(parsed["post_id"], "456");
+    }
+
+    #[test]
+    fn test_strip_thinking_variant_tags() {
+        let input = r#"<thinking>Private scratch</thinking>
+{"action": "none", "reasoning": ["done"]}"#;
+
+        let result = extract_json(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["action"], "none");
     }
 }

@@ -6,6 +6,7 @@ pub mod trajectory;
 use anyhow::Result;
 use chrono::{Duration as ChronoDuration, Utc};
 use flume::Sender;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -21,12 +22,18 @@ use crate::memory::eval::{
 };
 use crate::memory::WorkingMemoryEntry;
 use crate::skills::{Skill, SkillContext, SkillEvent};
-use crate::tools::agentic::{AgenticConfig, AgenticLoop};
-use crate::tools::ToolContext;
+use crate::tools::agentic::{AgenticConfig, AgenticLoop, ToolCallRecord};
 use crate::tools::ToolRegistry;
+use crate::tools::{ToolContext, ToolOutput};
 
 const HEARTBEAT_LAST_RUN_STATE_KEY: &str = "heartbeat_last_run_at";
 const MEMORY_EVOLUTION_LAST_RUN_STATE_KEY: &str = "memory_evolution_last_run_at";
+const CHAT_TOOL_BLOCK_START: &str = "[tool_calls]";
+const CHAT_TOOL_BLOCK_END: &str = "[/tool_calls]";
+const CHAT_THINKING_BLOCK_START: &str = "[thinking]";
+const CHAT_THINKING_BLOCK_END: &str = "[/thinking]";
+const CHAT_CONTINUE_MARKER: &str = "[CONTINUE]";
+const CHAT_MAX_AUTONOMOUS_TURNS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub enum AgentVisualState {
@@ -44,7 +51,15 @@ pub enum AgentEvent {
     StateChanged(AgentVisualState),
     Observation(String),
     ReasoningTrace(Vec<String>),
-    ActionTaken { action: String, result: String },
+    ChatStreaming {
+        conversation_id: String,
+        content: String,
+        done: bool,
+    },
+    ActionTaken {
+        action: String,
+        result: String,
+    },
     Error(String),
 }
 
@@ -538,6 +553,14 @@ impl Agent {
                     .trim()
                     .to_string();
                 let no_action = summary.eq_ignore_ascii_case("NO_ACTION");
+
+                if !result.thinking_blocks.is_empty() {
+                    self.emit(AgentEvent::ReasoningTrace(vec![format!(
+                        "Heartbeat model emitted {} thinking block(s) (hidden from summary)",
+                        result.thinking_blocks.len()
+                    )]))
+                    .await;
+                }
 
                 if no_action && result.tool_calls_made.is_empty() {
                     tracing::debug!("Heartbeat completed with no action");
@@ -1154,88 +1177,215 @@ impl Agent {
             return Ok(());
         }
 
+        let mut messages_by_conversation: Vec<(String, Vec<crate::database::ChatMessage>)> =
+            Vec::new();
+        for msg in unprocessed_messages {
+            let conversation_id = msg.conversation_id.clone();
+            if let Some((_, bucket)) = messages_by_conversation
+                .iter_mut()
+                .find(|(id, _)| id == &conversation_id)
+            {
+                bucket.push(msg);
+            } else {
+                messages_by_conversation.push((conversation_id, vec![msg]));
+            }
+        }
+
+        let total_messages = messages_by_conversation
+            .iter()
+            .map(|(_, msgs)| msgs.len())
+            .sum::<usize>();
+
         self.emit(AgentEvent::Observation(format!(
-            "Processing {} private message(s) from operator...",
-            unprocessed_messages.len()
+            "Processing {} private message(s) across {} conversation(s)...",
+            total_messages,
+            messages_by_conversation.len()
         )))
         .await;
         self.set_state(AgentVisualState::Thinking).await;
 
-        // Get working memory context
-        let working_memory_context = {
+        let (working_memory_context, llm_api_url, llm_model, llm_api_key, system_prompt, username) = {
             let db_lock = self.database.read().await;
-            if let Some(ref db) = *db_lock {
+            let wm = if let Some(ref db) = *db_lock {
                 db.get_working_memory_context().unwrap_or_default()
             } else {
                 String::new()
+            };
+
+            let config = self.config.read().await;
+            (
+                wm,
+                config.llm_api_url.clone(),
+                config.llm_model.clone(),
+                config.llm_api_key.clone(),
+                config.system_prompt.clone(),
+                config.username.clone(),
+            )
+        };
+
+        let loop_config = AgenticConfig {
+            max_iterations: 10,
+            api_url: agentic_api_url(&llm_api_url),
+            model: llm_model,
+            api_key: llm_api_key,
+            temperature: 0.35,
+            max_tokens: 2048,
+        };
+        let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
+        let tool_ctx = ToolContext {
+            working_directory: std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".to_string()),
+            username,
+            autonomous: false,
+        };
+
+        let chat_system_prompt = format!(
+            "{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort. Do not hand control back early.\nIf work remains and you can continue without user clarification, begin your response with {} followed by a short status update.\nOnly provide a normal operator-facing final response when complete or blocked on missing user input.",
+            system_prompt,
+            CHAT_CONTINUE_MARKER
+        );
+
+        for (conversation_id, conversation_messages) in messages_by_conversation {
+            {
+                let db_lock = self.database.read().await;
+                if let Some(ref db) = *db_lock {
+                    for msg in &conversation_messages {
+                        if let Err(e) = db.mark_message_processed(&msg.id) {
+                            tracing::warn!("Failed to mark message as processed: {}", e);
+                        }
+                    }
+                }
             }
-        };
 
-        // Process the chat messages with the LLM
-        let decision = {
-            let reasoning = self.reasoning.read().await;
-            reasoning
-                .process_chat(&unprocessed_messages, &working_memory_context)
-                .await?
-        };
+            let mut pending_messages = conversation_messages.clone();
 
-        match decision {
-            reasoning::Decision::ChatReply {
-                content,
-                reasoning,
-                memory_update,
-            } => {
-                self.emit(AgentEvent::ReasoningTrace(reasoning)).await;
+            for turn in 1..=CHAT_MAX_AUTONOMOUS_TURNS {
+                let recent_chat_context = {
+                    let db_lock = self.database.read().await;
+                    if let Some(ref db) = *db_lock {
+                        db.get_chat_context_for_conversation(&conversation_id, 20)
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                };
 
-                // Save the agent's response to the chat
+                let user_message = build_private_chat_agentic_prompt(
+                    &pending_messages,
+                    &working_memory_context,
+                    &recent_chat_context,
+                );
+                let event_tx = self.event_tx.clone();
+                let stream_conversation_id = conversation_id.clone();
+                let stream_callback = move |content: &str, done: bool| {
+                    let _ = event_tx.send(AgentEvent::ChatStreaming {
+                        conversation_id: stream_conversation_id.clone(),
+                        content: content.to_string(),
+                        done,
+                    });
+                };
+
+                let result = agentic_loop
+                    .run_with_history_streaming(
+                        &chat_system_prompt,
+                        vec![],
+                        &user_message,
+                        &tool_ctx,
+                        &stream_callback,
+                    )
+                    .await?;
+
+                let base_response = result.response.unwrap_or_else(|| {
+                    if result.tool_calls_made.is_empty() {
+                        "I do not have a useful response yet.".to_string()
+                    } else {
+                        "I ran tools for your request. Details are attached below.".to_string()
+                    }
+                });
+                let tool_count = result.tool_calls_made.len();
+
+                let continuation_status = parse_continue_status(&base_response);
+                let should_continue =
+                    continuation_status.is_some() && turn < CHAT_MAX_AUTONOMOUS_TURNS;
+                let operator_visible_response = continuation_status
+                    .clone()
+                    .unwrap_or_else(|| base_response.clone());
+
+                let chat_content = format_chat_message_with_metadata(
+                    &operator_visible_response,
+                    &result.tool_calls_made,
+                    &result.thinking_blocks,
+                );
+
                 {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
-                        // Mark all processed messages as processed
-                        for msg in &unprocessed_messages {
-                            if let Err(e) = db.mark_message_processed(&msg.id) {
-                                tracing::warn!("Failed to mark message as processed: {}", e);
-                            }
-                        }
-
-                        // Save agent's reply
-                        if let Err(e) = db.add_chat_message("agent", &content) {
+                        if let Err(e) = db.add_chat_message_in_conversation(
+                            &conversation_id,
+                            "agent",
+                            &chat_content,
+                        ) {
                             tracing::warn!("Failed to save agent chat reply: {}", e);
                         }
-
-                        // Update memory if requested
-                        if let Some((key, value)) = memory_update {
-                            if let Err(e) = db.set_working_memory(&key, &value) {
-                                tracing::warn!("Failed to update working memory: {}", e);
-                            } else {
-                                self.emit(AgentEvent::Observation(format!(
-                                    "Also updated memory: {}",
-                                    key
-                                )))
-                                .await;
-                            }
-                        }
                     }
+                }
+
+                let mut trace_lines = vec![format!(
+                    "Private chat [{}] turn {}/{} via agentic loop ({} tool call(s))",
+                    truncate_for_event(&conversation_id, 12),
+                    turn,
+                    CHAT_MAX_AUTONOMOUS_TURNS,
+                    tool_count
+                )];
+                if !result.thinking_blocks.is_empty() {
+                    trace_lines.push(format!(
+                        "Model emitted {} thinking block(s) (hidden from main reply)",
+                        result.thinking_blocks.len()
+                    ));
+                }
+                trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
+                self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
+
+                if should_continue {
+                    self.emit(AgentEvent::ActionTaken {
+                        action: "Continuing autonomous operator task".to_string(),
+                        result: format!(
+                            "[{}] {} tool call(s). {}",
+                            truncate_for_event(&conversation_id, 12),
+                            tool_count,
+                            truncate_for_event(&operator_visible_response, 80)
+                        ),
+                    })
+                    .await;
+
+                    pending_messages = vec![crate::database::ChatMessage {
+                        id: format!("autonomous_turn_{}_{}", conversation_id, turn),
+                        conversation_id: conversation_id.clone(),
+                        role: "operator".to_string(),
+                        content: "Continue autonomously on this task. Use more tools if needed. Only stop when the request is complete or blocked on missing user input.".to_string(),
+                        created_at: Utc::now(),
+                        processed: true,
+                    }];
+                    continue;
                 }
 
                 self.emit(AgentEvent::ActionTaken {
                     action: "Replied to operator".to_string(),
-                    result: format!("Response: {}...", &content[..content.len().min(50)]),
+                    result: format!(
+                        "[{}] {} tool call(s). {}",
+                        truncate_for_event(&conversation_id, 12),
+                        tool_count,
+                        truncate_for_event(&operator_visible_response, 80)
+                    ),
                 })
                 .await;
-                self.set_state(AgentVisualState::Happy).await;
-                sleep(Duration::from_millis(500)).await;
-            }
-            _ => {
-                // Mark messages as processed even if no reply
-                let db_lock = self.database.read().await;
-                if let Some(ref db) = *db_lock {
-                    for msg in &unprocessed_messages {
-                        let _ = db.mark_message_processed(&msg.id);
-                    }
-                }
+                break;
             }
         }
+
+        self.set_state(AgentVisualState::Happy).await;
+        sleep(Duration::from_millis(500)).await;
 
         Ok(())
     }
@@ -1292,6 +1442,134 @@ fn select_promotion_candidate_backend(
             a_key.cmp(&b_key)
         })
         .map(|c| c.backend_id.clone())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatToolCallDetail {
+    tool_name: String,
+    arguments_preview: String,
+    output_kind: String,
+    output_preview: String,
+}
+
+fn build_private_chat_agentic_prompt(
+    new_messages: &[crate::database::ChatMessage],
+    working_memory_context: &str,
+    recent_chat_context: &str,
+) -> String {
+    let mut prompt = String::new();
+
+    if !working_memory_context.trim().is_empty() {
+        prompt.push_str(working_memory_context.trim());
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    if !recent_chat_context.trim().is_empty() {
+        prompt.push_str("## Recent Conversation Context\n\n");
+        prompt.push_str(recent_chat_context.trim());
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    prompt.push_str("## New Operator Message(s)\n\n");
+    for msg in new_messages {
+        prompt.push_str("- ");
+        prompt.push_str(msg.content.trim());
+        prompt.push('\n');
+    }
+
+    prompt.push_str(
+        "\nRespond directly to the operator. Use tools when useful. If you use tools, verify results before answering.",
+    );
+    prompt
+}
+
+fn format_chat_message_with_metadata(
+    response: &str,
+    tool_calls: &[ToolCallRecord],
+    thinking_blocks: &[String],
+) -> String {
+    let mut content = response.trim().to_string();
+    if content.is_empty() {
+        content = if tool_calls.is_empty() {
+            "I do not have a useful response yet.".to_string()
+        } else {
+            "I ran tools for your request.".to_string()
+        };
+    }
+
+    if !thinking_blocks.is_empty() {
+        let thinking_json =
+            serde_json::to_string(thinking_blocks).unwrap_or_else(|_| "[]".to_string());
+        content.push_str("\n\n");
+        content.push_str(CHAT_THINKING_BLOCK_START);
+        content.push('\n');
+        content.push_str(&thinking_json);
+        content.push('\n');
+        content.push_str(CHAT_THINKING_BLOCK_END);
+    }
+
+    if tool_calls.is_empty() {
+        return content;
+    }
+
+    let details = tool_calls
+        .iter()
+        .map(|call| ChatToolCallDetail {
+            tool_name: call.tool_name.clone(),
+            arguments_preview: truncate_for_event(
+                &serde_json::to_string_pretty(&call.arguments)
+                    .unwrap_or_else(|_| call.arguments.to_string()),
+                500,
+            ),
+            output_kind: tool_output_kind(&call.output).to_string(),
+            output_preview: truncate_for_event(&call.output.to_llm_string(), 900),
+        })
+        .collect::<Vec<_>>();
+
+    let details_json = serde_json::to_string(&details).unwrap_or_else(|_| "[]".to_string());
+    content.push_str("\n\n");
+    content.push_str(CHAT_TOOL_BLOCK_START);
+    content.push('\n');
+    content.push_str(&details_json);
+    content.push('\n');
+    content.push_str(CHAT_TOOL_BLOCK_END);
+    content
+}
+
+fn tool_output_kind(output: &ToolOutput) -> &'static str {
+    match output {
+        ToolOutput::Text(_) => "text",
+        ToolOutput::Json(_) => "json",
+        ToolOutput::Error(_) => "error",
+        ToolOutput::NeedsApproval { .. } => "needs_approval",
+    }
+}
+
+fn tool_trace_lines(tool_calls: &[ToolCallRecord]) -> Vec<String> {
+    tool_calls
+        .iter()
+        .map(|call| {
+            format!(
+                "{} -> {}",
+                call.tool_name,
+                truncate_for_event(&call.output.to_llm_string(), 80)
+            )
+        })
+        .collect()
+}
+
+fn parse_continue_status(response: &str) -> Option<String> {
+    let trimmed = response.trim();
+    if !trimmed.starts_with(CHAT_CONTINUE_MARKER) {
+        return None;
+    }
+
+    let status = trimmed[CHAT_CONTINUE_MARKER.len()..].trim();
+    if status.is_empty() {
+        Some("Continuing autonomous work...".to_string())
+    } else {
+        Some(status.to_string())
+    }
 }
 
 fn parse_pending_checklist_items(markdown: &str) -> Vec<String> {
@@ -1431,5 +1709,59 @@ not a checklist item
 
         let candidate = select_promotion_candidate_backend(&report, "kv_v1").unwrap();
         assert_ne!(candidate, "kv_v1");
+    }
+
+    #[test]
+    fn chat_message_format_includes_tool_block_when_tools_exist() {
+        let calls = vec![ToolCallRecord {
+            tool_name: "shell".to_string(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            output: ToolOutput::Text("/tmp".to_string()),
+        }];
+
+        let formatted = format_chat_message_with_metadata("Done.", &calls, &[]);
+        assert!(formatted.contains(CHAT_TOOL_BLOCK_START));
+        assert!(formatted.contains(CHAT_TOOL_BLOCK_END));
+        assert!(formatted.contains("shell"));
+    }
+
+    #[test]
+    fn chat_prompt_includes_new_operator_messages() {
+        let now = Utc::now();
+        let msgs = vec![crate::database::ChatMessage {
+            id: "m1".to_string(),
+            conversation_id: crate::database::DEFAULT_CHAT_CONVERSATION_ID.to_string(),
+            role: "operator".to_string(),
+            content: "Please list files".to_string(),
+            created_at: now,
+            processed: false,
+        }];
+        let prompt = build_private_chat_agentic_prompt(&msgs, "", "");
+        assert!(prompt.contains("Please list files"));
+        assert!(prompt.contains("Use tools"));
+    }
+
+    #[test]
+    fn chat_message_format_includes_thinking_block_when_present() {
+        let formatted = format_chat_message_with_metadata(
+            "Hello!",
+            &[],
+            &["Private planning text".to_string()],
+        );
+        assert!(formatted.contains(CHAT_THINKING_BLOCK_START));
+        assert!(formatted.contains(CHAT_THINKING_BLOCK_END));
+        assert!(formatted.contains("Private planning text"));
+    }
+
+    #[test]
+    fn continue_marker_is_parsed() {
+        let parsed = parse_continue_status("[CONTINUE] still gathering more context");
+        assert_eq!(parsed, Some("still gathering more context".to_string()));
+    }
+
+    #[test]
+    fn non_continue_response_is_ignored() {
+        let parsed = parse_continue_status("All done!");
+        assert!(parsed.is_none());
     }
 }

@@ -8,7 +8,7 @@ use super::comfy_settings::ComfySettingsPanel;
 use super::settings::SettingsPanel;
 use crate::agent::{Agent, AgentEvent, AgentVisualState};
 use crate::config::AgentConfig;
-use crate::database::{AgentDatabase, ChatMessage};
+use crate::database::{AgentDatabase, ChatConversation, ChatMessage, DEFAULT_CHAT_CONVERSATION_ID};
 
 pub struct AgentApp {
     events: Vec<AgentEvent>,
@@ -23,9 +23,17 @@ pub struct AgentApp {
     avatars: Option<AvatarSet>,
     avatars_loaded: bool,
     database: Option<Arc<AgentDatabase>>,
+    conversations: Vec<ChatConversation>,
+    active_conversation_id: String,
     chat_history: Vec<ChatMessage>,
+    streaming_chat_preview: Option<StreamingChatPreview>,
     last_chat_refresh: std::time::Instant,
-    show_chat_panel: bool,
+    show_activity_panel: bool,
+}
+
+struct StreamingChatPreview {
+    conversation_id: String,
+    content: String,
 }
 
 impl AgentApp {
@@ -38,7 +46,7 @@ impl AgentApp {
         let mut comfy_settings_panel = ComfySettingsPanel::new();
         comfy_settings_panel.load_workflow_from_config(&config);
 
-        Self {
+        let mut app = Self {
             events: Vec::new(),
             event_rx,
             agent,
@@ -51,15 +59,45 @@ impl AgentApp {
             avatars: None, // Will be loaded on first frame when egui context is available
             avatars_loaded: false,
             database,
+            conversations: Vec::new(),
+            active_conversation_id: DEFAULT_CHAT_CONVERSATION_ID.to_string(),
             chat_history: Vec::new(),
+            streaming_chat_preview: None,
             last_chat_refresh: std::time::Instant::now(),
-            show_chat_panel: false,
+            show_activity_panel: false,
+        };
+        app.refresh_conversations();
+        app.refresh_chat_history();
+        app
+    }
+
+    fn refresh_conversations(&mut self) {
+        if let Some(ref db) = self.database {
+            match db.list_chat_conversations(100) {
+                Ok(conversations) => {
+                    self.conversations = conversations;
+                    if self
+                        .conversations
+                        .iter()
+                        .all(|c| c.id != self.active_conversation_id)
+                    {
+                        self.active_conversation_id = self
+                            .conversations
+                            .first()
+                            .map(|c| c.id.clone())
+                            .unwrap_or_else(|| DEFAULT_CHAT_CONVERSATION_ID.to_string());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to refresh chat conversations: {}", e);
+                }
+            }
         }
     }
 
     fn refresh_chat_history(&mut self) {
         if let Some(ref db) = self.database {
-            match db.get_chat_history(50) {
+            match db.get_chat_history_for_conversation(&self.active_conversation_id, 200) {
                 Ok(history) => {
                     self.chat_history = history;
                 }
@@ -72,13 +110,35 @@ impl AgentApp {
 
     fn send_chat_message(&mut self, content: &str) {
         if let Some(ref db) = self.database {
-            match db.add_chat_message("operator", content) {
+            match db.add_chat_message_in_conversation(
+                &self.active_conversation_id,
+                "operator",
+                content,
+            ) {
                 Ok(_) => {
                     tracing::info!("Sent chat message to agent: {}", content);
+                    self.refresh_conversations();
                     self.refresh_chat_history();
                 }
                 Err(e) => {
                     tracing::error!("Failed to send chat message: {}", e);
+                }
+            }
+        }
+    }
+
+    fn create_new_conversation(&mut self) {
+        if let Some(ref db) = self.database {
+            match db.create_chat_conversation(None) {
+                Ok(conversation) => {
+                    self.active_conversation_id = conversation.id;
+                    self.user_input.clear();
+                    self.streaming_chat_preview = None;
+                    self.refresh_conversations();
+                    self.refresh_chat_history();
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create conversation: {}", e);
                 }
             }
         }
@@ -101,6 +161,14 @@ impl AgentApp {
     }
 }
 
+fn conversation_display_label(conversation: &ChatConversation) -> String {
+    if conversation.message_count == 0 {
+        conversation.title.clone()
+    } else {
+        format!("{} ({})", conversation.title, conversation.message_count)
+    }
+}
+
 impl eframe::App for AgentApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Load avatars on first frame when context is available
@@ -112,6 +180,7 @@ impl eframe::App for AgentApp {
 
         // Periodically refresh chat history
         if self.last_chat_refresh.elapsed() > std::time::Duration::from_secs(2) {
+            self.refresh_conversations();
             self.refresh_chat_history();
             self.last_chat_refresh = std::time::Instant::now();
         }
@@ -122,10 +191,51 @@ impl eframe::App for AgentApp {
                 AgentEvent::StateChanged(state) => {
                     self.current_state = state.clone();
                 }
+                AgentEvent::ChatStreaming {
+                    conversation_id,
+                    content,
+                    done,
+                } => {
+                    if *done && content.trim().is_empty() {
+                        if self
+                            .streaming_chat_preview
+                            .as_ref()
+                            .is_some_and(|preview| preview.conversation_id == *conversation_id)
+                        {
+                            self.streaming_chat_preview = None;
+                        }
+                    } else {
+                        self.streaming_chat_preview = Some(StreamingChatPreview {
+                            conversation_id: conversation_id.clone(),
+                            content: content.clone(),
+                        });
+                    }
+                    continue;
+                }
+                AgentEvent::ActionTaken { action, .. } if action.contains("operator") => {
+                    self.refresh_conversations();
+                    self.refresh_chat_history();
+                    self.streaming_chat_preview = None;
+                }
                 _ => {}
             }
             self.events.push(event);
         }
+
+        egui::SidePanel::right("activity_panel")
+            .resizable(true)
+            .default_width(320.0)
+            .show_animated(ctx, self.show_activity_panel, |ui| {
+                ui.heading("Activity");
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Secondary event/reasoning log")
+                        .weak()
+                        .italics(),
+                );
+                ui.add_space(8.0);
+                super::chat::render_event_log(ui, &self.events);
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Header with agent sprite
@@ -157,49 +267,94 @@ impl eframe::App for AgentApp {
                         self.comfy_settings_panel.show = true;
                     }
 
-                    // Toggle chat panel button
-                    let chat_btn_text = if self.show_chat_panel {
-                        "📋 Activity"
+                    // Toggle secondary activity panel
+                    let activity_btn_text = if self.show_activity_panel {
+                        "📋 Hide Activity"
                     } else {
-                        "💬 Chat"
+                        "📋 Show Activity"
                     };
-                    if ui.button(chat_btn_text).clicked() {
-                        self.show_chat_panel = !self.show_chat_panel;
-                        if self.show_chat_panel {
-                            self.refresh_chat_history();
-                        }
+                    if ui.button(activity_btn_text).clicked() {
+                        self.show_activity_panel = !self.show_activity_panel;
                     }
                 });
             });
 
             ui.separator();
 
-            // Show either event log or chat panel
-            if self.show_chat_panel {
-                super::chat::render_private_chat(ui, &self.chat_history);
-            } else {
-                super::chat::render_event_log(ui, &self.events);
-            }
+            ui.horizontal(|ui| {
+                ui.label("Conversation:");
+                let previous_conversation_id = self.active_conversation_id.clone();
+                let selected_text = self
+                    .conversations
+                    .iter()
+                    .find(|c| c.id == self.active_conversation_id)
+                    .map(conversation_display_label)
+                    .unwrap_or_else(|| "Default chat".to_string());
+
+                egui::ComboBox::from_id_salt("chat_conversation_picker")
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        for conversation in &self.conversations {
+                            ui.selectable_value(
+                                &mut self.active_conversation_id,
+                                conversation.id.clone(),
+                                conversation_display_label(conversation),
+                            );
+                        }
+                    });
+
+                if ui.button("New Chat").clicked() {
+                    self.create_new_conversation();
+                }
+
+                if self.active_conversation_id != previous_conversation_id {
+                    self.streaming_chat_preview = None;
+                    self.refresh_chat_history();
+                }
+            });
+            ui.add_space(6.0);
+
+            // Chat is now the primary interaction surface.
+            let active_streaming_preview = self
+                .streaming_chat_preview
+                .as_ref()
+                .filter(|preview| preview.conversation_id == self.active_conversation_id)
+                .map(|preview| preview.content.as_str());
+            super::chat::render_private_chat(ui, &self.chat_history, active_streaming_preview);
 
             ui.separator();
+            ui.label(
+                egui::RichText::new("Press Enter to send. Shift+Enter inserts a newline.")
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(4.0);
 
-            // User input - sends private chat message
+            // Multi-line chat input
             ui.horizontal(|ui| {
                 ui.label("💬");
-                let response = ui.text_edit_singleline(&mut self.user_input);
+                let response = ui.add_sized(
+                    [ui.available_width() - 80.0, 72.0],
+                    egui::TextEdit::multiline(&mut self.user_input)
+                        .hint_text("Message Ponderer...")
+                        .desired_rows(3),
+                );
 
-                let enter_pressed =
-                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let send_shortcut = response.has_focus()
+                    && ui.input(|i| {
+                        i.key_pressed(egui::Key::Enter)
+                            && !i.modifiers.shift
+                            && !i.modifiers.ctrl
+                            && !i.modifiers.command
+                            && !i.modifiers.alt
+                    });
                 let send_clicked = ui.button("Send").clicked();
 
-                if (enter_pressed || send_clicked) && !self.user_input.trim().is_empty() {
+                if (send_shortcut || send_clicked) && !self.user_input.trim().is_empty() {
                     let msg = self.user_input.trim().to_string();
+                    self.streaming_chat_preview = None;
                     self.send_chat_message(&msg);
                     self.user_input.clear();
-                    // Switch to chat view to see the message
-                    if !self.show_chat_panel {
-                        self.show_chat_panel = true;
-                    }
                 }
             });
         });
