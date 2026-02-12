@@ -17,6 +17,10 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 - **Does**: Executes the same loop while forwarding incremental assistant text (`content`) to a callback as it streams in
 - **Interacts with**: `AgentEvent::ChatStreaming` emission in `../agent/mod.rs`
 
+### `AgenticLoop::run_with_history_streaming_and_tool_events`
+- **Does**: Streaming variant that additionally emits a callback for each completed tool call record as the loop runs
+- **Interacts with**: `AgentEvent::ToolCallProgress` emission in `../agent/mod.rs`
+
 ### `call_llm_streaming`
 - **Does**: Calls `chat/completions` with `"stream": true`, parses SSE `data:` payloads, accumulates text/tool-call deltas, and produces a final assistant message
 - **Interacts with**: OpenAI, vLLM, and LMStudio-compatible stream payloads; fallback path in `call_llm`
@@ -34,7 +38,7 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
 | `../agent/mod.rs` | `AgenticResult` includes `response`, `thinking_blocks`, and `tool_calls_made` | Renaming/removing these fields |
-| `../agent/mod.rs` | `run_with_history_streaming` callback receives evolving full text and a done flag | Changing callback semantics |
+| `../agent/mod.rs` | `run_with_history_streaming` callback receives evolving full text and a done flag; tool-event callback receives completed `ToolCallRecord`s | Changing callback semantics |
 | `../tools/mod.rs` | Tool calls are executed via `ToolRegistry::execute_call` semantics | Changing execution or safety flow contracts |
 | OpenAI-compatible backends | Request/response shape uses `chat/completions` with optional `tools` and optional streaming SSE | Non-compatible payload format changes |
 

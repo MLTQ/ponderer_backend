@@ -34,33 +34,36 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 - **Interacts with**: `reasoning::ReasoningEngine`, `Skill::poll/execute`, `AgentDatabase` memory/chat helpers
 
 ### `process_chat_messages`
-- **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, and can run multiple autonomous turns per thread before final handoff using a `[CONTINUE]` marker protocol
-- **Interacts with**: `database::chat_messages`, `database::chat_conversations`, `tools::agentic::AgenticLoop::run_with_history_streaming`, `ToolRegistry`
+- **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, emits per-tool progress updates, and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol
+- **Interacts with**: `database::chat_messages`, `database::chat_conversations`, `tools::agentic::AgenticLoop::run_with_history_streaming_and_tool_events`, `ToolRegistry`
 
 ### Persona evolution helpers
 - **Does**: Capture persona snapshots and run trajectory inference on schedule
 - **Interacts with**: `agent::trajectory`, `database::persona_history`, reflection timestamps in `agent_state`
 
 ### Chat formatting helpers
-- **Does**: Builds operator-chat prompts and serializes tool-call/thinking metadata into `[tool_calls]...[/tool_calls]` and `[thinking]...[/thinking]` blocks for inline UI rendering
-- **Interacts with**: `ui/chat.rs` parser for collapsible tool details
+- **Does**: Builds operator-chat prompts and serializes tool-call/thinking/media metadata into `[tool_calls]...[/tool_calls]`, `[thinking]...[/thinking]`, and `[media]...[/media]` blocks for inline UI rendering
+- **Interacts with**: `ui/chat.rs` parser for collapsible tool details and media previews
 
 ## Contracts
 
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
 | `main.rs` | `Agent::new(...).run_loop()` drives autonomous behavior without extra orchestration | Changing constructor or loop entrypoint signatures |
-| `ui/app.rs` | `AgentEvent` variants remain stable enough for chat/state rendering, including `ChatStreaming { conversation_id, content, done }` | Renaming/removing emitted event types |
+| `ui/app.rs` | `AgentEvent` variants remain stable enough for chat/state rendering, including `ChatStreaming { conversation_id, content, done }` and `ToolCallProgress { ... }` | Renaming/removing emitted event types |
 | `database.rs` | Chat and memory APIs are available and synchronous; conversation-scoped methods exist for private chat (`get_chat_context_for_conversation`, `add_chat_message_in_conversation`) | Changing DB API names or semantics |
 | `tools/mod.rs` | `ToolRegistry` can be shared and used in autonomous context | Removing registry injection from `Agent` |
 | `tools/agentic.rs` | `AgenticLoop` accepts OpenAI-compatible endpoint and ToolContext for autonomous runs | Changing loop constructor/run signatures |
 | `memory/eval.rs` | Replay evaluation functions remain deterministic and serializable | Breaking report schema or candidate IDs |
 | `ui/chat.rs` | Embedded metadata block delimiters remain stable (`[tool_calls]`, `[thinking]`) | Changing envelope formats without parser update |
+| `tools/comfy.rs` | Tool JSON with `media` arrays is transformed into chat-visible media payloads | Changing media extraction shape in formatter |
 
 ## Notes
 - Current behavior combines periodic skill polling with persona maintenance, optional heartbeat automation, and private chat handling.
 - Private chat replies are now scoped per conversation ID to avoid cross-thread prompt contamination.
-- Private chat can emit intermediate "continuing autonomous work" messages and only cede control when the model omits the `[CONTINUE]` marker (or max autonomous turns is reached).
+- Private chat emits a structured turn-control block per assistant response; the loop continues only when decision=`continue`, user input is not needed, and turn budget remains.
+- Turn-control parsing treats visible assistant text as authoritative; block `user_message` is only fallback when visible text is empty and does not resemble a hallucinated `User:`/`Operator:` transcript.
+- Tool-call progress is streamed as events during a turn so the UI can show real-time execution output (for example shell output snippets) before final reply persistence.
 - Heartbeat mode is guarded by config + due-time checks and is intentionally quiet when no pending tasks/reminders are found.
 - Memory evolution scheduling is heartbeat-triggered but independently rate-limited by its own interval key in `agent_state`.
 - The run loop is intentionally conservative around errors: failures emit events and continue after short backoff.

@@ -120,7 +120,7 @@ impl AgenticLoop {
         user_message: &str,
         tool_ctx: &ToolContext,
     ) -> Result<AgenticResult> {
-        self.run_with_history_internal(system_prompt, vec![], user_message, tool_ctx, None)
+        self.run_with_history_internal(system_prompt, vec![], user_message, tool_ctx, None, None)
             .await
     }
 
@@ -132,7 +132,7 @@ impl AgenticLoop {
         user_message: &str,
         tool_ctx: &ToolContext,
     ) -> Result<AgenticResult> {
-        self.run_with_history_internal(system_prompt, history, user_message, tool_ctx, None)
+        self.run_with_history_internal(system_prompt, history, user_message, tool_ctx, None, None)
             .await
     }
 
@@ -145,12 +145,34 @@ impl AgenticLoop {
         tool_ctx: &ToolContext,
         on_text_stream: &dyn Fn(&str, bool),
     ) -> Result<AgenticResult> {
+        self.run_with_history_streaming_and_tool_events(
+            system_prompt,
+            history,
+            user_message,
+            tool_ctx,
+            on_text_stream,
+            None,
+        )
+        .await
+    }
+
+    /// Run the agentic loop with existing conversation history while streaming text and tool events.
+    pub async fn run_with_history_streaming_and_tool_events(
+        &self,
+        system_prompt: &str,
+        history: Vec<Message>,
+        user_message: &str,
+        tool_ctx: &ToolContext,
+        on_text_stream: &dyn Fn(&str, bool),
+        on_tool_event: Option<&dyn Fn(&ToolCallRecord)>,
+    ) -> Result<AgenticResult> {
         self.run_with_history_internal(
             system_prompt,
             history,
             user_message,
             tool_ctx,
             Some(on_text_stream),
+            on_tool_event,
         )
         .await
     }
@@ -162,6 +184,7 @@ impl AgenticLoop {
         user_message: &str,
         tool_ctx: &ToolContext,
         on_text_stream: Option<&dyn Fn(&str, bool)>,
+        on_tool_event: Option<&dyn Fn(&ToolCallRecord)>,
     ) -> Result<AgenticResult> {
         // Build initial messages
         let mut messages = vec![Message {
@@ -293,11 +316,15 @@ impl AgenticLoop {
                             other => other.to_llm_string(),
                         };
 
-                        tool_calls_made.push(ToolCallRecord {
+                        let record = ToolCallRecord {
                             tool_name: tc.function.name.clone(),
                             arguments,
                             output: result.output,
-                        });
+                        };
+                        if let Some(callback) = on_tool_event {
+                            callback(&record);
+                        }
+                        tool_calls_made.push(record);
 
                         // Add tool result message
                         messages.push(Message {

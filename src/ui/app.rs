@@ -10,6 +10,8 @@ use crate::agent::{Agent, AgentEvent, AgentVisualState};
 use crate::config::AgentConfig;
 use crate::database::{AgentDatabase, ChatConversation, ChatMessage, DEFAULT_CHAT_CONVERSATION_ID};
 
+const MAX_LIVE_TOOL_PROGRESS_LINES: usize = 200;
+
 pub struct AgentApp {
     events: Vec<AgentEvent>,
     event_rx: Receiver<AgentEvent>,
@@ -26,6 +28,8 @@ pub struct AgentApp {
     conversations: Vec<ChatConversation>,
     active_conversation_id: String,
     chat_history: Vec<ChatMessage>,
+    chat_media_cache: super::chat::ChatMediaCache,
+    live_tool_progress: Vec<LiveToolProgress>,
     streaming_chat_preview: Option<StreamingChatPreview>,
     last_chat_refresh: std::time::Instant,
     show_activity_panel: bool,
@@ -34,6 +38,11 @@ pub struct AgentApp {
 struct StreamingChatPreview {
     conversation_id: String,
     content: String,
+}
+
+struct LiveToolProgress {
+    conversation_id: String,
+    line: String,
 }
 
 impl AgentApp {
@@ -62,6 +71,8 @@ impl AgentApp {
             conversations: Vec::new(),
             active_conversation_id: DEFAULT_CHAT_CONVERSATION_ID.to_string(),
             chat_history: Vec::new(),
+            chat_media_cache: super::chat::ChatMediaCache::new(),
+            live_tool_progress: Vec::new(),
             streaming_chat_preview: None,
             last_chat_refresh: std::time::Instant::now(),
             show_activity_panel: false,
@@ -109,6 +120,8 @@ impl AgentApp {
     }
 
     fn send_chat_message(&mut self, content: &str) {
+        let active_conversation = self.active_conversation_id.clone();
+        self.clear_live_tool_progress(&active_conversation);
         if let Some(ref db) = self.database {
             match db.add_chat_message_in_conversation(
                 &self.active_conversation_id,
@@ -142,6 +155,22 @@ impl AgentApp {
                 }
             }
         }
+    }
+
+    fn push_live_tool_progress(&mut self, conversation_id: &str, line: String) {
+        self.live_tool_progress.push(LiveToolProgress {
+            conversation_id: conversation_id.to_string(),
+            line,
+        });
+        if self.live_tool_progress.len() > MAX_LIVE_TOOL_PROGRESS_LINES {
+            let overflow = self.live_tool_progress.len() - MAX_LIVE_TOOL_PROGRESS_LINES;
+            self.live_tool_progress.drain(0..overflow);
+        }
+    }
+
+    fn clear_live_tool_progress(&mut self, conversation_id: &str) {
+        self.live_tool_progress
+            .retain(|entry| entry.conversation_id != conversation_id);
     }
 
     fn load_avatars(&mut self, ctx: &egui::Context, config: &AgentConfig) {
@@ -211,6 +240,16 @@ impl eframe::App for AgentApp {
                         });
                     }
                     continue;
+                }
+                AgentEvent::ToolCallProgress {
+                    conversation_id,
+                    tool_name,
+                    output_preview,
+                } => {
+                    self.push_live_tool_progress(
+                        conversation_id,
+                        format!("{} -> {}", tool_name, output_preview),
+                    );
                 }
                 AgentEvent::ActionTaken { action, .. } if action.contains("operator") => {
                     self.refresh_conversations();
@@ -320,7 +359,42 @@ impl eframe::App for AgentApp {
                 .as_ref()
                 .filter(|preview| preview.conversation_id == self.active_conversation_id)
                 .map(|preview| preview.content.as_str());
-            super::chat::render_private_chat(ui, &self.chat_history, active_streaming_preview);
+            super::chat::render_private_chat(
+                ui,
+                &self.chat_history,
+                active_streaming_preview,
+                &mut self.chat_media_cache,
+            );
+
+            let active_progress: Vec<String> = self
+                .live_tool_progress
+                .iter()
+                .filter(|entry| entry.conversation_id == self.active_conversation_id)
+                .map(|entry| entry.line.clone())
+                .collect();
+            if !active_progress.is_empty() {
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new("Live Agent Turn")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Real-time tool output while the agent is still working",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(120.0)
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                for line in &active_progress {
+                                    ui.monospace(line);
+                                }
+                            });
+                    });
+            }
 
             ui.separator();
             ui.label(

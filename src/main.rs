@@ -68,8 +68,10 @@ fn main() {
     let tool_registry = Arc::new(ToolRegistry::new());
     {
         use tools::{
+            comfy::{GenerateComfyMediaTool, PostToGraphchanTool},
             files::{ListDirectoryTool, PatchFileTool, ReadFileTool, WriteFileTool},
             shell::ShellTool,
+            vision::{CaptureScreenTool, EvaluateLocalImageTool, PublishMediaToChatTool},
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -80,9 +82,24 @@ fn main() {
                 .register(Arc::new(ListDirectoryTool::new()))
                 .await;
             tool_registry.register(Arc::new(PatchFileTool::new())).await;
+            tool_registry
+                .register(Arc::new(GenerateComfyMediaTool::new()))
+                .await;
+            tool_registry
+                .register(Arc::new(PostToGraphchanTool::new()))
+                .await;
+            tool_registry
+                .register(Arc::new(EvaluateLocalImageTool::new()))
+                .await;
+            tool_registry
+                .register(Arc::new(PublishMediaToChatTool::new()))
+                .await;
+            tool_registry
+                .register(Arc::new(CaptureScreenTool::new()))
+                .await;
         });
     }
-    tracing::info!("Tool registry initialized with 5 built-in tools");
+    tracing::info!("Tool registry initialized with 10 built-in tools");
 
     // Create event channel
     let (event_tx, event_rx) = flume::unbounded();

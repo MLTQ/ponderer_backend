@@ -123,6 +123,19 @@ impl SettingsPanel {
                                 );
                             });
                     });
+                    ui.add_space(8.0);
+
+                    ui.checkbox(
+                        &mut self.config.enable_screen_capture_in_loop,
+                        "Allow screen capture in agentic loop (opt-in)",
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Enables the capture_screen tool so the agent can inspect your current desktop.",
+                        )
+                        .small()
+                        .weak(),
+                    );
                     ui.add_space(16.0);
 
                     ui.separator();

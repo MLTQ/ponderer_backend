@@ -1,5 +1,7 @@
 use eframe::egui::{self, Color32, RichText, ScrollArea};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::Path;
 
 use crate::agent::AgentEvent;
 use crate::database::ChatMessage;
@@ -8,6 +10,8 @@ const CHAT_TOOL_BLOCK_START: &str = "[tool_calls]";
 const CHAT_TOOL_BLOCK_END: &str = "[/tool_calls]";
 const CHAT_THINKING_BLOCK_START: &str = "[thinking]";
 const CHAT_THINKING_BLOCK_END: &str = "[/thinking]";
+const CHAT_MEDIA_BLOCK_START: &str = "[media]";
+const CHAT_MEDIA_BLOCK_END: &str = "[/media]";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ChatToolCallDetail {
@@ -17,11 +21,56 @@ struct ChatToolCallDetail {
     output_preview: String,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ChatMediaDetail {
+    path: String,
+    #[serde(default)]
+    media_kind: String,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ChatRenderPayload {
     display_content: String,
     tool_details: Vec<ChatToolCallDetail>,
     thinking_details: Vec<String>,
+    media_details: Vec<ChatMediaDetail>,
+}
+
+#[derive(Default)]
+pub struct ChatMediaCache {
+    image_textures: HashMap<String, egui::TextureHandle>,
+}
+
+impl ChatMediaCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn load_image_texture(
+        &mut self,
+        ctx: &egui::Context,
+        path: &str,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(tex) = self.image_textures.get(path) {
+            return Some(tex.clone());
+        }
+
+        let image = image::open(path).ok()?;
+        let rgba = image.to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+        let tex = ctx.load_texture(
+            format!("chat_media_{}", path),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.image_textures.insert(path.to_string(), tex.clone());
+        Some(tex)
+    }
 }
 
 pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
@@ -52,6 +101,20 @@ pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
                     });
                     ui.add_space(6.0);
                 }
+                AgentEvent::ToolCallProgress {
+                    conversation_id,
+                    tool_name,
+                    output_preview,
+                } => {
+                    ui.label(
+                        RichText::new(format!(
+                            "🛠 [{}] {}: {}",
+                            conversation_id, tool_name, output_preview
+                        ))
+                        .color(Color32::KHAKI),
+                    );
+                    ui.add_space(4.0);
+                }
                 AgentEvent::ActionTaken { action, result } => {
                     ui.label(
                         RichText::new(format!("✅ {}: {}", action, result)).color(Color32::GREEN),
@@ -78,6 +141,7 @@ pub fn render_private_chat(
     ui: &mut egui::Ui,
     messages: &[ChatMessage],
     streaming_preview: Option<&str>,
+    media_cache: &mut ChatMediaCache,
 ) {
     ui.heading("Private Chat");
     ui.add_space(4.0);
@@ -112,7 +176,7 @@ pub fn render_private_chat(
                 let time_str = msg.created_at.format("%H:%M").to_string();
                 let payload = parse_chat_payload(&msg.content);
                 let row_width = ui.available_width();
-                let max_bubble_width = row_width * 0.7;
+                let max_bubble_width = (row_width * 0.7).clamp(220.0, (row_width - 8.0).max(120.0));
                 let row_layout = if is_operator {
                     egui::Layout::right_to_left(egui::Align::TOP)
                 } else {
@@ -120,13 +184,20 @@ pub fn render_private_chat(
                 };
 
                 ui.allocate_ui_with_layout(egui::vec2(row_width, 0.0), row_layout, |ui| {
-                    render_chat_message_bubble(
-                        ui,
-                        msg,
-                        &time_str,
-                        &payload,
-                        is_operator,
-                        max_bubble_width,
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(max_bubble_width, 0.0),
+                        egui::Layout::left_to_right(egui::Align::TOP),
+                        |ui| {
+                            render_chat_message_bubble(
+                                ui,
+                                msg,
+                                &time_str,
+                                &payload,
+                                is_operator,
+                                max_bubble_width,
+                                media_cache,
+                            );
+                        },
                     );
                 });
 
@@ -137,12 +208,19 @@ pub fn render_private_chat(
                 let trimmed = preview.trim();
                 if !trimmed.is_empty() {
                     let row_width = ui.available_width();
-                    let max_bubble_width = row_width * 0.7;
+                    let max_bubble_width =
+                        (row_width * 0.7).clamp(220.0, (row_width - 8.0).max(120.0));
                     ui.allocate_ui_with_layout(
                         egui::vec2(row_width, 0.0),
                         egui::Layout::left_to_right(egui::Align::TOP),
                         |ui| {
-                            render_streaming_preview_bubble(ui, trimmed, max_bubble_width);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(max_bubble_width, 0.0),
+                                egui::Layout::left_to_right(egui::Align::TOP),
+                                |ui| {
+                                    render_streaming_preview_bubble(ui, trimmed, max_bubble_width);
+                                },
+                            );
                         },
                     );
                     ui.add_space(8.0);
@@ -158,11 +236,12 @@ fn render_chat_message_bubble(
     payload: &ChatRenderPayload,
     is_operator: bool,
     max_bubble_width: f32,
+    media_cache: &mut ChatMediaCache,
 ) {
     ui.group(|ui| {
-        ui.set_max_width(max_bubble_width);
-        ui.set_width(max_bubble_width);
-        let wrap_token_len = max_token_len_for_width(max_bubble_width);
+        let inner_width = (max_bubble_width - 14.0).max(100.0);
+        ui.set_max_width(inner_width);
+        let wrap_token_len = max_token_len_for_width(inner_width);
 
         let (role_label, role_color, bg_color) = if is_operator {
             (
@@ -189,6 +268,16 @@ fn render_chat_message_bubble(
             payload.display_content.as_str(),
             wrap_token_len,
         ));
+
+        if !payload.media_details.is_empty() {
+            ui.add_space(6.0);
+            render_media_panel(
+                ui,
+                &payload.media_details,
+                (inner_width - 12.0).max(80.0),
+                media_cache,
+            );
+        }
 
         let has_thinking = !payload.thinking_details.is_empty();
         let has_tool_calls = !payload.tool_details.is_empty();
@@ -228,6 +317,71 @@ fn render_chat_message_bubble(
             );
         }
     });
+}
+
+fn render_media_panel(
+    ui: &mut egui::Ui,
+    media_details: &[ChatMediaDetail],
+    max_width: f32,
+    media_cache: &mut ChatMediaCache,
+) {
+    ui.label(RichText::new("Media").small().color(Color32::LIGHT_GREEN));
+
+    for media in media_details {
+        let kind = normalize_media_kind(&media.media_kind);
+        let filename = Path::new(&media.path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(media.path.as_str());
+
+        ui.group(|ui| {
+            let source = media.source.clone().unwrap_or_else(|| "tool".to_string());
+            ui.label(RichText::new(format!("{} ({})", filename, source)).strong());
+            ui.label(RichText::new(&media.path).weak().small());
+
+            if let Some(mime) = media.mime_type.as_deref().filter(|m| !m.trim().is_empty()) {
+                ui.label(RichText::new(mime).weak().small().italics());
+            }
+
+            match kind {
+                "image" => {
+                    if let Some(texture) = media_cache.load_image_texture(ui.ctx(), &media.path) {
+                        let mut size = texture.size_vec2();
+                        if size.x > max_width {
+                            let scale = max_width / size.x;
+                            size *= scale;
+                        }
+                        if size.y > 240.0 {
+                            let scale = 240.0 / size.y;
+                            size *= scale;
+                        }
+                        ui.image((texture.id(), size));
+                    } else {
+                        ui.label(RichText::new("Preview unavailable").small().weak());
+                    }
+                }
+                "audio" => {
+                    ui.label(RichText::new("Audio file generated").small());
+                }
+                "video" => {
+                    ui.label(RichText::new("Video file generated").small());
+                }
+                _ => {
+                    ui.label(RichText::new("File generated").small());
+                }
+            }
+        });
+        ui.add_space(4.0);
+    }
+}
+
+fn normalize_media_kind(kind: &str) -> &'static str {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "image" => "image",
+        "audio" => "audio",
+        "video" => "video",
+        _ => "file",
+    }
 }
 
 fn render_thinking_panel(
@@ -291,9 +445,9 @@ fn render_tool_calls_panel(
 
 fn render_streaming_preview_bubble(ui: &mut egui::Ui, preview: &str, max_bubble_width: f32) {
     ui.group(|ui| {
-        ui.set_max_width(max_bubble_width);
-        ui.set_width(max_bubble_width);
-        let wrap_token_len = max_token_len_for_width(max_bubble_width);
+        let inner_width = (max_bubble_width - 14.0).max(100.0);
+        ui.set_max_width(inner_width);
+        let wrap_token_len = max_token_len_for_width(inner_width);
         ui.visuals_mut().widgets.noninteractive.bg_fill = Color32::from_rgb(30, 50, 40);
 
         ui.horizontal(|ui| {
@@ -355,13 +509,24 @@ fn parse_chat_payload(content: &str) -> ChatRenderPayload {
         .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
         .unwrap_or_default();
 
-    let (display_content, inline_thinking) = strip_inline_thinking_tags(&without_block_thinking);
+    let (without_media_blocks, raw_media) = extract_block(
+        &without_block_thinking,
+        CHAT_MEDIA_BLOCK_START,
+        CHAT_MEDIA_BLOCK_END,
+    );
+    let media_details = raw_media
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<ChatMediaDetail>>(raw).ok())
+        .unwrap_or_default();
+
+    let (display_content, inline_thinking) = strip_inline_thinking_tags(&without_media_blocks);
     thinking_details.extend(inline_thinking);
 
     ChatRenderPayload {
         display_content: display_content.trim().to_string(),
         tool_details,
         thinking_details,
+        media_details,
     }
 }
 
@@ -462,5 +627,15 @@ mod tests {
         let payload = parse_chat_payload(content);
         assert_eq!(payload.display_content, "Visible");
         assert_eq!(payload.thinking_details, vec!["internal"]);
+    }
+
+    #[test]
+    fn parses_embedded_media_block() {
+        let content = "Generated.\n\n[media]\n[{\"path\":\"/tmp/a.png\",\"media_kind\":\"image\",\"mime_type\":\"image/png\",\"source\":\"generate_comfy_media\"}]\n[/media]";
+        let payload = parse_chat_payload(content);
+        assert_eq!(payload.display_content, "Generated.");
+        assert_eq!(payload.media_details.len(), 1);
+        assert_eq!(payload.media_details[0].path, "/tmp/a.png");
+        assert_eq!(payload.media_details[0].media_kind, "image");
     }
 }

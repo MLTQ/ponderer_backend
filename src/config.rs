@@ -164,6 +164,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub enable_image_generation: bool,
     #[serde(default)]
+    pub enable_screen_capture_in_loop: bool,
+    #[serde(default)]
     pub comfyui: ComfyUIConfig,
 
     // Workflow settings
@@ -282,6 +284,7 @@ impl Default for AgentConfig {
             database_path: default_database_path(),
             max_important_posts: default_max_important_posts(),
             enable_image_generation: false,
+            enable_screen_capture_in_loop: false,
             comfyui: ComfyUIConfig::default(),
             workflow_path: None,
             workflow_settings: None,
@@ -426,6 +429,13 @@ impl AgentConfig {
             if !path.trim().is_empty() {
                 config.memory_eval_trace_set_path = Some(path);
             }
+        }
+
+        if let Ok(enabled) = env::var("AGENT_ENABLE_SCREEN_CAPTURE") {
+            let enabled = enabled.eq_ignore_ascii_case("1")
+                || enabled.eq_ignore_ascii_case("true")
+                || enabled.eq_ignore_ascii_case("yes");
+            config.enable_screen_capture_in_loop = enabled;
         }
 
         if let Ok(name) = env::var("AGENT_NAME") {

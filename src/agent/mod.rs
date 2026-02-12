@@ -32,7 +32,11 @@ const CHAT_TOOL_BLOCK_START: &str = "[tool_calls]";
 const CHAT_TOOL_BLOCK_END: &str = "[/tool_calls]";
 const CHAT_THINKING_BLOCK_START: &str = "[thinking]";
 const CHAT_THINKING_BLOCK_END: &str = "[/thinking]";
-const CHAT_CONTINUE_MARKER: &str = "[CONTINUE]";
+const CHAT_MEDIA_BLOCK_START: &str = "[media]";
+const CHAT_MEDIA_BLOCK_END: &str = "[/media]";
+const CHAT_TURN_CONTROL_BLOCK_START: &str = "[turn_control]";
+const CHAT_TURN_CONTROL_BLOCK_END: &str = "[/turn_control]";
+const CHAT_CONTINUE_MARKER_LEGACY: &str = "[CONTINUE]";
 const CHAT_MAX_AUTONOMOUS_TURNS: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -51,6 +55,11 @@ pub enum AgentEvent {
     StateChanged(AgentVisualState),
     Observation(String),
     ReasoningTrace(Vec<String>),
+    ToolCallProgress {
+        conversation_id: String,
+        tool_name: String,
+        output_preview: String,
+    },
     ChatStreaming {
         conversation_id: String,
         content: String,
@@ -1241,9 +1250,10 @@ impl Agent {
         };
 
         let chat_system_prompt = format!(
-            "{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort. Do not hand control back early.\nIf work remains and you can continue without user clarification, begin your response with {} followed by a short status update.\nOnly provide a normal operator-facing final response when complete or blocked on missing user input.",
+            "{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nEvery response MUST end with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nChoose decision='continue' only if more useful work can be done right now without clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.",
             system_prompt,
-            CHAT_CONTINUE_MARKER
+            CHAT_TURN_CONTROL_BLOCK_START,
+            CHAT_TURN_CONTROL_BLOCK_END
         );
 
         for (conversation_id, conversation_messages) in messages_by_conversation {
@@ -1261,6 +1271,14 @@ impl Agent {
             let mut pending_messages = conversation_messages.clone();
 
             for turn in 1..=CHAT_MAX_AUTONOMOUS_TURNS {
+                self.emit(AgentEvent::Observation(format!(
+                    "Operator task [{}] turn {}/{}",
+                    truncate_for_event(&conversation_id, 12),
+                    turn,
+                    CHAT_MAX_AUTONOMOUS_TURNS
+                )))
+                .await;
+
                 let recent_chat_context = {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
@@ -1285,14 +1303,26 @@ impl Agent {
                         done,
                     });
                 };
+                let tool_event_tx = self.event_tx.clone();
+                let tool_event_conversation_id = conversation_id.clone();
+                let tool_event_callback = move |record: &ToolCallRecord| {
+                    let output_preview =
+                        truncate_for_event(&record.output.to_llm_string().replace('\n', " "), 220);
+                    let _ = tool_event_tx.send(AgentEvent::ToolCallProgress {
+                        conversation_id: tool_event_conversation_id.clone(),
+                        tool_name: record.tool_name.clone(),
+                        output_preview,
+                    });
+                };
 
                 let result = agentic_loop
-                    .run_with_history_streaming(
+                    .run_with_history_streaming_and_tool_events(
                         &chat_system_prompt,
                         vec![],
                         &user_message,
                         &tool_ctx,
                         &stream_callback,
+                        Some(&tool_event_callback),
                     )
                     .await?;
 
@@ -1304,13 +1334,21 @@ impl Agent {
                     }
                 });
                 let tool_count = result.tool_calls_made.len();
-
-                let continuation_status = parse_continue_status(&base_response);
-                let should_continue =
-                    continuation_status.is_some() && turn < CHAT_MAX_AUTONOMOUS_TURNS;
-                let operator_visible_response = continuation_status
-                    .clone()
-                    .unwrap_or_else(|| base_response.clone());
+                let turn_control = parse_turn_control(&base_response, tool_count);
+                let should_continue = turn_control.decision == TurnDecision::Continue
+                    && !turn_control.needs_user_input
+                    && turn < CHAT_MAX_AUTONOMOUS_TURNS;
+                let operator_visible_response = if !turn_control.operator_response.trim().is_empty()
+                {
+                    turn_control.operator_response.clone()
+                } else if should_continue {
+                    turn_control
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "Still working on your request...".to_string())
+                } else {
+                    base_response.clone()
+                };
 
                 let chat_content = format_chat_message_with_metadata(
                     &operator_visible_response,
@@ -1351,9 +1389,10 @@ impl Agent {
                     self.emit(AgentEvent::ActionTaken {
                         action: "Continuing autonomous operator task".to_string(),
                         result: format!(
-                            "[{}] {} tool call(s). {}",
+                            "[{}] {} tool call(s), status={}. {}",
                             truncate_for_event(&conversation_id, 12),
                             tool_count,
+                            turn_control.status,
                             truncate_for_event(&operator_visible_response, 80)
                         ),
                     })
@@ -1363,7 +1402,14 @@ impl Agent {
                         id: format!("autonomous_turn_{}_{}", conversation_id, turn),
                         conversation_id: conversation_id.clone(),
                         role: "operator".to_string(),
-                        content: "Continue autonomously on this task. Use more tools if needed. Only stop when the request is complete or blocked on missing user input.".to_string(),
+                        content: format!(
+                            "Continue autonomously on this task. Previous status: {}. {}",
+                            turn_control.status,
+                            turn_control
+                                .reason
+                                .as_deref()
+                                .unwrap_or("Use more tools if needed and stop only when complete or blocked on missing input.")
+                        ),
                         created_at: Utc::now(),
                         processed: true,
                     }];
@@ -1373,9 +1419,10 @@ impl Agent {
                 self.emit(AgentEvent::ActionTaken {
                     action: "Replied to operator".to_string(),
                     result: format!(
-                        "[{}] {} tool call(s). {}",
+                        "[{}] {} tool call(s), status={}. {}",
                         truncate_for_event(&conversation_id, 12),
                         tool_count,
+                        turn_control.status,
                         truncate_for_event(&operator_visible_response, 80)
                     ),
                 })
@@ -1452,6 +1499,38 @@ struct ChatToolCallDetail {
     output_preview: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMediaDetail {
+    path: String,
+    media_kind: String,
+    mime_type: Option<String>,
+    source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnDecision {
+    Continue,
+    Yield,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTurnControl {
+    operator_response: String,
+    decision: TurnDecision,
+    needs_user_input: bool,
+    status: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TurnControlBlock {
+    decision: Option<String>,
+    status: Option<String>,
+    needs_user_input: Option<bool>,
+    user_message: Option<String>,
+    reason: Option<String>,
+}
+
 fn build_private_chat_agentic_prompt(
     new_messages: &[crate::database::ChatMessage],
     working_memory_context: &str,
@@ -1508,6 +1587,17 @@ fn format_chat_message_with_metadata(
         content.push_str(CHAT_THINKING_BLOCK_END);
     }
 
+    let media_details = extract_media_details(tool_calls);
+    if !media_details.is_empty() {
+        let media_json = serde_json::to_string(&media_details).unwrap_or_else(|_| "[]".to_string());
+        content.push_str("\n\n");
+        content.push_str(CHAT_MEDIA_BLOCK_START);
+        content.push('\n');
+        content.push_str(&media_json);
+        content.push('\n');
+        content.push_str(CHAT_MEDIA_BLOCK_END);
+    }
+
     if tool_calls.is_empty() {
         return content;
     }
@@ -1545,6 +1635,56 @@ fn tool_output_kind(output: &ToolOutput) -> &'static str {
     }
 }
 
+fn extract_media_details(tool_calls: &[ToolCallRecord]) -> Vec<ChatMediaDetail> {
+    let mut media = Vec::new();
+
+    for call in tool_calls {
+        let ToolOutput::Json(payload) = &call.output else {
+            continue;
+        };
+
+        let Some(items) = payload.get("media").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+
+        for item in items {
+            let Some(path) = item
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+            else {
+                continue;
+            };
+
+            let media_kind = item
+                .get("media_kind")
+                .or_else(|| item.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|kind| !kind.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| infer_media_kind_from_path(path));
+
+            let mime_type = item
+                .get("mime_type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|mime| !mime.is_empty())
+                .map(str::to_string);
+
+            media.push(ChatMediaDetail {
+                path: path.to_string(),
+                media_kind,
+                mime_type,
+                source: call.tool_name.clone(),
+            });
+        }
+    }
+
+    media
+}
+
 fn tool_trace_lines(tool_calls: &[ToolCallRecord]) -> Vec<String> {
     tool_calls
         .iter()
@@ -1558,18 +1698,168 @@ fn tool_trace_lines(tool_calls: &[ToolCallRecord]) -> Vec<String> {
         .collect()
 }
 
-fn parse_continue_status(response: &str) -> Option<String> {
-    let trimmed = response.trim();
-    if !trimmed.starts_with(CHAT_CONTINUE_MARKER) {
-        return None;
+fn parse_turn_control(response: &str, tool_call_count: usize) -> ParsedTurnControl {
+    let (cleaned_response, block_json) = extract_metadata_block(
+        response,
+        CHAT_TURN_CONTROL_BLOCK_START,
+        CHAT_TURN_CONTROL_BLOCK_END,
+    );
+    let mut fallback_decision = TurnDecision::Yield;
+    let mut fallback_reason = None;
+    let cleaned_trimmed = cleaned_response.trim().to_string();
+
+    // Backward-compatible marker support while prompts transition.
+    if cleaned_trimmed.starts_with(CHAT_CONTINUE_MARKER_LEGACY) {
+        let status = cleaned_trimmed[CHAT_CONTINUE_MARKER_LEGACY.len()..].trim();
+        fallback_decision = TurnDecision::Continue;
+        fallback_reason = Some(if status.is_empty() {
+            "Continuing autonomous work...".to_string()
+        } else {
+            status.to_string()
+        });
     }
 
-    let status = trimmed[CHAT_CONTINUE_MARKER.len()..].trim();
-    if status.is_empty() {
-        Some("Continuing autonomous work...".to_string())
+    let parsed_block = block_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<TurnControlBlock>(raw).ok());
+
+    let decision = parsed_block
+        .as_ref()
+        .and_then(|b| b.decision.as_deref())
+        .map(parse_turn_decision)
+        .unwrap_or(fallback_decision);
+
+    let needs_user_input = parsed_block
+        .as_ref()
+        .and_then(|b| b.needs_user_input)
+        .unwrap_or(false);
+
+    let status = parsed_block
+        .as_ref()
+        .and_then(|b| b.status.as_deref())
+        .map(normalize_turn_status)
+        .unwrap_or_else(|| {
+            if decision == TurnDecision::Continue {
+                "still_working".to_string()
+            } else if tool_call_count == 0 && needs_user_input {
+                "blocked".to_string()
+            } else {
+                "done".to_string()
+            }
+        });
+
+    let block_user_message = parsed_block
+        .as_ref()
+        .and_then(|b| b.user_message.as_deref())
+        .map(str::trim)
+        .filter(|msg| !msg.is_empty())
+        .filter(|msg| !looks_like_hallucinated_user_turn(msg))
+        .map(str::to_string);
+
+    let visible_assistant_text = strip_legacy_continue_prefix(&cleaned_trimmed).to_string();
+    let operator_response = if !visible_assistant_text.trim().is_empty() {
+        visible_assistant_text
     } else {
-        Some(status.to_string())
+        block_user_message.unwrap_or_default()
+    };
+
+    let reason = parsed_block
+        .as_ref()
+        .and_then(|b| b.reason.as_deref())
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .or(fallback_reason);
+
+    ParsedTurnControl {
+        operator_response,
+        decision,
+        needs_user_input,
+        status,
+        reason,
     }
+}
+
+fn parse_turn_decision(raw: &str) -> TurnDecision {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "continue" => TurnDecision::Continue,
+        _ => TurnDecision::Yield,
+    }
+}
+
+fn normalize_turn_status(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "still_working" | "working" => "still_working".to_string(),
+        "blocked" | "needs_input" => "blocked".to_string(),
+        _ => "done".to_string(),
+    }
+}
+
+fn strip_legacy_continue_prefix(text: &str) -> &str {
+    let trimmed = text.trim();
+    if trimmed.starts_with(CHAT_CONTINUE_MARKER_LEGACY) {
+        trimmed[CHAT_CONTINUE_MARKER_LEGACY.len()..].trim()
+    } else {
+        trimmed
+    }
+}
+
+fn looks_like_hallucinated_user_turn(message: &str) -> bool {
+    let lower = message.trim_start().to_ascii_lowercase();
+    let starts_like_user_turn = [
+        "user:",
+        "operator:",
+        "human:",
+        "**user**:",
+        "**operator**:",
+        "you:",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+
+    let embeds_user_turn = [
+        "\nuser:",
+        "\noperator:",
+        "\nhuman:",
+        "\n**user**:",
+        "\n**operator**:",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    starts_like_user_turn || embeds_user_turn
+}
+
+fn extract_metadata_block(
+    content: &str,
+    start_marker: &str,
+    end_marker: &str,
+) -> (String, Option<String>) {
+    let Some(start_idx) = content.find(start_marker) else {
+        return (content.to_string(), None);
+    };
+    let after_start = start_idx + start_marker.len();
+    let remaining = &content[after_start..];
+    let Some(relative_end) = remaining.find(end_marker) else {
+        return (content.to_string(), None);
+    };
+    let end_idx = after_start + relative_end;
+    let full_end = end_idx + end_marker.len();
+
+    let mut cleaned = String::new();
+    cleaned.push_str(content[..start_idx].trim_end());
+    if full_end < content.len() {
+        let suffix = content[full_end..].trim_start();
+        if !suffix.is_empty() {
+            if !cleaned.is_empty() {
+                cleaned.push('\n');
+            }
+            cleaned.push_str(suffix);
+        }
+    }
+
+    let raw = remaining[..relative_end].trim().to_string();
+    (cleaned, Some(raw))
 }
 
 fn parse_pending_checklist_items(markdown: &str) -> Vec<String> {
@@ -1619,6 +1909,20 @@ fn truncate_for_event(input: &str, max_chars: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn infer_media_kind_from_path(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+
+    match ext.as_deref() {
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp") => "image".to_string(),
+        Some("wav" | "mp3" | "ogg" | "flac" | "m4a") => "audio".to_string(),
+        Some("mp4" | "mov" | "webm" | "mkv" | "avi") => "video".to_string(),
+        _ => "file".to_string(),
+    }
 }
 
 fn ordered_score(v: f64) -> i64 {
@@ -1754,14 +2058,63 @@ not a checklist item
     }
 
     #[test]
-    fn continue_marker_is_parsed() {
-        let parsed = parse_continue_status("[CONTINUE] still gathering more context");
-        assert_eq!(parsed, Some("still gathering more context".to_string()));
+    fn chat_message_format_includes_media_block_when_tool_returns_media_json() {
+        let calls = vec![ToolCallRecord {
+            tool_name: "generate_comfy_media".to_string(),
+            arguments: serde_json::json!({"prompt": "hi"}),
+            output: ToolOutput::Json(serde_json::json!({
+                "media": [
+                    {
+                        "path": "/tmp/generated_test.png",
+                        "media_kind": "image",
+                        "mime_type": "image/png"
+                    }
+                ]
+            })),
+        }];
+
+        let formatted = format_chat_message_with_metadata("Here you go.", &calls, &[]);
+        assert!(formatted.contains(CHAT_MEDIA_BLOCK_START));
+        assert!(formatted.contains(CHAT_MEDIA_BLOCK_END));
+        assert!(formatted.contains("generated_test.png"));
     }
 
     #[test]
-    fn non_continue_response_is_ignored() {
-        let parsed = parse_continue_status("All done!");
-        assert!(parsed.is_none());
+    fn turn_control_block_is_parsed() {
+        let response = "Working...\n[turn_control]\n{\"decision\":\"continue\",\"status\":\"still_working\",\"needs_user_input\":false,\"user_message\":\"Still working...\",\"reason\":\"Need one more tool call\"}\n[/turn_control]";
+        let parsed = parse_turn_control(response, 1);
+        assert_eq!(parsed.decision, TurnDecision::Continue);
+        assert_eq!(parsed.status, "still_working");
+        assert!(!parsed.needs_user_input);
+        assert_eq!(parsed.operator_response, "Working...");
+    }
+
+    #[test]
+    fn legacy_continue_marker_remains_supported() {
+        let parsed = parse_turn_control("[CONTINUE] still gathering more context", 1);
+        assert_eq!(parsed.decision, TurnDecision::Continue);
+        assert_eq!(parsed.operator_response, "still gathering more context");
+    }
+
+    #[test]
+    fn turn_control_defaults_to_yield_without_block() {
+        let parsed = parse_turn_control("All done!", 0);
+        assert_eq!(parsed.decision, TurnDecision::Yield);
+        assert_eq!(parsed.status, "done");
+        assert_eq!(parsed.operator_response, "All done!");
+    }
+
+    #[test]
+    fn turn_control_uses_block_user_message_when_visible_text_missing() {
+        let response = "[turn_control]\n{\"decision\":\"yield\",\"status\":\"done\",\"needs_user_input\":false,\"user_message\":\"Completed successfully.\",\"reason\":\"done\"}\n[/turn_control]";
+        let parsed = parse_turn_control(response, 0);
+        assert_eq!(parsed.operator_response, "Completed successfully.");
+    }
+
+    #[test]
+    fn turn_control_rejects_hallucinated_user_prefixed_block_message() {
+        let response = "[turn_control]\n{\"decision\":\"yield\",\"status\":\"done\",\"needs_user_input\":false,\"user_message\":\"User: please continue with step 2\",\"reason\":\"done\"}\n[/turn_control]";
+        let parsed = parse_turn_control(response, 0);
+        assert_eq!(parsed.operator_response, "");
     }
 }
