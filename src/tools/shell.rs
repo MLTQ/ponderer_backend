@@ -159,6 +159,8 @@ mod tests {
             working_directory: "/tmp".to_string(),
             username: "test".to_string(),
             autonomous: false,
+            allowed_tools: None,
+            disallowed_tools: Vec::new(),
         }
     }
 

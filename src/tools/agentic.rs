@@ -206,7 +206,7 @@ impl AgenticLoop {
         });
 
         // Get tool definitions
-        let tool_defs = self.registry.tool_definitions().await;
+        let tool_defs = self.registry.tool_definitions_for_context(tool_ctx).await;
 
         let mut tool_calls_made = Vec::new();
         let mut iterations = 0;

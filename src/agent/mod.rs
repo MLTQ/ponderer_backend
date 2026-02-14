@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 
 use crate::config::AgentConfig;
-use crate::database::AgentDatabase;
+use crate::database::{AgentDatabase, ChatTurnPhase};
 use crate::memory::archive::{MemoryEvalRunRecord, MemoryPromotionPolicy, PromotionOutcome};
 use crate::memory::eval::{
     default_replay_trace_set, evaluate_trace_set, load_trace_set, EvalBackendKind, MemoryEvalReport,
@@ -549,6 +549,8 @@ impl Agent {
             working_directory,
             username,
             autonomous: true,
+            allowed_tools: None,
+            disallowed_tools: Vec::new(),
         };
 
         match agentic_loop
@@ -918,7 +920,6 @@ impl Agent {
 
         // Collect events from all skills
         let mut all_events: Vec<SkillEvent> = Vec::new();
-        let mut skill_names: Vec<String> = Vec::new();
         {
             let skills = self.skills.read().await;
             for skill in skills.iter() {
@@ -932,7 +933,6 @@ impl Agent {
                             );
                         }
                         all_events.extend(events);
-                        skill_names.push(skill.name().to_string());
                     }
                     Err(e) => {
                         tracing::warn!("Skill '{}' poll failed: {}", skill.name(), e);
@@ -991,177 +991,119 @@ impl Agent {
             }
         };
 
-        // Reason about events using LLM with full context
+        // Reason about events using the same agentic loop used for private chat.
         self.set_state(AgentVisualState::Thinking).await;
         self.emit(AgentEvent::Observation(
-            "Asking LLM to analyze events...".to_string(),
+            "Analyzing skill events via agentic loop...".to_string(),
         ))
         .await;
 
-        let decision = {
-            let reasoning = self.reasoning.read().await;
-            reasoning
-                .analyze_events_with_context(
-                    &filtered_events,
-                    &working_memory_context,
-                    &chat_context,
-                )
-                .await?
+        let (llm_api_url, llm_model, llm_api_key, system_prompt) = {
+            let config = self.config.read().await;
+            (
+                config.llm_api_url.clone(),
+                config.llm_model.clone(),
+                config.llm_api_key.clone(),
+                config.system_prompt.clone(),
+            )
         };
+        let loop_config = AgenticConfig {
+            max_iterations: 8,
+            api_url: agentic_api_url(&llm_api_url),
+            model: llm_model,
+            api_key: llm_api_key,
+            temperature: 0.35,
+            max_tokens: 1536,
+        };
+        let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
+        let tool_ctx = ToolContext {
+            working_directory: std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".to_string()),
+            username: username.clone(),
+            autonomous: true,
+            allowed_tools: None,
+            disallowed_tools: Vec::new(),
+        };
+        let skill_system_prompt = format!(
+            "{}\n\nYou are processing external skill events. Decide whether to take action.\nUse tools when needed.\nIf replying on Graphchan, call tool `graphchan_skill` with action=`reply` and params containing `post_id` (or `event_id`) and `content`; include `thread_id` when known.\nYou may use `write_memory` for durable notes and `search_memory` for recall.\nIf no action is needed, explain briefly and return.",
+            system_prompt
+        );
+        let user_message = build_skill_events_agentic_prompt(
+            &filtered_events,
+            &working_memory_context,
+            &chat_context,
+        );
 
-        match decision {
-            reasoning::Decision::Reply {
-                post_id,
-                content,
-                reasoning,
-            } => {
-                // Show reasoning trace
-                self.emit(AgentEvent::ReasoningTrace(reasoning)).await;
+        match agentic_loop
+            .run(&skill_system_prompt, &user_message, &tool_ctx)
+            .await
+        {
+            Ok(result) => {
+                let mut trace_lines = vec![format!(
+                    "Skill-event agentic pass ({} event(s), {} tool call(s))",
+                    filtered_events.len(),
+                    result.tool_calls_made.len()
+                )];
+                if !result.thinking_blocks.is_empty() {
+                    trace_lines.push(format!(
+                        "Model emitted {} thinking block(s) (hidden from operator-facing outputs)",
+                        result.thinking_blocks.len()
+                    ));
+                }
+                trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
+                self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
 
-                // Execute through the appropriate skill
-                self.set_state(AgentVisualState::Writing).await;
-                self.emit(AgentEvent::Observation(format!(
-                    "Writing reply to event {}...",
-                    &post_id[..post_id.len().min(8)]
-                )))
-                .await;
-
-                // Find the source event to determine parent context
-                let source_event = filtered_events.iter().find(|e| {
-                    let SkillEvent::NewContent { ref id, .. } = e;
-                    *id == post_id
-                });
-
-                let params = serde_json::json!({
-                    "event_id": post_id,
-                    "content": content,
-                    "username": username,
-                });
-
-                // Try executing against each skill until one succeeds
-                let mut executed = false;
+                if let Some(response) = result.response.as_deref().filter(|r| !r.trim().is_empty())
                 {
-                    let skills = self.skills.read().await;
-                    for skill in skills.iter() {
-                        match skill.execute("reply", &params).await {
-                            Ok(result) => {
-                                match result {
-                                    crate::skills::SkillResult::Success { message } => {
-                                        self.emit(AgentEvent::ActionTaken {
-                                            action: format!("Reply via {}", skill.name()),
-                                            result: message,
-                                        })
-                                        .await;
-                                        executed = true;
-                                    }
-                                    crate::skills::SkillResult::Error { message } => {
-                                        tracing::debug!(
-                                            "Skill '{}' could not execute reply: {}",
-                                            skill.name(),
-                                            message
-                                        );
-                                        continue;
-                                    }
-                                }
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::debug!("Skill '{}' reply failed: {}", skill.name(), e);
-                                continue;
-                            }
-                        }
-                    }
+                    self.emit(AgentEvent::Observation(format!(
+                        "Skill-event summary: {}",
+                        truncate_for_event(&response.replace('\n', " "), 220)
+                    )))
+                    .await;
                 }
 
-                if executed {
-                    // Update stats
+                let successful_graphchan_calls = result
+                    .tool_calls_made
+                    .iter()
+                    .filter(|call| call.tool_name == "graphchan_skill" && call.output.is_success())
+                    .count();
+                if successful_graphchan_calls > 0 {
                     let mut state = self.state.write().await;
-                    state.actions_this_hour += 1;
+                    state.actions_this_hour += successful_graphchan_calls as u32;
                     state.last_action_time = Some(chrono::Utc::now());
-                    state.processed_events.insert(post_id.clone());
                     drop(state);
-
+                    self.emit(AgentEvent::ActionTaken {
+                        action: "Graphchan action(s) via agentic loop".to_string(),
+                        result: format!(
+                            "{} successful graphchan_skill call(s)",
+                            successful_graphchan_calls
+                        ),
+                    })
+                    .await;
                     self.set_state(AgentVisualState::Happy).await;
                     sleep(Duration::from_secs(2)).await;
                 } else {
-                    self.emit(AgentEvent::Error(
-                        "No skill could execute the reply".to_string(),
+                    self.emit(AgentEvent::Observation(
+                        "No external reply action was required.".to_string(),
                     ))
                     .await;
-                    self.set_state(AgentVisualState::Confused).await;
-                    // Still mark as processed to avoid retrying repeatedly
-                    let mut state = self.state.write().await;
-                    state.processed_events.insert(post_id.clone());
+                }
+
+                // Mark analyzed events as processed so we don't re-analyze them.
+                let mut state = self.state.write().await;
+                for event in &filtered_events {
+                    let SkillEvent::NewContent { ref id, .. } = event;
+                    state.processed_events.insert(id.clone());
                 }
             }
-            reasoning::Decision::UpdateMemory {
-                key,
-                content,
-                reasoning,
-            } => {
-                // Agent wants to update its working memory
-                self.emit(AgentEvent::ReasoningTrace(reasoning)).await;
-                self.emit(AgentEvent::Observation(format!(
-                    "Updating working memory: {}...",
-                    key
+            Err(e) => {
+                self.emit(AgentEvent::Error(format!(
+                    "Skill-event agentic loop failed: {}",
+                    e
                 )))
                 .await;
-
-                let db_lock = self.database.read().await;
-                if let Some(ref db) = *db_lock {
-                    if let Err(e) = db.set_working_memory(&key, &content) {
-                        tracing::warn!("Failed to update working memory: {}", e);
-                        self.emit(AgentEvent::Error(format!("Failed to save memory: {}", e)))
-                            .await;
-                    } else {
-                        self.emit(AgentEvent::ActionTaken {
-                            action: "Updated memory".to_string(),
-                            result: format!("Key: {}", key),
-                        })
-                        .await;
-                    }
-                }
-
-                // Mark all analyzed events as processed
-                let mut state = self.state.write().await;
-                for event in &filtered_events {
-                    let SkillEvent::NewContent { ref id, .. } = event;
-                    state.processed_events.insert(id.clone());
-                }
-            }
-            reasoning::Decision::ChatReply {
-                content,
-                reasoning,
-                memory_update,
-            } => {
-                // This shouldn't happen in run_cycle (it's for process_chat_messages)
-                // but handle it gracefully
-                self.emit(AgentEvent::ReasoningTrace(reasoning)).await;
-                tracing::warn!(
-                    "Unexpected ChatReply decision in run_cycle, content: {}",
-                    content
-                );
-            }
-            reasoning::Decision::NoAction { reasoning } => {
-                self.emit(AgentEvent::ReasoningTrace(reasoning)).await;
-                self.emit(AgentEvent::Observation(
-                    "No action needed at this time.".to_string(),
-                ))
-                .await;
-
-                // Mark all analyzed events as processed so we don't re-analyze them
-                let mut state = self.state.write().await;
-                for event in &filtered_events {
-                    let SkillEvent::NewContent { ref id, .. } = event;
-                    state.processed_events.insert(id.clone());
-                }
-                let num_marked = filtered_events.len();
-                drop(state);
-
-                tracing::debug!(
-                    "Marked {} events as processed (no action needed)",
-                    num_marked
-                );
+                self.set_state(AgentVisualState::Confused).await;
             }
         }
 
@@ -1247,30 +1189,51 @@ impl Agent {
                 .unwrap_or_else(|_| ".".to_string()),
             username,
             autonomous: false,
+            allowed_tools: None,
+            disallowed_tools: vec![
+                "graphchan_skill".to_string(),
+                "post_to_graphchan".to_string(),
+            ],
         };
 
         let chat_system_prompt = format!(
-            "{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nEvery response MUST end with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nChoose decision='continue' only if more useful work can be done right now without clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.",
+            "{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nDo not use Graphchan posting/reply tools in private chat.\nEvery response MUST end with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.",
             system_prompt,
             CHAT_TURN_CONTROL_BLOCK_START,
             CHAT_TURN_CONTROL_BLOCK_END
         );
 
         for (conversation_id, conversation_messages) in messages_by_conversation {
-            {
-                let db_lock = self.database.read().await;
-                if let Some(ref db) = *db_lock {
-                    for msg in &conversation_messages {
-                        if let Err(e) = db.mark_message_processed(&msg.id) {
-                            tracing::warn!("Failed to mark message as processed: {}", e);
-                        }
-                    }
-                }
-            }
-
             let mut pending_messages = conversation_messages.clone();
+            let mut continuation_hint: Option<String> = None;
+            let mut marked_initial_messages = false;
 
             for turn in 1..=CHAT_MAX_AUTONOMOUS_TURNS {
+                let turn_trigger_message_ids: Vec<String> =
+                    pending_messages.iter().map(|m| m.id.clone()).collect();
+                let turn_id = {
+                    let db_lock = self.database.read().await;
+                    if let Some(ref db) = *db_lock {
+                        match db.begin_chat_turn(
+                            &conversation_id,
+                            &turn_trigger_message_ids,
+                            turn as i64,
+                        ) {
+                            Ok(id) => Some(id),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to persist start of chat turn [{}]: {}",
+                                    truncate_for_event(&conversation_id, 12),
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                };
+
                 self.emit(AgentEvent::Observation(format!(
                     "Operator task [{}] turn {}/{}",
                     truncate_for_event(&conversation_id, 12),
@@ -1293,6 +1256,7 @@ impl Agent {
                     &pending_messages,
                     &working_memory_context,
                     &recent_chat_context,
+                    continuation_hint.as_deref(),
                 );
                 let event_tx = self.event_tx.clone();
                 let stream_conversation_id = conversation_id.clone();
@@ -1315,7 +1279,7 @@ impl Agent {
                     });
                 };
 
-                let result = agentic_loop
+                let result = match agentic_loop
                     .run_with_history_streaming_and_tool_events(
                         &chat_system_prompt,
                         vec![],
@@ -1324,7 +1288,41 @@ impl Agent {
                         &stream_callback,
                         Some(&tool_event_callback),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        if let Some(turn_id) = turn_id.as_deref() {
+                            let db_lock = self.database.read().await;
+                            if let Some(ref db) = *db_lock {
+                                if let Err(db_err) = db.fail_chat_turn(turn_id, &e.to_string()) {
+                                    tracing::warn!(
+                                        "Failed to persist failed chat turn: {}",
+                                        db_err
+                                    );
+                                }
+                                if let Err(db_err) = db.append_daily_activity_log(&format!(
+                                    "chat [{}] turn {} failed: {}",
+                                    truncate_for_event(&conversation_id, 12),
+                                    turn,
+                                    truncate_for_event(&e.to_string(), 180)
+                                )) {
+                                    tracing::warn!(
+                                        "Failed to append chat failure to activity log: {}",
+                                        db_err
+                                    );
+                                }
+                            }
+                        }
+                        self.emit(AgentEvent::Error(format!(
+                            "Private chat turn failed [{}]: {}",
+                            truncate_for_event(&conversation_id, 12),
+                            e
+                        )))
+                        .await;
+                        break;
+                    }
+                };
 
                 let base_response = result.response.unwrap_or_else(|| {
                     if result.tool_calls_made.is_empty() {
@@ -1337,7 +1335,8 @@ impl Agent {
                 let turn_control = parse_turn_control(&base_response, tool_count);
                 let should_continue = turn_control.decision == TurnDecision::Continue
                     && !turn_control.needs_user_input
-                    && turn < CHAT_MAX_AUTONOMOUS_TURNS;
+                    && turn < CHAT_MAX_AUTONOMOUS_TURNS
+                    && (tool_count > 0 || turn_control.status == "still_working");
                 let operator_visible_response = if !turn_control.operator_response.trim().is_empty()
                 {
                     turn_control.operator_response.clone()
@@ -1356,15 +1355,118 @@ impl Agent {
                     &result.thinking_blocks,
                 );
 
+                let mut agent_message_id: Option<String> = None;
+                if !should_continue {
+                    let db_lock = self.database.read().await;
+                    if let Some(ref db) = *db_lock {
+                        let add_result = if let Some(turn_id) = turn_id.as_deref() {
+                            db.add_chat_message_in_turn(
+                                &conversation_id,
+                                turn_id,
+                                "agent",
+                                &chat_content,
+                            )
+                        } else {
+                            db.add_chat_message_in_conversation(
+                                &conversation_id,
+                                "agent",
+                                &chat_content,
+                            )
+                        };
+                        match add_result {
+                            Ok(message_id) => {
+                                agent_message_id = Some(message_id);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to save agent chat reply: {}", e);
+                            }
+                        }
+                    }
+                }
+
                 {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
-                        if let Err(e) = db.add_chat_message_in_conversation(
-                            &conversation_id,
-                            "agent",
-                            &chat_content,
+                        if let Some(turn_id) = turn_id.as_deref() {
+                            for (idx, record) in result.tool_calls_made.iter().enumerate() {
+                                if let Err(e) = db.record_chat_turn_tool_call(
+                                    turn_id,
+                                    idx,
+                                    &record.tool_name,
+                                    &record.arguments.to_string(),
+                                    &record.output.to_llm_string(),
+                                ) {
+                                    tracing::warn!(
+                                        "Failed to persist chat turn tool call {} for {}: {}",
+                                        idx,
+                                        record.tool_name,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+
+                        if !marked_initial_messages
+                            && !should_continue
+                            && agent_message_id.is_some()
+                        {
+                            for msg in &conversation_messages {
+                                if let Err(e) = db.mark_message_processed(&msg.id) {
+                                    tracing::warn!("Failed to mark message as processed: {}", e);
+                                }
+                                if let Err(e) = db.append_daily_activity_log(&format!(
+                                    "operator [{}]: {}",
+                                    truncate_for_event(&conversation_id, 12),
+                                    truncate_for_event(msg.content.trim(), 220)
+                                )) {
+                                    tracing::warn!(
+                                        "Failed to append operator message to activity log: {}",
+                                        e
+                                    );
+                                }
+                            }
+                            marked_initial_messages = true;
+                        }
+                    }
+                }
+
+                if let Some(turn_id) = turn_id.as_deref() {
+                    let completion_phase = if should_continue {
+                        ChatTurnPhase::Completed
+                    } else if turn_control.needs_user_input {
+                        ChatTurnPhase::AwaitingApproval
+                    } else if turn_control.status == "blocked" {
+                        ChatTurnPhase::Failed
+                    } else {
+                        ChatTurnPhase::Completed
+                    };
+                    let decision_text = match turn_control.decision {
+                        TurnDecision::Continue => "continue",
+                        TurnDecision::Yield => "yield",
+                    };
+                    let db_lock = self.database.read().await;
+                    if let Some(ref db) = *db_lock {
+                        if let Err(e) = db.complete_chat_turn(
+                            turn_id,
+                            completion_phase,
+                            decision_text,
+                            &turn_control.status,
+                            &operator_visible_response,
+                            turn_control.reason.as_deref(),
+                            tool_count,
+                            agent_message_id.as_deref(),
                         ) {
-                            tracing::warn!("Failed to save agent chat reply: {}", e);
+                            tracing::warn!("Failed to persist completed chat turn: {}", e);
+                        }
+                        if let Err(e) = db.append_daily_activity_log(&format!(
+                            "agent [{}] turn {}: decision={}, status={}, tools={}",
+                            truncate_for_event(&conversation_id, 12),
+                            turn,
+                            decision_text,
+                            turn_control.status,
+                            tool_count
+                        )) {
+                            tracing::warn!("Failed to append agent turn to activity log: {}", e);
                         }
                     }
                 }
@@ -1398,21 +1500,17 @@ impl Agent {
                     })
                     .await;
 
-                    pending_messages = vec![crate::database::ChatMessage {
-                        id: format!("autonomous_turn_{}_{}", conversation_id, turn),
-                        conversation_id: conversation_id.clone(),
-                        role: "operator".to_string(),
-                        content: format!(
-                            "Continue autonomously on this task. Previous status: {}. {}",
-                            turn_control.status,
-                            turn_control
-                                .reason
-                                .as_deref()
-                                .unwrap_or("Use more tools if needed and stop only when complete or blocked on missing input.")
-                        ),
-                        created_at: Utc::now(),
-                        processed: true,
-                    }];
+                    pending_messages.clear();
+                    continuation_hint = Some(format!(
+                        "Previous autonomous turn: status={}, tools={}, summary=\"{}\", reason=\"{}\". Continue only if meaningful progress is still possible without operator input.",
+                        turn_control.status,
+                        tool_count,
+                        truncate_for_event(&operator_visible_response.replace('\n', " "), 220),
+                        truncate_for_event(
+                            turn_control.reason.as_deref().unwrap_or(""),
+                            180
+                        )
+                    ));
                     continue;
                 }
 
@@ -1535,6 +1633,7 @@ fn build_private_chat_agentic_prompt(
     new_messages: &[crate::database::ChatMessage],
     working_memory_context: &str,
     recent_chat_context: &str,
+    continuation_hint: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
 
@@ -1549,15 +1648,74 @@ fn build_private_chat_agentic_prompt(
         prompt.push_str("\n\n---\n\n");
     }
 
-    prompt.push_str("## New Operator Message(s)\n\n");
-    for msg in new_messages {
-        prompt.push_str("- ");
-        prompt.push_str(msg.content.trim());
+    if !new_messages.is_empty() {
+        prompt.push_str("## New Operator Message(s)\n\n");
+        for msg in new_messages {
+            prompt.push_str("- ");
+            prompt.push_str(msg.content.trim());
+            prompt.push('\n');
+        }
         prompt.push('\n');
     }
 
+    if let Some(hint) = continuation_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+    {
+        prompt.push_str("## Autonomous Continuation Context\n\n");
+        prompt.push_str(hint);
+        prompt.push_str("\n\n");
+    }
+
     prompt.push_str(
-        "\nRespond directly to the operator. Use tools when useful. If you use tools, verify results before answering.",
+        "Respond directly to the operator. Use tools when useful. If you use tools, verify results before answering.",
+    );
+    prompt
+}
+
+fn build_skill_events_agentic_prompt(
+    events: &[SkillEvent],
+    working_memory_context: &str,
+    chat_context: &str,
+) -> String {
+    let mut prompt = String::new();
+
+    if !working_memory_context.trim().is_empty() {
+        prompt.push_str(working_memory_context.trim());
+        prompt.push_str("\n\n---\n\n");
+    }
+    if !chat_context.trim().is_empty() {
+        prompt.push_str(chat_context.trim());
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    prompt.push_str("## Incoming Skill Events\n\n");
+    for (index, event) in events.iter().enumerate() {
+        let SkillEvent::NewContent {
+            id,
+            source,
+            author,
+            body,
+            parent_ids,
+        } = event;
+        let parent_summary = if parent_ids.is_empty() {
+            "none".to_string()
+        } else {
+            parent_ids.join(", ")
+        };
+        prompt.push_str(&format!(
+            "{}. event_id={} source=\"{}\" author=\"{}\" parents=[{}]\n   body: {}\n\n",
+            index + 1,
+            id,
+            source,
+            author,
+            parent_summary,
+            body.trim()
+        ));
+    }
+
+    prompt.push_str(
+        "Decide whether to act. If replying to Graphchan, call `graphchan_skill` with action=`reply` and include `post_id`/`event_id` plus `content` (and `thread_id` when available). If no action is needed, explain why briefly.",
     );
     prompt
 }
@@ -2040,9 +2198,21 @@ not a checklist item
             created_at: now,
             processed: false,
         }];
-        let prompt = build_private_chat_agentic_prompt(&msgs, "", "");
+        let prompt = build_private_chat_agentic_prompt(&msgs, "", "", None);
         assert!(prompt.contains("Please list files"));
         assert!(prompt.contains("Use tools"));
+    }
+
+    #[test]
+    fn chat_prompt_includes_continuation_context_without_fake_operator_turn() {
+        let prompt = build_private_chat_agentic_prompt(
+            &[],
+            "",
+            "",
+            Some("Previous autonomous turn: status=still_working, tools=1"),
+        );
+        assert!(prompt.contains("Autonomous Continuation Context"));
+        assert!(!prompt.contains("New Operator Message(s)"));
     }
 
     #[test]

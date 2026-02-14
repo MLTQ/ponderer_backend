@@ -30,12 +30,13 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 - **Interacts with**: `memory::eval`, `memory::archive`, `AgentDatabase` memory eval/promotion APIs
 
 ### `run_cycle`
-- **Does**: Polls skills, filters events, calls reasoning, executes chosen action (reply/update memory/no-op), and marks events processed
-- **Interacts with**: `reasoning::ReasoningEngine`, `Skill::poll/execute`, `AgentDatabase` memory/chat helpers
+- **Does**: Polls skills, filters new events, then runs a dedicated agentic pass over those events so tool calls (including bridged skill actions) happen in the same loop architecture as private chat
+- **Interacts with**: `Skill::poll`, `tools::agentic::AgenticLoop`, `ToolRegistry` (notably `graphchan_skill`), `AgentDatabase` memory/chat helpers
 
 ### `process_chat_messages`
 - **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, emits per-tool progress updates, and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol
-- **Interacts with**: `database::chat_messages`, `database::chat_conversations`, `tools::agentic::AgenticLoop::run_with_history_streaming_and_tool_events`, `ToolRegistry`
+- **Interacts with**: `database::chat_messages`, `database::chat_conversations`, `database::chat_turns`, `database::chat_turn_tool_calls`, `tools::agentic::AgenticLoop::run_with_history_streaming_and_tool_events`, `ToolRegistry`
+- **Rationale**: Uses continuation hints (not synthetic operator messages) for multi-turn autonomy, scopes private-chat tools away from Graphchan posting, and only persists the final yielded assistant reply to avoid duplicate/confusing intermediate chat bubbles.
 
 ### Persona evolution helpers
 - **Does**: Capture persona snapshots and run trajectory inference on schedule
@@ -51,8 +52,8 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 |-----------|---------|------------------|
 | `main.rs` | `Agent::new(...).run_loop()` drives autonomous behavior without extra orchestration | Changing constructor or loop entrypoint signatures |
 | `ui/app.rs` | `AgentEvent` variants remain stable enough for chat/state rendering, including `ChatStreaming { conversation_id, content, done }` and `ToolCallProgress { ... }` | Renaming/removing emitted event types |
-| `database.rs` | Chat and memory APIs are available and synchronous; conversation-scoped methods exist for private chat (`get_chat_context_for_conversation`, `add_chat_message_in_conversation`) | Changing DB API names or semantics |
-| `tools/mod.rs` | `ToolRegistry` can be shared and used in autonomous context | Removing registry injection from `Agent` |
+| `database.rs` | Chat and memory APIs are available and synchronous; private chat relies on conversation-scoped context plus turn lifecycle APIs (`begin_chat_turn`, `record_chat_turn_tool_call`, `complete_chat_turn`, `fail_chat_turn`, `add_chat_message_in_turn`) | Changing DB API names, turn-state semantics, or message persistence order |
+| `tools/mod.rs` | `ToolRegistry` can be shared and used in autonomous context, including bridged skill tools | Removing registry injection or bridged tool names used by prompts |
 | `tools/agentic.rs` | `AgenticLoop` accepts OpenAI-compatible endpoint and ToolContext for autonomous runs | Changing loop constructor/run signatures |
 | `memory/eval.rs` | Replay evaluation functions remain deterministic and serializable | Breaking report schema or candidate IDs |
 | `ui/chat.rs` | Embedded metadata block delimiters remain stable (`[tool_calls]`, `[thinking]`) | Changing envelope formats without parser update |
@@ -60,10 +61,15 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 
 ## Notes
 - Current behavior combines periodic skill polling with persona maintenance, optional heartbeat automation, and private chat handling.
+- Skill-event handling now goes through the same multi-step tool-calling loop used by private chat, so skill actions and regular tools share one decision engine.
 - Private chat replies are now scoped per conversation ID to avoid cross-thread prompt contamination.
 - Private chat emits a structured turn-control block per assistant response; the loop continues only when decision=`continue`, user input is not needed, and turn budget remains.
+- Private chat continuation now also requires meaningful forward progress signals (`tool_count > 0` or `status=still_working`) before another autonomous turn is allowed.
 - Turn-control parsing treats visible assistant text as authoritative; block `user_message` is only fallback when visible text is empty and does not resemble a hallucinated `User:`/`Operator:` transcript.
 - Tool-call progress is streamed as events during a turn so the UI can show real-time execution output (for example shell output snippets) before final reply persistence.
+- Each autonomous private-chat turn is persisted in DB before/after execution, including tool-call lineage and terminal state (`completed`, `awaiting_approval`, or `failed`), but only the final yielded assistant message is added to chat history.
+- Private chat `ToolContext` explicitly blocks Graphchan posting/reply tools so forum actions stay in skill-event flows.
+- Operator messages and per-turn agent outcomes now append to daily memory log keys (`activity-log-YYYY-MM-DD`) for longitudinal context.
 - Heartbeat mode is guarded by config + due-time checks and is intentionally quiet when no pending tasks/reminders are found.
 - Memory evolution scheduling is heartbeat-triggered but independently rate-limited by its own interval key in `agent_state`.
 - The run loop is intentionally conservative around errors: failures emit events and continue after short backoff.

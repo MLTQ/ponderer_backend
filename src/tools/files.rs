@@ -526,13 +526,14 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn test_ctx() -> ToolContext {
         ToolContext {
             working_directory: "/tmp".to_string(),
             username: "test".to_string(),
             autonomous: false,
+            allowed_tools: None,
+            disallowed_tools: Vec::new(),
         }
     }
 

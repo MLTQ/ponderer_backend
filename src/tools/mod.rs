@@ -12,8 +12,11 @@ pub mod agentic;
 pub mod approval;
 pub mod comfy;
 pub mod files;
+pub mod http;
+pub mod memory;
 pub mod safety;
 pub mod shell;
+pub mod skill_bridge;
 pub mod vision;
 
 use anyhow::Result;
@@ -84,6 +87,29 @@ pub struct ToolContext {
     pub username: String,
     /// Whether the tool is running in autonomous mode (vs interactive with user present)
     pub autonomous: bool,
+    /// If set, only these tool names are callable in this context (case-insensitive)
+    pub allowed_tools: Option<Vec<String>>,
+    /// Tool names that are not callable in this context (case-insensitive)
+    pub disallowed_tools: Vec<String>,
+}
+
+impl ToolContext {
+    pub fn allows_tool(&self, tool_name: &str) -> bool {
+        if self
+            .disallowed_tools
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(tool_name))
+        {
+            return false;
+        }
+
+        match &self.allowed_tools {
+            Some(allowed) => allowed
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(tool_name)),
+            None => true,
+        }
+    }
 }
 
 /// A tool provides the agent with a local capability.
@@ -223,11 +249,38 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Generate tool definitions filtered by execution context policy.
+    pub async fn tool_definitions_for_context(&self, ctx: &ToolContext) -> Vec<ToolDef> {
+        let tools = self.tools.read().await;
+        tools
+            .values()
+            .filter(|tool| ctx.allows_tool(tool.name()))
+            .map(|tool| ToolDef {
+                tool_type: "function".to_string(),
+                function: FunctionDef {
+                    name: tool.name().to_string(),
+                    description: tool.description().to_string(),
+                    parameters: tool.parameters_schema(),
+                },
+            })
+            .collect()
+    }
+
     /// Execute a tool call, handling approval checks.
     ///
     /// Returns `ToolOutput::NeedsApproval` if the tool requires approval
     /// and the context indicates autonomous mode.
     pub async fn execute_call(&self, call: &ToolCall, ctx: &ToolContext) -> ToolCallResult {
+        if !ctx.allows_tool(&call.name) {
+            return ToolCallResult {
+                name: call.name.clone(),
+                output: ToolOutput::Error(format!(
+                    "Tool '{}' is disabled for this context",
+                    call.name
+                )),
+            };
+        }
+
         let tool = match self.get(&call.name).await {
             Some(t) => t,
             None => {
@@ -363,6 +416,8 @@ mod tests {
             working_directory: "/tmp".to_string(),
             username: "test".to_string(),
             autonomous: false,
+            allowed_tools: None,
+            disallowed_tools: Vec::new(),
         }
     }
 
@@ -451,5 +506,28 @@ mod tests {
 
         registry.deregister("echo").await;
         assert!(registry.get("echo").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_context_tool_allowlist_blocks_other_tools() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool)).await;
+        registry.register(Arc::new(DangerousTool)).await;
+
+        let call = ToolCall {
+            name: "dangerous".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let mut ctx = test_ctx();
+        ctx.allowed_tools = Some(vec!["echo".to_string()]);
+
+        let result = registry.execute_call(&call, &ctx).await;
+        assert!(matches!(result.output, ToolOutput::Error(_)));
+        assert!(result.output.to_llm_string().contains("disabled"));
+
+        let defs = registry.tool_definitions_for_context(&ctx).await;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].function.name, "echo");
     }
 }

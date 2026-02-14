@@ -11,7 +11,7 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 
 ### `AgenticLoop::run` / `run_with_history`
 - **Does**: Executes the function-calling loop and returns final response + tool call records
-- **Interacts with**: `ToolRegistry`, tool safety checks, OpenAI-compatible chat completions endpoint
+- **Interacts with**: `ToolRegistry` (context-filtered tool defs + execution), tool safety checks, OpenAI-compatible chat completions endpoint
 
 ### `AgenticLoop::run_with_history_streaming`
 - **Does**: Executes the same loop while forwarding incremental assistant text (`content`) to a callback as it streams in
@@ -39,10 +39,11 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 |-----------|---------|------------------|
 | `../agent/mod.rs` | `AgenticResult` includes `response`, `thinking_blocks`, and `tool_calls_made` | Renaming/removing these fields |
 | `../agent/mod.rs` | `run_with_history_streaming` callback receives evolving full text and a done flag; tool-event callback receives completed `ToolCallRecord`s | Changing callback semantics |
-| `../tools/mod.rs` | Tool calls are executed via `ToolRegistry::execute_call` semantics | Changing execution or safety flow contracts |
+| `../tools/mod.rs` | Tool calls are executed via `ToolRegistry::execute_call` and tool visibility honors `ToolContext` policy | Changing execution or filtering flow contracts |
 | OpenAI-compatible backends | Request/response shape uses `chat/completions` with optional `tools` and optional streaming SSE | Non-compatible payload format changes |
 
 ## Notes
 - Tool outputs are sanitized before being fed back into the loop.
+- Tool definitions are now filtered per `ToolContext` before each loop run, preventing out-of-scope tools from being proposed/called.
 - Thinking tags are preserved only as structured metadata (`thinking_blocks`) for optional UI/debug display.
 - Streaming failures automatically degrade to the non-streaming code path instead of failing the entire agentic call.

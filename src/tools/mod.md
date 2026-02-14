@@ -10,12 +10,19 @@ Defines the shared tool abstraction (`Tool` trait), typed tool I/O (`ToolOutput`
 - **Interacts with**: `tools/agentic.rs` function-calling loop
 
 ### `ToolRegistry`
-- **Does**: Stores tools, builds OpenAI-format tool definitions, and executes calls with approval checks
-- **Interacts with**: `main.rs` (tool registration), `agent/mod.rs` (shared registry), `tools/approval.rs`
+- **Does**: Stores tools, builds OpenAI-format tool definitions, and executes calls with approval checks plus per-context allow/deny filtering
+- **Interacts with**: `main.rs` (tool registration), `agent/mod.rs` (shared registry + context policies), `tools/approval.rs`
+
+### `ToolContext`
+- **Does**: Carries execution metadata (`working_directory`, `username`, `autonomous`) and tool-scope controls (`allowed_tools`, `disallowed_tools`)
+- **Interacts with**: `ToolRegistry::tool_definitions_for_context`, `ToolRegistry::execute_call`, `tools/agentic.rs`
 
 ### Tool modules
 - **Does**: Exposes built-in tool namespaces:
   - `shell`, `files` for local operations
+  - `http` for guarded web/API fetch
+  - `memory` for persistent note search/write
+  - `skill_bridge` for exposing external skill actions (Graphchan) inside the tool loop
   - `comfy` for ComfyUI generation + Graphchan publishing
   - `vision` for local image evaluation, chat media publication, and optional screenshot capture
   - `agentic`, `approval`, `safety` for orchestration and policy
@@ -25,9 +32,10 @@ Defines the shared tool abstraction (`Tool` trait), typed tool I/O (`ToolOutput`
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
 | `main.rs` | Module exports for all built-in tools and stable `ToolRegistry` API | Renaming/removing modules or registry methods |
-| `tools/agentic.rs` | `tool_definitions` and `execute_call` behavior for function-calling loop | Changing payload shapes or return semantics |
+| `tools/agentic.rs` | `tool_definitions_for_context` and `execute_call` enforce `ToolContext` scope rules | Changing context-policy fields or filtering semantics |
 | Tool implementations | `ToolOutput::to_llm_string()` remains usable for model feedback | Altering output encoding conventions |
 
 ## Notes
 - Approval checks happen at registry execution time, not inside each tool.
+- Tool availability can now be restricted per run context before the model sees function defs and again at execution time.
 - `ToolOutput::Json` is now a key channel for rich chat metadata (for example media payloads extracted later by `agent/mod.rs` and `ui/chat.rs`).
