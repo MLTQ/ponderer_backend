@@ -7,7 +7,7 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 
 ### `Agent`
 - **Does**: Owns runtime dependencies (skills, tools, config, database, reasoning engines) and exposes lifecycle operations (`new`, `run_loop`, `reload_config`, `toggle_pause`)
-- **Interacts with**: `config::AgentConfig`, `database::AgentDatabase`, `skills::*`, `tools::ToolRegistry`, `agent::reasoning`, `agent::trajectory`
+- **Interacts with**: `config::AgentConfig`, `database::AgentDatabase`, `skills::*`, `tools::ToolRegistry`, `agent::reasoning`, `agent::trajectory`, `agent::orientation`, `agent::journal`, `agent::concerns`
 
 ### Living Loop foundation modules (`journal`, `concerns`)
 - **Does**: Provide typed records for journal entries and concern tracking used by new ll.1 database tables
@@ -18,7 +18,7 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 - **Interacts with**: `run_loop`, `run_cycle`, and UI-facing event emission
 
 ### `AgentEvent` / `AgentVisualState`
-- **Does**: Defines UI/event bus payloads describing current state, observations, reasoning traces, actions, and errors
+- **Does**: Defines UI/event bus payloads describing current state, observations, reasoning traces, actions, orientation updates, journal writes, concern lifecycle updates, and errors
 - **Interacts with**: `ui::app` via shared flume channel
 
 ### `run_loop`
@@ -42,8 +42,18 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 - **Interacts with**: `presence/mod.rs` (`PresenceMonitor`), `agent/orientation.rs` (`OrientationEngine`, `OrientationContext`), `database.rs` (`save_orientation_snapshot`), `AgentEvent::OrientationUpdate`
 - **Rationale**: Adds situational awareness without changing existing action behavior in phase 2
 
+### `maybe_write_journal_entry`
+- **Does**: Applies journal gating (disposition + unchanged-disposition + minimum interval), requests a private entry from `JournalEngine`, persists it, and emits `JournalWritten`
+- **Interacts with**: `agent/journal.rs` (`JournalEngine`, `journal_skip_reason`), `database.rs` (`add_journal_entry`, `set_state`)
+- **Rationale**: Keeps journaling autonomous but bounded so ambient cycles do not spam repetitive entries
+
+### `maybe_decay_concerns` / `apply_chat_concern_updates`
+- **Does**: Applies salience decay each cycle (`7d -> monitoring`, `30d -> background`, `90d -> dormant`) and updates concerns from private-chat interactions via mention touch + structured concern signals
+- **Interacts with**: `agent/concerns.rs` (`ConcernsManager`, `ConcernSignal`) and `database.rs` concern persistence
+- **Rationale**: Keeps long-lived concern memory fresh without spamming low-value updates
+
 ### `process_chat_messages`
-- **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, emits per-tool progress updates, and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol
+- **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, emits per-tool progress updates, ingests structured concern signals (`[concerns]...[/concerns]`), and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol
 - **Interacts with**: `database::chat_messages`, `database::chat_conversations`, `database::chat_turns`, `database::chat_turn_tool_calls`, `tools::agentic::AgenticLoop::run_with_history_streaming_and_tool_events`, `ToolRegistry`
 - **Rationale**: Uses continuation hints (not synthetic operator messages) for multi-turn autonomy, scopes private-chat tools away from Graphchan posting, compacts long sessions through persisted summary snapshots, and only persists the final yielded assistant reply to avoid duplicate/confusing intermediate chat bubbles.
 
@@ -64,13 +74,13 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
 | `main.rs` | `Agent::new(...).run_loop()` drives autonomous behavior without extra orchestration | Changing constructor or loop entrypoint signatures |
-| `ui/app.rs` | `AgentEvent` variants remain stable enough for chat/state rendering, including `ChatStreaming { conversation_id, content, done }`, `ToolCallProgress { ... }`, and `OrientationUpdate(...)` | Renaming/removing emitted event types |
+| `ui/app.rs` | `AgentEvent` variants remain stable enough for chat/state rendering, including `ChatStreaming { conversation_id, content, done }`, `ToolCallProgress { ... }`, `OrientationUpdate(...)`, `JournalWritten(...)`, `ConcernCreated { ... }`, and `ConcernTouched { ... }` | Renaming/removing emitted event types |
 | `database.rs` | Chat and memory APIs are available and synchronous; private chat relies on conversation-scoped context plus turn lifecycle APIs (`begin_chat_turn`, `record_chat_turn_tool_call`, `complete_chat_turn`, `fail_chat_turn`, `add_chat_message_in_turn`) | Changing DB API names, turn-state semantics, or message persistence order |
 | `tools/mod.rs` | `ToolRegistry` can be shared and used in autonomous context, including bridged skill tools | Removing registry injection or bridged tool names used by prompts |
 | `tools/agentic.rs` | `AgenticLoop` accepts OpenAI-compatible endpoint and ToolContext for autonomous runs | Changing loop constructor/run signatures |
 | `agent/capability_profiles.rs` | Loop context policies are resolved centrally and applied consistently across heartbeat, skill events, and private chat | Bypassing policy resolver or changing profile semantics |
 | `memory/eval.rs` | Replay evaluation functions remain deterministic and serializable | Breaking report schema or candidate IDs |
-| `ui/chat.rs` | Embedded metadata block delimiters remain stable (`[tool_calls]`, `[thinking]`) | Changing envelope formats without parser update |
+| `ui/chat.rs` | Embedded metadata block delimiters remain stable (`[tool_calls]`, `[thinking]`, `[concerns]`) | Changing envelope formats without parser update |
 | `tools/comfy.rs` | Tool JSON with `media` arrays is transformed into chat-visible media payloads | Changing media extraction shape in formatter |
 
 ## Notes
@@ -81,9 +91,12 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 - Private chat emits a structured turn-control block per assistant response; the loop continues only when decision=`continue`, user input is not needed, and turn budget remains.
 - Private chat continuation now also requires meaningful forward progress signals (`tool_count > 0` or `status=still_working`) before another autonomous turn is allowed.
 - Turn-control parsing treats visible assistant text as authoritative; block `user_message` is only fallback when visible text is empty and does not resemble a hallucinated `User:`/`Operator:` transcript.
+- Private-chat prompts now include concern-priority context ahead of general working memory to bias retrieval toward ongoing topics.
+- Concern lifecycle now runs in-loop: decay demotes stale concerns, mention matching reactivates them, and structured concern signals create/touch concerns explicitly.
 - Tool-call progress is streamed as events during a turn so the UI can show real-time execution output (for example shell output snippets) before final reply persistence.
 - Each autonomous private-chat turn is persisted in DB before/after execution, including tool-call lineage and terminal state (`completed`, `awaiting_approval`, or `failed`), but only the final yielded assistant message is added to chat history.
 - Orientation is now refreshed once per cycle as a log-only signal: it emits `OrientationUpdate`, persists `orientation_snapshots`, and uses an input signature cache to avoid repeated LLM calls when context is unchanged.
+- Journal generation now runs off orientation disposition (`journal`) with two anti-spam guards: skip when disposition is unchanged from previous cycle, and skip until a minimum interval elapses since the last entry.
 - Tool access is now enforced by explicit capability profiles per loop (`private_chat`, `skill_events`, `heartbeat`), with optional config overrides for allow/deny lists.
 - Operator messages and per-turn agent outcomes now append to daily memory log keys (`activity-log-YYYY-MM-DD`) for longitudinal context.
 - Heartbeat mode is guarded by config + due-time checks and is intentionally quiet when no pending tasks/reminders are found.

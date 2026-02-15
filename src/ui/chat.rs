@@ -133,6 +133,35 @@ pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
                     );
                     ui.add_space(4.0);
                 }
+                AgentEvent::JournalWritten(summary) => {
+                    ui.label(
+                        RichText::new(format!("📓 Journal: {}", summary))
+                            .color(Color32::LIGHT_GREEN),
+                    );
+                    ui.add_space(4.0);
+                }
+                AgentEvent::ConcernCreated { id, summary } => {
+                    ui.label(
+                        RichText::new(format!(
+                            "🧷 Concern created [{}]: {}",
+                            id.chars().take(8).collect::<String>(),
+                            summary
+                        ))
+                        .color(Color32::LIGHT_BLUE),
+                    );
+                    ui.add_space(4.0);
+                }
+                AgentEvent::ConcernTouched { id, summary } => {
+                    ui.label(
+                        RichText::new(format!(
+                            "🔁 Concern touched [{}]: {}",
+                            id.chars().take(8).collect::<String>(),
+                            summary
+                        ))
+                        .color(Color32::LIGHT_YELLOW),
+                    );
+                    ui.add_space(4.0);
+                }
                 AgentEvent::Error(e) => {
                     ui.label(RichText::new(format!("❌ Error: {}", e)).color(Color32::RED));
                     ui.add_space(4.0);

@@ -1,13 +1,13 @@
 # journal.rs
 
 ## Purpose
-Defines the foundational journal data model for the Living Loop. These are private, timestamped inner-life entries that can later be generated and read by orientation/dream logic.
+Implements the private inner-life journal system for the Living Loop. It defines journal entry types and provides `JournalEngine` to generate authentic, concise inner-monologue entries from orientation/context signals with strict JSON parsing.
 
 ## Components
 
 ### `JournalEntry`
 - **Does**: Represents one journal note with type, text, context, related concerns, and optional mood values
-- **Interacts with**: `database.rs` journal CRUD methods and future `JournalEngine`
+- **Interacts with**: `database.rs` journal CRUD methods and `Agent::maybe_write_journal_entry` in `mod.rs`
 
 ### `JournalEntryType`
 - **Does**: Enumerates journal note categories and provides DB string conversion helpers (`as_db_str`, `from_db`)
@@ -21,12 +21,23 @@ Defines the foundational journal data model for the Living Loop. These are priva
 - **Does**: Stores lightweight affect values captured with an entry (`valence`, `arousal`)
 - **Interacts with**: Orientation synthesis and trend analysis
 
+### `JournalEngine`
+- **Does**: Builds a journal prompt from orientation/recent entries/concerns/events, calls LLM JSON generation, and returns optional `JournalEntry` when the model chooses to write
+- **Interacts with**: `llm_client.rs` (`generate_json`), `orientation.rs`, `concerns.rs`, `skills/mod.rs`
+- **Rationale**: Keeps journal generation isolated from loop orchestration so loop code only applies gating and persistence policy
+
+### `journal_skip_reason`
+- **Does**: Centralizes rate-limit gating logic (`disposition=journal`, unchanged disposition skip, minimum interval)
+- **Interacts with**: `Agent::maybe_write_journal_entry` in `mod.rs`
+
 ## Contracts
 
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
-| `database.rs` | Stable `JournalEntryType` DB string mappings | Renaming enum variants or conversion outputs |
-| Future journal/orientation engines | `JournalEntry` fields are serializable and timestamped in UTC | Removing fields used for context continuity |
+| `database.rs` | Stable `JournalEntryType` DB string mappings and `JournalEntry` serialization | Renaming enum variants or conversion outputs |
+| `agent/mod.rs` | `JournalEngine::maybe_generate_entry` returns `Ok(None)` for skip/no-write conditions instead of hard errors | Changing skip semantics to throw errors |
+| `agent/mod.rs` | `journal_skip_reason` encodes same-disposition and interval gating in one place | Diverging gating logic from helper behavior |
 
 ## Notes
-- This file intentionally contains only types for ll.1 foundation work; behavior is added in later phases.
+- Prompt explicitly asks for inner monologue and varied wording to reduce repetitive report-style entries.
+- Parsing is tolerant: malformed model output causes a skip rather than crashing the loop.

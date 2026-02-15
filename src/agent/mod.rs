@@ -19,6 +19,10 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 
 use crate::agent::capability_profiles::{build_tool_context_for_profile, AgentCapabilityProfile};
+use crate::agent::concerns::{ConcernSignal, ConcernsManager};
+use crate::agent::journal::{
+    journal_skip_reason, JournalEngine, JournalSkipReason, DEFAULT_JOURNAL_MIN_INTERVAL_SECS,
+};
 use crate::agent::orientation::{
     context_signature as orientation_context_signature, Disposition, Orientation,
     OrientationContext, OrientationEngine,
@@ -39,6 +43,7 @@ use crate::tools::ToolRegistry;
 
 const HEARTBEAT_LAST_RUN_STATE_KEY: &str = "heartbeat_last_run_at";
 const MEMORY_EVOLUTION_LAST_RUN_STATE_KEY: &str = "memory_evolution_last_run_at";
+const JOURNAL_LAST_WRITTEN_STATE_KEY: &str = "journal_last_written_at";
 const CHAT_TOOL_BLOCK_START: &str = "[tool_calls]";
 const CHAT_TOOL_BLOCK_END: &str = "[/tool_calls]";
 const CHAT_THINKING_BLOCK_START: &str = "[thinking]";
@@ -47,6 +52,8 @@ const CHAT_MEDIA_BLOCK_START: &str = "[media]";
 const CHAT_MEDIA_BLOCK_END: &str = "[/media]";
 const CHAT_TURN_CONTROL_BLOCK_START: &str = "[turn_control]";
 const CHAT_TURN_CONTROL_BLOCK_END: &str = "[/turn_control]";
+const CHAT_CONCERNS_BLOCK_START: &str = "[concerns]";
+const CHAT_CONCERNS_BLOCK_END: &str = "[/concerns]";
 const CHAT_CONTINUE_MARKER_LEGACY: &str = "[CONTINUE]";
 const CHAT_MAX_AUTONOMOUS_TURNS: usize = 4;
 const CHAT_CONTEXT_RECENT_LIMIT: usize = 18;
@@ -85,6 +92,15 @@ pub enum AgentEvent {
         result: String,
     },
     OrientationUpdate(Orientation),
+    JournalWritten(String),
+    ConcernCreated {
+        id: String,
+        summary: String,
+    },
+    ConcernTouched {
+        id: String,
+        summary: String,
+    },
     Error(String),
 }
 
@@ -119,6 +135,7 @@ pub struct Agent {
     database: Arc<RwLock<Option<AgentDatabase>>>,
     trajectory_engine: Arc<RwLock<Option<trajectory::TrajectoryEngine>>>,
     orientation_engine: Arc<RwLock<OrientationEngine>>,
+    journal_engine: Arc<RwLock<JournalEngine>>,
     presence_monitor: Arc<Mutex<PresenceMonitor>>,
     last_orientation_signature: Arc<RwLock<Option<String>>>,
     last_orientation: Arc<RwLock<Option<Orientation>>>,
@@ -138,6 +155,11 @@ impl Agent {
             config.system_prompt.clone(),
         );
         let orientation_engine = OrientationEngine::new(
+            config.llm_api_url.clone(),
+            config.llm_model.clone(),
+            config.llm_api_key.clone(),
+        );
+        let journal_engine = JournalEngine::new(
             config.llm_api_url.clone(),
             config.llm_model.clone(),
             config.llm_api_key.clone(),
@@ -209,6 +231,7 @@ impl Agent {
             database: Arc::new(RwLock::new(database)),
             trajectory_engine: Arc::new(RwLock::new(trajectory_engine)),
             orientation_engine: Arc::new(RwLock::new(orientation_engine)),
+            journal_engine: Arc::new(RwLock::new(journal_engine)),
             presence_monitor: Arc::new(Mutex::new(PresenceMonitor::new())),
             last_orientation_signature: Arc::new(RwLock::new(None)),
             last_orientation: Arc::new(RwLock::new(None)),
@@ -227,6 +250,11 @@ impl Agent {
             new_config.system_prompt.clone(),
         );
         let new_orientation = OrientationEngine::new(
+            new_config.llm_api_url.clone(),
+            new_config.llm_model.clone(),
+            new_config.llm_api_key.clone(),
+        );
+        let new_journal = JournalEngine::new(
             new_config.llm_api_url.clone(),
             new_config.llm_model.clone(),
             new_config.llm_api_key.clone(),
@@ -275,6 +303,7 @@ impl Agent {
         *self.config.write().await = new_config;
         *self.reasoning.write().await = new_reasoning;
         *self.orientation_engine.write().await = new_orientation;
+        *self.journal_engine.write().await = new_journal;
         *self.image_gen.write().await = new_image_gen;
         *self.trajectory_engine.write().await = new_trajectory;
         *self.last_orientation_signature.write().await = None;
@@ -920,7 +949,7 @@ impl Agent {
         Ok(snapshot)
     }
 
-    async fn maybe_update_orientation(&self, pending_events: &[SkillEvent]) {
+    async fn maybe_update_orientation(&self, pending_events: &[SkillEvent]) -> Option<Orientation> {
         let presence = {
             let mut monitor = self.presence_monitor.lock().await;
             monitor.sample()
@@ -957,9 +986,11 @@ impl Agent {
 
         if signature_matches {
             if let Some(orientation) = self.last_orientation.read().await.clone() {
-                self.emit(AgentEvent::OrientationUpdate(orientation)).await;
+                self.emit(AgentEvent::OrientationUpdate(orientation.clone()))
+                    .await;
+                return Some(orientation);
             }
-            return;
+            return None;
         }
 
         let orientation = {
@@ -973,7 +1004,7 @@ impl Agent {
                         error
                     )))
                     .await;
-                    return;
+                    return None;
                 }
             }
         };
@@ -1018,7 +1049,203 @@ impl Agent {
             orientation.salience_map.len()
         )))
         .await;
-        self.emit(AgentEvent::OrientationUpdate(orientation)).await;
+        self.emit(AgentEvent::OrientationUpdate(orientation.clone()))
+            .await;
+        Some(orientation)
+    }
+
+    async fn maybe_write_journal_entry(
+        &self,
+        orientation: &Orientation,
+        previous_disposition: Option<Disposition>,
+        pending_events: &[SkillEvent],
+    ) {
+        let now = Utc::now();
+        let min_interval_secs = DEFAULT_JOURNAL_MIN_INTERVAL_SECS;
+
+        let (recent_journal, concerns, last_written_at) = {
+            let db_lock = self.database.read().await;
+            if let Some(db) = db_lock.as_ref() {
+                let recent = db.get_recent_journal(6).unwrap_or_default();
+                let concerns = db.get_active_concerns().unwrap_or_default();
+                let last = db
+                    .get_state(JOURNAL_LAST_WRITTEN_STATE_KEY)
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| raw.parse::<chrono::DateTime<Utc>>().ok());
+                (recent, concerns, last)
+            } else {
+                (Vec::new(), Vec::new(), None)
+            }
+        };
+
+        if let Some(reason) = journal_skip_reason(
+            now,
+            last_written_at,
+            orientation.disposition,
+            previous_disposition,
+            min_interval_secs,
+        ) {
+            match reason {
+                JournalSkipReason::DispositionNotJournal => {}
+                JournalSkipReason::SameDisposition => {
+                    tracing::debug!("Skipping journal entry: disposition unchanged");
+                }
+                JournalSkipReason::MinInterval { remaining_secs } => {
+                    tracing::debug!(
+                        "Skipping journal entry: minimum interval not reached ({}s remaining)",
+                        remaining_secs
+                    );
+                }
+            }
+            return;
+        }
+
+        let journal_entry = {
+            let engine = self.journal_engine.read().await;
+            match engine
+                .maybe_generate_entry(orientation, &recent_journal, &concerns, pending_events)
+                .await
+            {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!("Journal generation failed: {}", error);
+                    self.emit(AgentEvent::Error(format!(
+                        "Journal generation failed: {}",
+                        error
+                    )))
+                    .await;
+                    return;
+                }
+            }
+        };
+
+        let Some(entry) = journal_entry else {
+            tracing::debug!("Journal engine returned no entry this cycle");
+            return;
+        };
+
+        {
+            let db_lock = self.database.read().await;
+            if let Some(db) = db_lock.as_ref() {
+                if let Err(error) = db.add_journal_entry(&entry) {
+                    tracing::warn!("Failed to persist journal entry: {}", error);
+                    return;
+                }
+                let _ = db.set_state(
+                    JOURNAL_LAST_WRITTEN_STATE_KEY,
+                    &entry.timestamp.to_rfc3339(),
+                );
+                let _ = db.append_daily_activity_log(&format!(
+                    "Journal entry [{}]: {}",
+                    entry.entry_type.as_db_str(),
+                    truncate_for_event(&entry.content, 180)
+                ));
+            } else {
+                return;
+            }
+        }
+
+        self.emit(AgentEvent::JournalWritten(format!(
+            "{}: {}",
+            entry.entry_type.as_db_str(),
+            truncate_for_event(&entry.content, 180)
+        )))
+        .await;
+    }
+
+    async fn maybe_decay_concerns(&self) {
+        let decay_report = {
+            let db_lock = self.database.read().await;
+            let Some(db) = db_lock.as_ref() else {
+                return;
+            };
+            match ConcernsManager::apply_salience_decay(db, Utc::now()) {
+                Ok(report) => report,
+                Err(error) => {
+                    tracing::warn!("Concern decay failed: {}", error);
+                    return;
+                }
+            }
+        };
+
+        if decay_report.total_changes() == 0 {
+            return;
+        }
+
+        self.emit(AgentEvent::Observation(format!(
+            "Concern decay: monitoring={}, background={}, dormant={}",
+            decay_report.to_monitoring, decay_report.to_background, decay_report.to_dormant
+        )))
+        .await;
+    }
+
+    async fn apply_chat_concern_updates(
+        &self,
+        conversation_id: &str,
+        operator_messages: &[crate::database::ChatMessage],
+        operator_visible_response: &str,
+        concern_signals: &[ConcernSignal],
+    ) {
+        let operator_text = operator_messages
+            .iter()
+            .map(|msg| msg.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reason = format!("chat mention [{}]", truncate_for_event(conversation_id, 12));
+
+        let (touched_from_text, ingest_report) = {
+            let db_lock = self.database.read().await;
+            let Some(db) = db_lock.as_ref() else {
+                return;
+            };
+
+            let mut mention_text = operator_text;
+            if !operator_visible_response.trim().is_empty() {
+                if !mention_text.is_empty() {
+                    mention_text.push('\n');
+                }
+                mention_text.push_str(operator_visible_response.trim());
+            }
+
+            let touched =
+                ConcernsManager::touch_from_text(db, &mention_text, &reason).unwrap_or_default();
+            let report = ConcernsManager::ingest_signals(db, concern_signals, "private_chat")
+                .unwrap_or_default();
+
+            if !report.created.is_empty() || !report.touched.is_empty() {
+                let _ = db.append_daily_activity_log(&format!(
+                    "concerns [{}]: created={}, touched={}",
+                    truncate_for_event(conversation_id, 12),
+                    report.created.len(),
+                    report.touched.len()
+                ));
+            }
+
+            (touched, report)
+        };
+
+        for concern in ingest_report.created {
+            self.emit(AgentEvent::ConcernCreated {
+                id: concern.id,
+                summary: concern.summary,
+            })
+            .await;
+        }
+
+        let mut touched_ids = HashSet::new();
+        for concern in touched_from_text
+            .into_iter()
+            .chain(ingest_report.touched.into_iter())
+        {
+            if touched_ids.insert(concern.id.clone()) {
+                self.emit(AgentEvent::ConcernTouched {
+                    id: concern.id,
+                    summary: concern.summary,
+                })
+                .await;
+            }
+        }
     }
 
     async fn run_cycle(&self) -> Result<()> {
@@ -1088,9 +1315,19 @@ impl Agent {
             })
             .collect();
 
-        // Phase-2 Living Loop integration: orientation is synthesized each cycle
-        // for situational awareness and logging only (no behavior control yet).
-        self.maybe_update_orientation(&filtered_events).await;
+        self.maybe_decay_concerns().await;
+
+        // Phase-2/3 Living Loop integration: orientation is synthesized each cycle,
+        // then journal writing may trigger from disposition=journal with rate limits.
+        let previous_orientation = self.last_orientation.read().await.clone();
+        if let Some(orientation) = self.maybe_update_orientation(&filtered_events).await {
+            self.maybe_write_journal_entry(
+                &orientation,
+                previous_orientation.as_ref().map(|o| o.disposition),
+                &filtered_events,
+            )
+            .await;
+        }
 
         if filtered_events.is_empty() {
             self.emit(AgentEvent::Observation(
@@ -1107,14 +1344,16 @@ impl Agent {
         .await;
 
         // Get working memory and chat context from database
-        let (working_memory_context, chat_context) = {
+        let (working_memory_context, concerns_priority_context, chat_context) = {
             let db_lock = self.database.read().await;
             if let Some(ref db) = *db_lock {
                 let wm = db.get_working_memory_context().unwrap_or_default();
+                let concerns_ctx =
+                    ConcernsManager::build_priority_context(db, 8, 180).unwrap_or_default();
                 let chat = db.get_chat_context(10).unwrap_or_default();
-                (wm, chat)
+                (wm, concerns_ctx, chat)
             } else {
-                (String::new(), String::new())
+                (String::new(), String::new(), String::new())
             }
         };
 
@@ -1153,6 +1392,7 @@ impl Agent {
         );
         let user_message = build_skill_events_agentic_prompt(
             &filtered_events,
+            &concerns_priority_context,
             &working_memory_context,
             &chat_context,
         );
@@ -1282,16 +1522,19 @@ impl Agent {
         .await;
         self.set_state(AgentVisualState::Thinking).await;
 
-        let (working_memory_context, config_snapshot) = {
+        let (working_memory_context, concerns_priority_context, config_snapshot) = {
             let db_lock = self.database.read().await;
-            let wm = if let Some(ref db) = *db_lock {
-                db.get_working_memory_context().unwrap_or_default()
+            let (wm, concerns_ctx) = if let Some(ref db) = *db_lock {
+                (
+                    db.get_working_memory_context().unwrap_or_default(),
+                    ConcernsManager::build_priority_context(db, 10, 220).unwrap_or_default(),
+                )
             } else {
-                String::new()
+                (String::new(), String::new())
             };
 
             let config = self.config.read().await;
-            (wm, config.clone())
+            (wm, concerns_ctx, config.clone())
         };
         let llm_api_url = config_snapshot.llm_api_url.clone();
         let llm_model = config_snapshot.llm_model.clone();
@@ -1318,8 +1561,10 @@ impl Agent {
         );
 
         let chat_system_prompt = format!(
-            "{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nDo not use Graphchan posting/reply tools in private chat.\nEvery response MUST end with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.",
+            "{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nDo not use Graphchan posting/reply tools in private chat.\nIf you detect persistent topics/projects/reminders, append a concerns block:\n{}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[\"optional-key\"]}}]\n{}\nUse an empty array when there are no concern updates.\nEvery response MUST end with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.",
             system_prompt,
+            CHAT_CONCERNS_BLOCK_START,
+            CHAT_CONCERNS_BLOCK_END,
             CHAT_TURN_CONTROL_BLOCK_START,
             CHAT_TURN_CONTROL_BLOCK_END
         );
@@ -1387,6 +1632,7 @@ impl Agent {
 
                 let user_message = build_private_chat_agentic_prompt(
                     &pending_messages,
+                    &concerns_priority_context,
                     &working_memory_context,
                     &recent_chat_context,
                     conversation_summary_context.as_deref(),
@@ -1466,7 +1712,9 @@ impl Agent {
                     }
                 });
                 let tool_count = result.tool_calls_made.len();
-                let turn_control = parse_turn_control(&base_response, tool_count);
+                let (response_without_concerns, concern_signals) =
+                    parse_concern_signals(&base_response);
+                let turn_control = parse_turn_control(&response_without_concerns, tool_count);
                 let should_continue = turn_control.decision == TurnDecision::Continue
                     && !turn_control.needs_user_input
                     && turn < CHAT_MAX_AUTONOMOUS_TURNS
@@ -1480,8 +1728,16 @@ impl Agent {
                         .clone()
                         .unwrap_or_else(|| "Still working on your request...".to_string())
                 } else {
-                    base_response.clone()
+                    response_without_concerns.clone()
                 };
+
+                self.apply_chat_concern_updates(
+                    &conversation_id,
+                    &pending_messages,
+                    &operator_visible_response,
+                    &concern_signals,
+                )
+                .await;
 
                 let chat_content = format_chat_message_with_metadata(
                     &operator_visible_response,
@@ -1927,14 +2183,32 @@ struct TurnControlBlock {
     reason: Option<String>,
 }
 
+fn parse_concern_signals(response: &str) -> (String, Vec<ConcernSignal>) {
+    let (cleaned_response, block_json) =
+        extract_metadata_block(response, CHAT_CONCERNS_BLOCK_START, CHAT_CONCERNS_BLOCK_END);
+
+    let signals = block_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<ConcernSignal>>(raw).ok())
+        .unwrap_or_default();
+
+    (cleaned_response, signals)
+}
+
 fn build_private_chat_agentic_prompt(
     new_messages: &[crate::database::ChatMessage],
+    concerns_priority_context: &str,
     working_memory_context: &str,
     recent_chat_context: &str,
     summary_snapshot: Option<&str>,
     continuation_hint: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
+
+    if !concerns_priority_context.trim().is_empty() {
+        prompt.push_str(concerns_priority_context.trim());
+        prompt.push_str("\n\n---\n\n");
+    }
 
     if !working_memory_context.trim().is_empty() {
         prompt.push_str(working_memory_context.trim());
@@ -1983,10 +2257,16 @@ fn build_private_chat_agentic_prompt(
 
 fn build_skill_events_agentic_prompt(
     events: &[SkillEvent],
+    concerns_priority_context: &str,
     working_memory_context: &str,
     chat_context: &str,
 ) -> String {
     let mut prompt = String::new();
+
+    if !concerns_priority_context.trim().is_empty() {
+        prompt.push_str(concerns_priority_context.trim());
+        prompt.push_str("\n\n---\n\n");
+    }
 
     if !working_memory_context.trim().is_empty() {
         prompt.push_str(working_memory_context.trim());
@@ -2616,7 +2896,7 @@ not a checklist item
             created_at: now,
             processed: false,
         }];
-        let prompt = build_private_chat_agentic_prompt(&msgs, "", "", None, None);
+        let prompt = build_private_chat_agentic_prompt(&msgs, "", "", "", None, None);
         assert!(prompt.contains("Please list files"));
         assert!(prompt.contains("Use tools"));
     }
@@ -2625,6 +2905,7 @@ not a checklist item
     fn chat_prompt_includes_continuation_context_without_fake_operator_turn() {
         let prompt = build_private_chat_agentic_prompt(
             &[],
+            "",
             "",
             "",
             None,
@@ -2638,6 +2919,7 @@ not a checklist item
     fn chat_prompt_includes_summary_snapshot_when_available() {
         let prompt = build_private_chat_agentic_prompt(
             &[],
+            "",
             "",
             "",
             Some("### Objectives\n- Ship session compaction"),
@@ -2726,5 +3008,29 @@ not a checklist item
         let cleaned = strip_inline_thinking_tags(raw);
         assert!(!cleaned.contains("hidden"));
         assert!(cleaned.contains("### Objectives"));
+    }
+
+    #[test]
+    fn parses_concern_signals_block_and_strips_from_response() {
+        let response = "Sure, continuing.\n[concerns]\n[{\"summary\":\"Thermal array calibration\",\"kind\":\"project\",\"confidence\":0.9}]\n[/concerns]\n[turn_control]\n{\"decision\":\"yield\",\"status\":\"done\",\"needs_user_input\":false,\"user_message\":\"Done\",\"reason\":\"done\"}\n[/turn_control]";
+        let (cleaned, signals) = parse_concern_signals(response);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].summary, "Thermal array calibration");
+        assert!(!cleaned.contains("[concerns]"));
+        assert!(cleaned.contains("[turn_control]"));
+    }
+
+    #[test]
+    fn chat_prompt_includes_concern_priority_context() {
+        let prompt = build_private_chat_agentic_prompt(
+            &[],
+            "## Concern Priority Context\n- [active] Ship concerns manager",
+            "",
+            "",
+            None,
+            None,
+        );
+        assert!(prompt.contains("Concern Priority Context"));
+        assert!(prompt.contains("Ship concerns manager"));
     }
 }
