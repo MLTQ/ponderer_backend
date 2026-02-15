@@ -191,10 +191,24 @@ impl AgentApp {
 }
 
 fn conversation_display_label(conversation: &ChatConversation) -> String {
-    if conversation.message_count == 0 {
+    let base = if conversation.message_count == 0 {
         conversation.title.clone()
     } else {
         format!("{} ({})", conversation.title, conversation.message_count)
+    };
+
+    let status_suffix = match conversation.runtime_state {
+        crate::database::ChatTurnPhase::Idle => "",
+        crate::database::ChatTurnPhase::Processing => " · processing",
+        crate::database::ChatTurnPhase::Completed => " · done",
+        crate::database::ChatTurnPhase::AwaitingApproval => " · awaiting input",
+        crate::database::ChatTurnPhase::Failed => " · failed",
+    };
+
+    if status_suffix.is_empty() {
+        base
+    } else {
+        format!("{}{}", base, status_suffix)
     }
 }
 

@@ -15,7 +15,7 @@ Defines `AgentApp`, the top-level eframe application. It owns the agent handle, 
 - **Interacts with**: `SettingsPanel`, `CharacterPanel`, `ComfySettingsPanel`, `AgentConfig`
 
 ### `AgentApp::refresh_conversations()`
-- **Does**: Refreshes available chat threads and keeps `active_conversation_id` valid when threads change
+- **Does**: Refreshes available chat threads (including persisted runtime status) and keeps `active_conversation_id` valid when threads change
 - **Interacts with**: `AgentDatabase::list_chat_conversations`
 
 ### `AgentApp::refresh_chat_history()`
@@ -34,6 +34,10 @@ Defines `AgentApp`, the top-level eframe application. It owns the agent handle, 
 - **Does**: Reads avatar paths from config and delegates to `AvatarSet::load`
 - **Interacts with**: `AvatarSet`, `AgentConfig` fields `avatar_idle`, `avatar_thinking`, `avatar_active`
 
+### `conversation_display_label(conversation)` (private)
+- **Does**: Builds conversation picker labels from title/message count and appends a runtime-state suffix (`processing`, `done`, `awaiting input`, `failed`) when non-idle
+- **Interacts with**: `ChatConversation.runtime_state` from `database.rs`
+
 ### `impl eframe::App for AgentApp` -- `update()`
 - **Does**: Main render loop. Loads avatars on first frame, polls `event_rx` for `AgentEvent`s, maps `ChatStreaming` events into a live preview bubble, records `ToolCallProgress` updates into a per-conversation live buffer, refreshes chat on operator-related actions, renders header with sprite, toolbar buttons, primary private chat (including media rendering via shared cache), a live "Agent Turn" tool-output drawer, secondary activity side panel, multiline chat input, and all modal panels (settings, character, comfy workflow). Persists config and hot-reloads the agent on save.
 - **Interacts with**: `sprite::render_agent_sprite`, `chat::render_event_log`, `chat::render_private_chat`, `SettingsPanel::render`, `CharacterPanel::render`, `ComfySettingsPanel::render`, `Agent::reload_config`, `Agent::toggle_pause`
@@ -45,12 +49,13 @@ Defines `AgentApp`, the top-level eframe application. It owns the agent handle, 
 | Binary entry point | `AgentApp::new` signature with `Receiver<AgentEvent>`, `Arc<Agent>`, `AgentConfig`, `Option<Arc<AgentDatabase>>` | Changing constructor args breaks startup |
 | `SettingsPanel` | `config` field is public and mutated by `CharacterPanel` saves | Making `config` private breaks cross-panel sync |
 | `Agent` | `reload_config` and `toggle_pause` are async | Removing these methods breaks UI buttons |
-| `AgentDatabase` | Conversation APIs (`list_chat_conversations`, `create_chat_conversation`, `get_chat_history_for_conversation`, `add_chat_message_in_conversation`) | Changing DB API signatures breaks chat switching/composer |
+| `AgentDatabase` | Conversation APIs (`list_chat_conversations`, `create_chat_conversation`, `get_chat_history_for_conversation`, `add_chat_message_in_conversation`) plus `ChatConversation.runtime_state` semantics | Removing runtime-state field or changing chat API signatures breaks picker/status behavior |
 | `agent::AgentEvent` | Streaming updates include `conversation_id`, partial/full `content`, and `done` state; tool updates include `ToolCallProgress` with preview text | Changing event payload shape breaks preview/drawer rendering |
 
 ## Notes
 - A dedicated `tokio::runtime::Runtime` is created inside the app because eframe's render loop is synchronous. All async agent calls are dispatched through `self.runtime.spawn`.
 - Chat conversations and active-conversation history auto-refresh every 2 seconds via `last_chat_refresh` timer.
+- Conversation picker labels include DB-backed runtime state so users can see when a thread is still processing, waiting for input, or failed.
 - Avatar loading is deferred to the first `update()` call because `egui::Context` is not available at construction time.
 - Chat input is multiline; plain `Enter` sends while `Shift+Enter` inserts a newline.
 - Live provider tokens are shown inline in chat via `streaming_chat_preview` and replaced by persisted messages once the agent saves final output.

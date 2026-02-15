@@ -1,7 +1,7 @@
 # database.rs
 
 ## Purpose
-Provides the agent's persistent memory layer via SQLite. Stores important posts, reflection history, persona snapshots (for personality evolution tracking), private chat messages, chat conversation threads, and key-value state. Working-memory CRUD now routes through a versioned `MemoryBackend` abstraction while preserving the existing KV behavior (`kv_v1`).
+Provides the agent's persistent memory layer via SQLite. Stores important posts, reflection history, persona snapshots (for personality evolution tracking), private chat sessions/conversations/turns/messages, per-turn tool call lineage, and key-value state. Working-memory CRUD routes through a versioned `MemoryBackend` abstraction while preserving the existing KV behavior (`kv_v1`).
 
 ## Components
 
@@ -28,6 +28,10 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - **Does**: Key-value scratchpad entries the agent can read/write between sessions
 - **Interacts with**: `memory::MemoryBackend` contract, `get_working_memory_context()` formats all entries for LLM context injection
 
+### Working-memory search/log methods (`search_working_memory`, `append_daily_activity_log`)
+- **Does**: Performs ranked text search over persisted memory entries and appends timestamped daily activity lines into date-keyed memory notes
+- **Interacts with**: `tools::memory::{search_memory, write_memory}`, `agent::process_chat_messages` automatic conversation logging
+
 ### `get_memory_design_version` / `set_memory_design_version`
 - **Does**: Persists and reads active memory design metadata from `agent_state` (`memory_design_id`, `memory_schema_version`)
 - **Interacts with**: `memory::MemoryDesignVersion`, startup initialization in `AgentDatabase::new`
@@ -42,15 +46,31 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - **Rationale**: Makes promotion outcomes auditable/reproducible and ensures rollback target is always persisted
 
 ### `ChatMessage`
-- **Does**: Private operator-agent chat messages with `conversation_id` routing and a `processed` flag for the agent to track unread messages
+- **Does**: Private operator-agent chat messages with `conversation_id` routing, `processed` unread tracking, and optional `turn_id` linkage for agent replies
 - **Interacts with**: UI chat panel, `agent::Agent` poll loop
 
-### `ChatConversation`
-- **Does**: Conversation-level metadata (`id`, `title`, timestamps, message stats) used by the UI for multi-chat selection
-- **Interacts with**: `ui::app` conversation picker, `chat_messages` table via `conversation_id`
+### `ChatTurnPhase`
+- **Does**: Encodes persisted lifecycle states shared across conversations and turns (`idle`, `processing`, `completed`, `awaiting_approval`, `failed`)
+- **Interacts with**: `chat_conversations.runtime_state`, `chat_turns.phase_state`, `agent::process_chat_messages`
 
-### Chat conversation methods (`create_chat_conversation`, `list_chat_conversations`, `add_chat_message_in_conversation`, `get_chat_history_for_conversation`, `get_chat_context_for_conversation`)
-- **Does**: Creates and lists conversation threads, writes messages to a specific thread, and returns thread-scoped history/context
+### `ChatSession`
+- **Does**: Top-level container grouping conversation threads for long-running desktop usage
+- **Interacts with**: `chat_conversations.session_id`, default bootstrap row (`default_session`)
+
+### `ChatConversation`
+- **Does**: Conversation-level metadata (`id`, `session_id`, `title`, timestamps, runtime state, active turn pointer, message stats) used by the UI for multi-chat selection and status display
+- **Interacts with**: `ui::app` conversation picker/status label, `chat_messages` and `chat_turns` via `conversation_id`
+
+### `ChatTurn` / `ChatTurnToolCall`
+- **Does**: Persist one agent turn with decision/status/error context and per-tool input/output records for replay/debug
+- **Interacts with**: `agent::process_chat_messages`, future turn history/undo/resume UX
+
+### Chat lifecycle methods (`begin_chat_turn`, `record_chat_turn_tool_call`, `complete_chat_turn`, `fail_chat_turn`, `list_chat_turns_for_conversation`, `list_chat_turn_tool_calls`)
+- **Does**: Implements persisted turn state transitions and tool-call lineage for each conversation thread
+- **Interacts with**: `agent::process_chat_messages` autonomous turn loop, diagnostics/recovery tooling
+
+### Chat conversation methods (`create_chat_conversation`, `list_chat_conversations`, `add_chat_message_in_conversation`, `add_chat_message_in_turn`, `get_chat_history_for_conversation`, `get_chat_context_for_conversation`)
+- **Does**: Creates/lists conversation threads, writes messages (optionally bound to a turn), and returns thread-scoped history/context
 - **Interacts with**: `ui::app::AgentApp` new-chat/switch-chat actions, `agent::process_chat_messages` per-conversation prompt building
 
 ### `CharacterCard` (DB model)
@@ -62,18 +82,18 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
 | `main.rs` | `AgentDatabase::new(path)` creates/opens DB, ensures schema, and initializes memory design metadata | Changing startup initialization or metadata keys |
-| `agent::Agent` | Methods: `get_recent_important_posts`, `save_important_post`, `get_current_system_prompt`, `set_current_system_prompt`, `get_unprocessed_operator_messages`, `mark_message_processed`, `save_persona_snapshot`, `get_working_memory_context`, `get_chat_context_for_conversation`, `add_chat_message_in_conversation` | Removing or renaming any public method |
-| `ui::app` | `list_chat_conversations`, `create_chat_conversation`, `get_chat_history_for_conversation`, `add_chat_message_in_conversation`, plus legacy `get_chat_history` | Changing return types/signatures of chat query and write methods |
+| `agent::Agent` | Chat APIs include turn lifecycle methods plus conversation-scoped message/context methods (`begin_chat_turn`, `record_chat_turn_tool_call`, `complete_chat_turn`, `fail_chat_turn`, `add_chat_message_in_turn`) | Removing/renaming lifecycle methods or changing state semantics |
+| `ui::app` | `ChatConversation` includes `runtime_state`; conversation APIs remain (`list_chat_conversations`, `create_chat_conversation`, `get_chat_history_for_conversation`, `add_chat_message_in_conversation`) | Removing runtime state fields or changing chat query/write signatures |
 | `memory::mod` | `MemoryBackend` trait and `MemoryDesignVersion` metadata keys remain stable | Changing backend trait signatures or metadata semantics |
 | `memory::archive` | Archive methods serialize/deserialize policy + metrics snapshots without loss | Changing JSON field contracts for policy/snapshot structs |
 
 ## Notes
 - All timestamps stored as RFC 3339 strings in SQLite, parsed back to `chrono::DateTime<Utc>`.
 - `ensure_schema()` uses `CREATE TABLE IF NOT EXISTS` -- no formal migration system. Adding columns requires manual ALTER TABLE handling.
-- `ensure_schema()` now performs a manual chat migration by checking `PRAGMA table_info(chat_messages)` and adding `conversation_id` when missing.
+- `ensure_schema()` performs manual chat migrations by checking `PRAGMA table_info(...)` and adding missing columns (`conversation_id`, `turn_id`, `session_id`, `runtime_state`, `active_turn_id`) in place.
 - Memory design metadata is stored in `agent_state` under `memory_design_id` and `memory_schema_version`.
 - Memory evolution archive uses three tables: `memory_design_archive`, `memory_eval_runs`, `memory_promotion_decisions`.
 - `memory_promotion_decisions` enforces rollback fields (`rollback_design_id`, `rollback_schema_version`) as NOT NULL.
 - `save_character_card` deletes all existing cards before inserting (singleton pattern).
 - The `agent_state` table is a generic key-value store used for `current_system_prompt` and `last_reflection_time`.
-- A default thread (`id = "default"`) is auto-created for backward compatibility with old data and legacy `add_chat_message`.
+- Default chat bootstrap rows are auto-created for both session (`default_session`) and conversation (`default`) compatibility.

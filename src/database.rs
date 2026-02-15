@@ -106,16 +106,90 @@ pub struct ChatMessage {
     pub processed: bool, // Has the agent seen/responded to this?
 }
 
+pub const DEFAULT_CHAT_SESSION_ID: &str = "default_session";
 pub const DEFAULT_CHAT_CONVERSATION_ID: &str = "default";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatTurnPhase {
+    Idle,
+    Processing,
+    Completed,
+    AwaitingApproval,
+    Failed,
+}
+
+impl ChatTurnPhase {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            ChatTurnPhase::Idle => "idle",
+            ChatTurnPhase::Processing => "processing",
+            ChatTurnPhase::Completed => "completed",
+            ChatTurnPhase::AwaitingApproval => "awaiting_approval",
+            ChatTurnPhase::Failed => "failed",
+        }
+    }
+
+    fn from_db(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "processing" => ChatTurnPhase::Processing,
+            "completed" => ChatTurnPhase::Completed,
+            "awaiting_approval" => ChatTurnPhase::AwaitingApproval,
+            "failed" => ChatTurnPhase::Failed,
+            _ => ChatTurnPhase::Idle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSession {
+    pub id: String,
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatConversation {
     pub id: String,
+    pub session_id: String,
     pub title: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub runtime_state: ChatTurnPhase,
+    pub active_turn_id: Option<String>,
     pub message_count: usize,
     pub last_message_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatTurn {
+    pub id: String,
+    pub session_id: String,
+    pub conversation_id: String,
+    pub iteration: i64,
+    pub phase_state: ChatTurnPhase,
+    pub decision: Option<String>,
+    pub status: Option<String>,
+    pub trigger_message_ids: Vec<String>,
+    pub operator_message: Option<String>,
+    pub reason: Option<String>,
+    pub error: Option<String>,
+    pub tool_call_count: usize,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub agent_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatTurnToolCall {
+    pub id: String,
+    pub turn_id: String,
+    pub call_index: usize,
+    pub tool_name: String,
+    pub arguments_json: String,
+    pub output_text: String,
+    pub created_at: DateTime<Utc>,
 }
 
 pub struct AgentDatabase {
@@ -152,17 +226,24 @@ impl AgentDatabase {
         Ok(())
     }
 
-    fn ensure_chat_messages_conversation_column(&self, conn: &Connection) -> Result<()> {
-        let mut stmt = conn.prepare("PRAGMA table_info(chat_messages)")?;
+    fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
         let columns = stmt
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(columns.iter().any(|name| name == column))
+    }
 
-        if !columns.iter().any(|name| name == "conversation_id") {
+    fn ensure_chat_messages_conversation_column(&self, conn: &Connection) -> Result<()> {
+        if !Self::table_has_column(conn, "chat_messages", "conversation_id")? {
             conn.execute(
                 "ALTER TABLE chat_messages ADD COLUMN conversation_id TEXT NOT NULL DEFAULT 'default'",
                 [],
             )?;
+        }
+
+        if !Self::table_has_column(conn, "chat_messages", "turn_id")? {
+            conn.execute("ALTER TABLE chat_messages ADD COLUMN turn_id TEXT", [])?;
         }
 
         conn.execute(
@@ -173,16 +254,64 @@ impl AgentDatabase {
         Ok(())
     }
 
+    fn ensure_chat_conversations_runtime_columns(&self, conn: &Connection) -> Result<()> {
+        if !Self::table_has_column(conn, "chat_conversations", "session_id")? {
+            conn.execute(
+                "ALTER TABLE chat_conversations ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default_session'",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(conn, "chat_conversations", "runtime_state")? {
+            conn.execute(
+                "ALTER TABLE chat_conversations ADD COLUMN runtime_state TEXT NOT NULL DEFAULT 'idle'",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(conn, "chat_conversations", "active_turn_id")? {
+            conn.execute(
+                "ALTER TABLE chat_conversations ADD COLUMN active_turn_id TEXT",
+                [],
+            )?;
+        }
+
+        conn.execute(
+            "UPDATE chat_conversations
+             SET session_id = ?1
+             WHERE session_id IS NULL OR TRIM(session_id) = ''",
+            [DEFAULT_CHAT_SESSION_ID],
+        )?;
+        conn.execute(
+            "UPDATE chat_conversations
+             SET runtime_state = ?1
+             WHERE runtime_state IS NULL OR TRIM(runtime_state) = ''",
+            [ChatTurnPhase::Idle.as_db_str()],
+        )?;
+
+        Ok(())
+    }
+
+    fn ensure_default_chat_session(&self, conn: &Connection) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_sessions (id, label, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![DEFAULT_CHAT_SESSION_ID, "Default session", now.clone(), now],
+        )?;
+        Ok(())
+    }
+
     fn ensure_default_chat_conversation(&self, conn: &Connection) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT OR IGNORE INTO chat_conversations (id, title, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO chat_conversations (id, session_id, title, created_at, updated_at, runtime_state, active_turn_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
             params![
                 DEFAULT_CHAT_CONVERSATION_ID,
+                DEFAULT_CHAT_SESSION_ID,
                 "Default chat",
                 now.clone(),
-                now
+                now,
+                ChatTurnPhase::Idle.as_db_str(),
             ],
         )?;
         Ok(())
@@ -340,30 +469,83 @@ impl AgentDatabase {
             [],
         )?;
 
-        // Conversation metadata for private operator chat
+        // Session metadata for grouping chat threads over long-running use.
         conn.execute(
-            r#"CREATE TABLE IF NOT EXISTS chat_conversations (
+            r#"CREATE TABLE IF NOT EXISTS chat_sessions (
                 id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
+                label TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )"#,
             [],
         )?;
 
-        // Private chat between operator and agent
+        // Conversation metadata for private operator chat.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS chat_conversations (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL DEFAULT 'default_session',
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                runtime_state TEXT NOT NULL DEFAULT 'idle',
+                active_turn_id TEXT
+            )"#,
+            [],
+        )?;
+
+        // Private chat between operator and agent.
         conn.execute(
             r#"CREATE TABLE IF NOT EXISTS chat_messages (
                 id TEXT PRIMARY KEY,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                processed INTEGER NOT NULL DEFAULT 0
+                processed INTEGER NOT NULL DEFAULT 0,
+                turn_id TEXT
+            )"#,
+            [],
+        )?;
+
+        // Conversation turns with explicit lifecycle.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS chat_turns (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                iteration INTEGER NOT NULL,
+                phase_state TEXT NOT NULL,
+                decision TEXT,
+                status TEXT,
+                trigger_message_ids_json TEXT NOT NULL,
+                operator_message TEXT,
+                reason TEXT,
+                error TEXT,
+                tool_call_count INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                agent_message_id TEXT
+            )"#,
+            [],
+        )?;
+
+        // Tool output lineage for each turn.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS chat_turn_tool_calls (
+                id TEXT PRIMARY KEY,
+                turn_id TEXT NOT NULL,
+                call_index INTEGER NOT NULL,
+                tool_name TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                output_text TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )"#,
             [],
         )?;
 
         self.ensure_chat_messages_conversation_column(&conn)?;
+        self.ensure_chat_conversations_runtime_columns(&conn)?;
+        self.ensure_default_chat_session(&conn)?;
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at ASC)",
@@ -371,6 +553,30 @@ impl AgentDatabase {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_created_at ON chat_messages(conversation_id, created_at ASC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_turn_id ON chat_messages(turn_id)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_conversations_session_updated ON chat_conversations(session_id, updated_at DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_conversations_runtime_state ON chat_conversations(runtime_state)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_turns_conversation_started ON chat_turns(conversation_id, started_at DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_turns_phase_state ON chat_turns(phase_state)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_turn_tool_calls_turn_idx ON chat_turn_tool_calls(turn_id, call_index ASC)",
             [],
         )?;
 
@@ -1150,6 +1356,92 @@ impl AgentDatabase {
         self.memory_backend.list_entries(&conn)
     }
 
+    /// Search working memory entries using a simple relevance rank over key/content text.
+    pub fn search_working_memory(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkingMemoryEntry>> {
+        let max_results = limit.max(1);
+        let trimmed_query = query.trim();
+        let mut entries = self.get_all_working_memory()?;
+        if trimmed_query.is_empty() {
+            entries.truncate(max_results);
+            return Ok(entries);
+        }
+
+        let query_lower = trimmed_query.to_ascii_lowercase();
+        let terms: Vec<&str> = query_lower
+            .split_whitespace()
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        let mut ranked = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let key_lower = entry.key.to_ascii_lowercase();
+                let content_lower = entry.content.to_ascii_lowercase();
+
+                let mut score: i32 = 0;
+                if key_lower.contains(&query_lower) {
+                    score += 6;
+                }
+                if content_lower.contains(&query_lower) {
+                    score += 5;
+                }
+                for term in &terms {
+                    if key_lower.contains(term) {
+                        score += 3;
+                    }
+                    if content_lower.contains(term) {
+                        score += 1;
+                    }
+                }
+
+                if score > 0 {
+                    Some((score, entry))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.updated_at.cmp(&a.1.updated_at))
+        });
+        ranked.truncate(max_results);
+        Ok(ranked.into_iter().map(|(_, entry)| entry).collect())
+    }
+
+    /// Append one line to today's activity log in working memory.
+    pub fn append_daily_activity_log(&self, entry: &str) -> Result<()> {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+
+        let now = Utc::now();
+        let day_key = format!("activity-log-{}", now.format("%Y-%m-%d"));
+        let line = format!("- [{} UTC] {}", now.format("%H:%M:%S"), trimmed);
+        let existing = self
+            .get_working_memory(&day_key)?
+            .map(|item| item.content)
+            .unwrap_or_default();
+
+        let merged = if existing.trim().is_empty() {
+            format!(
+                "Daily activity log for {}\n\n{}",
+                now.format("%Y-%m-%d"),
+                line
+            )
+        } else {
+            format!("{}\n{}", existing.trim_end(), line)
+        };
+
+        self.set_working_memory(&day_key, &merged)
+    }
+
     /// Delete a working memory entry
     pub fn delete_working_memory(&self, key: &str) -> Result<()> {
         let conn = self.lock_conn()?;
@@ -1179,12 +1471,12 @@ impl AgentDatabase {
         self.add_chat_message_in_conversation(DEFAULT_CHAT_CONVERSATION_ID, role, content)
     }
 
-    /// Add a chat message to a specific conversation.
-    pub fn add_chat_message_in_conversation(
+    fn add_chat_message_internal(
         &self,
         conversation_id: &str,
         role: &str,
         content: &str,
+        turn_id: Option<&str>,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let conversation_id = if conversation_id.trim().is_empty() {
@@ -1193,23 +1485,75 @@ impl AgentDatabase {
             conversation_id.trim()
         };
         let now = Utc::now().to_rfc3339();
+        let processed = if role.eq_ignore_ascii_case("operator") {
+            0
+        } else {
+            1
+        };
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT OR IGNORE INTO chat_conversations (id, title, created_at, updated_at)
+            "INSERT OR IGNORE INTO chat_sessions (id, label, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![conversation_id, "Conversation", now.clone(), now.clone()],
+            params![
+                DEFAULT_CHAT_SESSION_ID,
+                "Default session",
+                now.clone(),
+                now.clone()
+            ],
         )?;
         conn.execute(
-            "INSERT INTO chat_messages (id, conversation_id, role, content, created_at, processed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, conversation_id, role, content, now.clone(), 0],
+            "INSERT OR IGNORE INTO chat_conversations (id, session_id, title, created_at, updated_at, runtime_state, active_turn_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![
+                conversation_id,
+                DEFAULT_CHAT_SESSION_ID,
+                "Conversation",
+                now.clone(),
+                now.clone(),
+                ChatTurnPhase::Idle.as_db_str(),
+            ],
         )?;
         conn.execute(
-            "UPDATE chat_conversations
-             SET updated_at = ?2
-             WHERE id = ?1",
-            params![conversation_id, now],
+            "INSERT INTO chat_messages (id, conversation_id, role, content, created_at, processed, turn_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, conversation_id, role, content, now.clone(), processed, turn_id],
         )?;
+        if role.eq_ignore_ascii_case("operator") {
+            conn.execute(
+                "UPDATE chat_conversations
+                 SET runtime_state = ?2, active_turn_id = NULL, updated_at = ?3
+                 WHERE id = ?1",
+                params![conversation_id, ChatTurnPhase::Idle.as_db_str(), now],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE chat_conversations
+                 SET updated_at = ?2
+                 WHERE id = ?1",
+                params![conversation_id, now],
+            )?;
+        }
         Ok(id)
+    }
+
+    /// Add a chat message to a specific conversation.
+    pub fn add_chat_message_in_conversation(
+        &self,
+        conversation_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<String> {
+        self.add_chat_message_internal(conversation_id, role, content, None)
+    }
+
+    /// Add a chat message and attach it to a specific turn.
+    pub fn add_chat_message_in_turn(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<String> {
+        self.add_chat_message_internal(conversation_id, role, content, Some(turn_id))
     }
 
     /// Create a new conversation and return it.
@@ -1225,16 +1569,36 @@ impl AgentDatabase {
 
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO chat_conversations (id, title, created_at, updated_at)
+            "INSERT OR IGNORE INTO chat_sessions (id, label, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![id, title, now_str.clone(), now_str],
+            params![
+                DEFAULT_CHAT_SESSION_ID,
+                "Default session",
+                now_str.clone(),
+                now_str.clone()
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO chat_conversations (id, session_id, title, created_at, updated_at, runtime_state, active_turn_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![
+                id,
+                DEFAULT_CHAT_SESSION_ID,
+                title,
+                now_str.clone(),
+                now_str,
+                ChatTurnPhase::Idle.as_db_str(),
+            ],
         )?;
 
         Ok(ChatConversation {
             id,
+            session_id: DEFAULT_CHAT_SESSION_ID.to_string(),
             title,
             created_at: now,
             updated_at: now,
+            runtime_state: ChatTurnPhase::Idle,
+            active_turn_id: None,
             message_count: 0,
             last_message_at: None,
         })
@@ -1246,9 +1610,12 @@ impl AgentDatabase {
         let mut stmt = conn.prepare(
             r#"SELECT
                    c.id,
+                   c.session_id,
                    c.title,
                    c.created_at,
                    c.updated_at,
+                   c.runtime_state,
+                   c.active_turn_id,
                    COUNT(m.id) as message_count,
                    MAX(m.created_at) as last_message_at
                FROM chat_conversations c
@@ -1260,33 +1627,38 @@ impl AgentDatabase {
 
         let conversations = stmt
             .query_map([limit], |row| {
-                let created_at_str: String = row.get(2)?;
-                let updated_at_str: String = row.get(3)?;
-                let last_message_at_str: Option<String> = row.get(5)?;
-                let message_count = row.get::<_, i64>(4)? as usize;
+                let created_at_str: String = row.get(3)?;
+                let updated_at_str: String = row.get(4)?;
+                let runtime_state_raw: String = row.get(5)?;
+                let active_turn_id: Option<String> = row.get(6)?;
+                let message_count = row.get::<_, i64>(7)? as usize;
+                let last_message_at_str: Option<String> = row.get(8)?;
 
                 Ok(ChatConversation {
                     id: row.get(0)?,
-                    title: row.get(1)?,
+                    session_id: row.get(1)?,
+                    title: row.get(2)?,
                     created_at: created_at_str.parse().map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?,
-                    updated_at: updated_at_str.parse().map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
                             3,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
                     })?,
+                    updated_at: updated_at_str.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    runtime_state: ChatTurnPhase::from_db(&runtime_state_raw),
+                    active_turn_id,
                     message_count,
                     last_message_at: match last_message_at_str {
                         Some(v) => Some(v.parse().map_err(|e| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                5,
+                                8,
                                 rusqlite::types::Type::Text,
                                 Box::new(e),
                             )
@@ -1298,6 +1670,284 @@ impl AgentDatabase {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(conversations)
+    }
+
+    /// Start a new persisted turn for a conversation.
+    pub fn begin_chat_turn(
+        &self,
+        conversation_id: &str,
+        trigger_message_ids: &[String],
+        iteration: i64,
+    ) -> Result<String> {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let trigger_json =
+            serde_json::to_string(trigger_message_ids).unwrap_or_else(|_| "[]".to_string());
+        let conn = self.lock_conn()?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_sessions (id, label, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                DEFAULT_CHAT_SESSION_ID,
+                "Default session",
+                now.clone(),
+                now.clone()
+            ],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_conversations (id, session_id, title, created_at, updated_at, runtime_state, active_turn_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![
+                conversation_id,
+                DEFAULT_CHAT_SESSION_ID,
+                "Conversation",
+                now.clone(),
+                now.clone(),
+                ChatTurnPhase::Idle.as_db_str(),
+            ],
+        )?;
+
+        let session_id: String = conn.query_row(
+            "SELECT session_id FROM chat_conversations WHERE id = ?1",
+            [conversation_id],
+            |row| row.get(0),
+        )?;
+
+        conn.execute(
+            "INSERT INTO chat_turns (
+                id, session_id, conversation_id, iteration, phase_state, decision, status,
+                trigger_message_ids_json, operator_message, reason, error, tool_call_count,
+                started_at, completed_at, agent_message_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, NULL, NULL, 0, ?7, NULL, NULL)",
+            params![
+                turn_id,
+                session_id,
+                conversation_id,
+                iteration,
+                ChatTurnPhase::Processing.as_db_str(),
+                trigger_json,
+                now.clone(),
+            ],
+        )?;
+
+        conn.execute(
+            "UPDATE chat_conversations
+             SET runtime_state = ?2, active_turn_id = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![
+                conversation_id,
+                ChatTurnPhase::Processing.as_db_str(),
+                turn_id,
+                now
+            ],
+        )?;
+
+        Ok(turn_id)
+    }
+
+    /// Record a single tool call made during a turn.
+    pub fn record_chat_turn_tool_call(
+        &self,
+        turn_id: &str,
+        call_index: usize,
+        tool_name: &str,
+        arguments_json: &str,
+        output_text: &str,
+    ) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO chat_turn_tool_calls (id, turn_id, call_index, tool_name, arguments_json, output_text, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                turn_id,
+                call_index as i64,
+                tool_name,
+                arguments_json,
+                output_text,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Complete a turn and set its terminal state.
+    pub fn complete_chat_turn(
+        &self,
+        turn_id: &str,
+        phase_state: ChatTurnPhase,
+        decision: &str,
+        status: &str,
+        operator_message: &str,
+        reason: Option<&str>,
+        tool_call_count: usize,
+        agent_message_id: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.lock_conn()?;
+
+        conn.execute(
+            "UPDATE chat_turns
+             SET phase_state = ?2,
+                 decision = ?3,
+                 status = ?4,
+                 operator_message = ?5,
+                 reason = ?6,
+                 error = NULL,
+                 tool_call_count = ?7,
+                 completed_at = ?8,
+                 agent_message_id = ?9
+             WHERE id = ?1",
+            params![
+                turn_id,
+                phase_state.as_db_str(),
+                decision,
+                status,
+                operator_message,
+                reason,
+                tool_call_count as i64,
+                now.clone(),
+                agent_message_id,
+            ],
+        )?;
+
+        conn.execute(
+            "UPDATE chat_conversations
+             SET runtime_state = ?2, active_turn_id = NULL, updated_at = ?3
+             WHERE id = (SELECT conversation_id FROM chat_turns WHERE id = ?1)",
+            params![turn_id, phase_state.as_db_str(), now],
+        )?;
+
+        Ok(())
+    }
+
+    /// Mark a turn as failed and retain the error text for post-mortem.
+    pub fn fail_chat_turn(&self, turn_id: &str, error: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.lock_conn()?;
+
+        conn.execute(
+            "UPDATE chat_turns
+             SET phase_state = ?2,
+                 error = ?3,
+                 completed_at = ?4
+             WHERE id = ?1",
+            params![
+                turn_id,
+                ChatTurnPhase::Failed.as_db_str(),
+                error,
+                now.clone()
+            ],
+        )?;
+
+        conn.execute(
+            "UPDATE chat_conversations
+             SET runtime_state = ?2, active_turn_id = NULL, updated_at = ?3
+             WHERE id = (SELECT conversation_id FROM chat_turns WHERE id = ?1)",
+            params![turn_id, ChatTurnPhase::Failed.as_db_str(), now],
+        )?;
+
+        Ok(())
+    }
+
+    /// List recent turns for one conversation (newest first).
+    pub fn list_chat_turns_for_conversation(
+        &self,
+        conversation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ChatTurn>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT
+                id, session_id, conversation_id, iteration, phase_state, decision, status,
+                trigger_message_ids_json, operator_message, reason, error, tool_call_count,
+                started_at, completed_at, agent_message_id
+             FROM chat_turns
+             WHERE conversation_id = ?1
+             ORDER BY started_at DESC
+             LIMIT ?2",
+        )?;
+
+        let turns = stmt
+            .query_map(params![conversation_id, limit], |row| {
+                let started_at_str: String = row.get(12)?;
+                let completed_at_str: Option<String> = row.get(13)?;
+                let phase_state_raw: String = row.get(4)?;
+                let trigger_ids_raw: String = row.get(7)?;
+                let trigger_message_ids = serde_json::from_str::<Vec<String>>(&trigger_ids_raw)
+                    .unwrap_or_else(|_| Vec::new());
+
+                Ok(ChatTurn {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    conversation_id: row.get(2)?,
+                    iteration: row.get(3)?,
+                    phase_state: ChatTurnPhase::from_db(&phase_state_raw),
+                    decision: row.get(5)?,
+                    status: row.get(6)?,
+                    trigger_message_ids,
+                    operator_message: row.get(8)?,
+                    reason: row.get(9)?,
+                    error: row.get(10)?,
+                    tool_call_count: row.get::<_, i64>(11)? as usize,
+                    started_at: started_at_str.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            12,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    completed_at: match completed_at_str {
+                        Some(v) => Some(v.parse().map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                13,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?),
+                        None => None,
+                    },
+                    agent_message_id: row.get(14)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(turns)
+    }
+
+    /// List tool calls for a specific turn.
+    pub fn list_chat_turn_tool_calls(&self, turn_id: &str) -> Result<Vec<ChatTurnToolCall>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, turn_id, call_index, tool_name, arguments_json, output_text, created_at
+             FROM chat_turn_tool_calls
+             WHERE turn_id = ?1
+             ORDER BY call_index ASC",
+        )?;
+
+        let calls = stmt
+            .query_map([turn_id], |row| {
+                let created_at_str: String = row.get(6)?;
+                Ok(ChatTurnToolCall {
+                    id: row.get(0)?,
+                    turn_id: row.get(1)?,
+                    call_index: row.get::<_, i64>(2)? as usize,
+                    tool_name: row.get(3)?,
+                    arguments_json: row.get(4)?,
+                    output_text: row.get(5)?,
+                    created_at: created_at_str.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(calls)
     }
 
     /// Get unprocessed messages from the operator
@@ -1445,5 +2095,175 @@ fn outcome_to_db(outcome: &PromotionOutcome) -> &'static str {
     match outcome {
         PromotionOutcome::Promote => "promote",
         PromotionOutcome::Hold => "hold",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ponderer_{}_{}.db", name, uuid::Uuid::new_v4()));
+        path
+    }
+
+    #[test]
+    fn chat_turn_lifecycle_persists_state_and_tool_calls() {
+        let path = temp_db_path("chat_turn_lifecycle");
+        let db = AgentDatabase::new(&path).expect("db init");
+
+        let conversation = db
+            .create_chat_conversation(Some("Lifecycle test"))
+            .expect("create conversation");
+        let operator_message_id = db
+            .add_chat_message_in_conversation(&conversation.id, "operator", "Please investigate.")
+            .expect("insert operator message");
+
+        let turn_id = db
+            .begin_chat_turn(
+                &conversation.id,
+                std::slice::from_ref(&operator_message_id),
+                1,
+            )
+            .expect("begin turn");
+
+        db.record_chat_turn_tool_call(
+            &turn_id,
+            0,
+            "list_directory",
+            r#"{"path":"."}"#,
+            "Found 3 entries",
+        )
+        .expect("record tool call");
+
+        let agent_message_id = db
+            .add_chat_message_in_turn(&conversation.id, &turn_id, "agent", "Done.")
+            .expect("insert agent turn message");
+
+        db.mark_message_processed(&operator_message_id)
+            .expect("mark processed");
+
+        db.complete_chat_turn(
+            &turn_id,
+            ChatTurnPhase::Completed,
+            "yield",
+            "done",
+            "Done.",
+            Some("Completed investigation"),
+            1,
+            Some(&agent_message_id),
+        )
+        .expect("complete turn");
+
+        let turns = db
+            .list_chat_turns_for_conversation(&conversation.id, 10)
+            .expect("list turns");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, turn_id);
+        assert_eq!(turns[0].phase_state, ChatTurnPhase::Completed);
+        assert_eq!(turns[0].tool_call_count, 1);
+        assert_eq!(
+            turns[0].agent_message_id.as_deref(),
+            Some(agent_message_id.as_str())
+        );
+        assert_eq!(
+            turns[0].trigger_message_ids,
+            vec![operator_message_id.clone()]
+        );
+
+        let tool_calls = db
+            .list_chat_turn_tool_calls(&turn_id)
+            .expect("list tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].tool_name, "list_directory");
+
+        let conversations = db.list_chat_conversations(50).expect("list conversations");
+        let convo_state = conversations
+            .iter()
+            .find(|c| c.id == conversation.id)
+            .expect("find conversation");
+        assert_eq!(convo_state.runtime_state, ChatTurnPhase::Completed);
+        assert_eq!(convo_state.active_turn_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_turn_keeps_operator_message_unprocessed_for_retry() {
+        let path = temp_db_path("chat_turn_failure");
+        let db = AgentDatabase::new(&path).expect("db init");
+
+        let conversation = db
+            .create_chat_conversation(Some("Failure test"))
+            .expect("create conversation");
+        let operator_message_id = db
+            .add_chat_message_in_conversation(&conversation.id, "operator", "Try and fail")
+            .expect("insert operator message");
+
+        let turn_id = db
+            .begin_chat_turn(
+                &conversation.id,
+                std::slice::from_ref(&operator_message_id),
+                1,
+            )
+            .expect("begin turn");
+        db.fail_chat_turn(&turn_id, "tool timeout")
+            .expect("fail turn");
+
+        let unprocessed = db
+            .get_unprocessed_operator_messages()
+            .expect("query unprocessed messages");
+        assert!(unprocessed.iter().any(|m| m.id == operator_message_id));
+
+        let conversations = db.list_chat_conversations(50).expect("list conversations");
+        let convo_state = conversations
+            .iter()
+            .find(|c| c.id == conversation.id)
+            .expect("find conversation");
+        assert_eq!(convo_state.runtime_state, ChatTurnPhase::Failed);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn memory_search_returns_relevant_entries() {
+        let path = temp_db_path("memory_search");
+        let db = AgentDatabase::new(&path).expect("db init");
+
+        db.set_working_memory("project-goal", "build desktop companion agent")
+            .expect("seed memory");
+        db.set_working_memory("music", "buy new synth")
+            .expect("seed memory");
+
+        let results = db
+            .search_working_memory("desktop agent", 5)
+            .expect("search memory");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].key, "project-goal");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_daily_activity_log_accumulates_lines() {
+        let path = temp_db_path("daily_activity_log");
+        let db = AgentDatabase::new(&path).expect("db init");
+
+        db.append_daily_activity_log("Ran memory search tool")
+            .expect("append first");
+        db.append_daily_activity_log("Answered operator request")
+            .expect("append second");
+
+        let today_key = format!("activity-log-{}", Utc::now().format("%Y-%m-%d"));
+        let item = db
+            .get_working_memory(&today_key)
+            .expect("get memory")
+            .expect("daily log exists");
+        assert!(item.content.contains("Ran memory search tool"));
+        assert!(item.content.contains("Answered operator request"));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -218,8 +218,23 @@ impl Skill for GraphchanSkill {
     async fn execute(&self, action: &str, params: &serde_json::Value) -> Result<SkillResult> {
         match action {
             "reply" => {
-                let thread_id = params["thread_id"].as_str().context("Missing thread_id")?;
-                let post_id = params["post_id"].as_str().context("Missing post_id")?;
+                let post_id = params["post_id"]
+                    .as_str()
+                    .or_else(|| params["event_id"].as_str())
+                    .context("Missing post_id (or event_id)")?;
+                let resolved_thread_id = if let Some(thread_id) = params["thread_id"].as_str() {
+                    thread_id.to_string()
+                } else {
+                    let recent = self.get_recent_posts(200).await?;
+                    recent
+                        .posts
+                        .into_iter()
+                        .find(|post_view| post_view.post.id == post_id)
+                        .map(|post_view| post_view.post.thread_id)
+                        .context(
+                            "Missing thread_id and could not resolve thread from recent posts",
+                        )?
+                };
                 let content = params["content"].as_str().context("Missing content")?;
                 let username = params["username"].as_str().unwrap_or("Ponderer");
 
@@ -232,7 +247,7 @@ impl Skill for GraphchanSkill {
                 });
 
                 let input = CreatePostInput {
-                    thread_id: thread_id.to_string(),
+                    thread_id: resolved_thread_id,
                     author_peer_id: None,
                     body: content.to_string(),
                     parent_post_ids: vec![post_id.to_string()],

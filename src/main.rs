@@ -70,7 +70,10 @@ fn main() {
         use tools::{
             comfy::{GenerateComfyMediaTool, PostToGraphchanTool},
             files::{ListDirectoryTool, PatchFileTool, ReadFileTool, WriteFileTool},
+            http::HttpFetchTool,
+            memory::{MemorySearchTool, MemoryWriteTool},
             shell::ShellTool,
+            skill_bridge::GraphchanSkillTool,
             vision::{CaptureScreenTool, EvaluateLocalImageTool, PublishMediaToChatTool},
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -97,9 +100,19 @@ fn main() {
             tool_registry
                 .register(Arc::new(CaptureScreenTool::new()))
                 .await;
+            tool_registry
+                .register(Arc::new(MemorySearchTool::new()))
+                .await;
+            tool_registry
+                .register(Arc::new(MemoryWriteTool::new()))
+                .await;
+            tool_registry.register(Arc::new(HttpFetchTool::new())).await;
+            tool_registry
+                .register(Arc::new(GraphchanSkillTool::new()))
+                .await;
         });
     }
-    tracing::info!("Tool registry initialized with 10 built-in tools");
+    tracing::info!("Tool registry initialized with 14 built-in tools");
 
     // Create event channel
     let (event_tx, event_rx) = flume::unbounded();
