@@ -36,7 +36,7 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 ### `process_chat_messages`
 - **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, emits per-tool progress updates, and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol
 - **Interacts with**: `database::chat_messages`, `database::chat_conversations`, `database::chat_turns`, `database::chat_turn_tool_calls`, `tools::agentic::AgenticLoop::run_with_history_streaming_and_tool_events`, `ToolRegistry`
-- **Rationale**: Uses continuation hints (not synthetic operator messages) for multi-turn autonomy, scopes private-chat tools away from Graphchan posting, and only persists the final yielded assistant reply to avoid duplicate/confusing intermediate chat bubbles.
+- **Rationale**: Uses continuation hints (not synthetic operator messages) for multi-turn autonomy, scopes private-chat tools away from Graphchan posting, compacts long sessions through persisted summary snapshots, and only persists the final yielded assistant reply to avoid duplicate/confusing intermediate chat bubbles.
 
 ### Persona evolution helpers
 - **Does**: Capture persona snapshots and run trajectory inference on schedule
@@ -63,6 +63,7 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 - Current behavior combines periodic skill polling with persona maintenance, optional heartbeat automation, and private chat handling.
 - Skill-event handling now goes through the same multi-step tool-calling loop used by private chat, so skill actions and regular tools share one decision engine.
 - Private chat replies are now scoped per conversation ID to avoid cross-thread prompt contamination.
+- Long-running private chats are compacted as `summary snapshot + recent context + new messages`, with snapshots stored in DB and refreshed after configurable message deltas.
 - Private chat emits a structured turn-control block per assistant response; the loop continues only when decision=`continue`, user input is not needed, and turn budget remains.
 - Private chat continuation now also requires meaningful forward progress signals (`tool_count > 0` or `status=still_working`) before another autonomous turn is allowed.
 - Turn-control parsing treats visible assistant text as authoritative; block `user_message` is only fallback when visible text is empty and does not resemble a hallucinated `User:`/`Operator:` transcript.

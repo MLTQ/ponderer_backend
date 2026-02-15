@@ -61,6 +61,10 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - **Does**: Conversation-level metadata (`id`, `session_id`, `title`, timestamps, runtime state, active turn pointer, message stats) used by the UI for multi-chat selection and status display
 - **Interacts with**: `ui::app` conversation picker/status label, `chat_messages` and `chat_turns` via `conversation_id`
 
+### `ChatConversationSummary`
+- **Does**: Stores compacted long-context snapshot text per conversation plus coverage count (`summarized_message_count`) and update timestamp
+- **Interacts with**: `agent::process_chat_messages` summary refresh/compaction prompt injection
+
 ### `ChatTurn` / `ChatTurnToolCall`
 - **Does**: Persist one agent turn with decision/status/error context and per-tool input/output records for replay/debug
 - **Interacts with**: `agent::process_chat_messages`, future turn history/undo/resume UX
@@ -72,6 +76,10 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 ### Chat conversation methods (`create_chat_conversation`, `list_chat_conversations`, `add_chat_message_in_conversation`, `add_chat_message_in_turn`, `get_chat_history_for_conversation`, `get_chat_context_for_conversation`)
 - **Does**: Creates/lists conversation threads, writes messages (optionally bound to a turn), and returns thread-scoped history/context
 - **Interacts with**: `ui::app::AgentApp` new-chat/switch-chat actions, `agent::process_chat_messages` per-conversation prompt building
+
+### Chat compaction methods (`count_chat_messages_for_conversation`, `get_chat_history_slice_for_conversation`, `upsert_chat_conversation_summary`, `get_chat_conversation_summary`)
+- **Does**: Supports long-session context compaction by counting messages, loading older windows, and persisting summary snapshots
+- **Interacts with**: `agent::maybe_refresh_conversation_compaction_summary` before private-chat tool loop turns
 
 ### `CharacterCard` (DB model)
 - **Does**: Stores imported character card metadata (format, raw data, derived prompt)
@@ -91,6 +99,7 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - All timestamps stored as RFC 3339 strings in SQLite, parsed back to `chrono::DateTime<Utc>`.
 - `ensure_schema()` uses `CREATE TABLE IF NOT EXISTS` -- no formal migration system. Adding columns requires manual ALTER TABLE handling.
 - `ensure_schema()` performs manual chat migrations by checking `PRAGMA table_info(...)` and adding missing columns (`conversation_id`, `turn_id`, `session_id`, `runtime_state`, `active_turn_id`) in place.
+- Conversation compaction snapshots are stored in `chat_conversation_summaries` and updated opportunistically by the agent loop when message-count thresholds are exceeded.
 - Memory design metadata is stored in `agent_state` under `memory_design_id` and `memory_schema_version`.
 - Memory evolution archive uses three tables: `memory_design_archive`, `memory_eval_runs`, `memory_promotion_decisions`.
 - `memory_promotion_decisions` enforces rollback fields (`rollback_design_id`, `rollback_schema_version`) as NOT NULL.

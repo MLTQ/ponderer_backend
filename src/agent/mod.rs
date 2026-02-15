@@ -16,6 +16,7 @@ use tokio::time::{sleep, Duration};
 
 use crate::config::AgentConfig;
 use crate::database::{AgentDatabase, ChatTurnPhase};
+use crate::llm_client::{LlmClient, Message as LlmMessage};
 use crate::memory::archive::{MemoryEvalRunRecord, MemoryPromotionPolicy, PromotionOutcome};
 use crate::memory::eval::{
     default_replay_trace_set, evaluate_trace_set, load_trace_set, EvalBackendKind, MemoryEvalReport,
@@ -38,6 +39,10 @@ const CHAT_TURN_CONTROL_BLOCK_START: &str = "[turn_control]";
 const CHAT_TURN_CONTROL_BLOCK_END: &str = "[/turn_control]";
 const CHAT_CONTINUE_MARKER_LEGACY: &str = "[CONTINUE]";
 const CHAT_MAX_AUTONOMOUS_TURNS: usize = 4;
+const CHAT_CONTEXT_RECENT_LIMIT: usize = 18;
+const CHAT_COMPACTION_TRIGGER_MESSAGES: usize = 36;
+const CHAT_COMPACTION_RESUMMARY_DELTA: usize = 8;
+const CHAT_COMPACTION_SOURCE_MAX_MESSAGES: usize = 140;
 
 #[derive(Debug, Clone)]
 pub enum AgentVisualState {
@@ -1177,8 +1182,8 @@ impl Agent {
         let loop_config = AgenticConfig {
             max_iterations: 10,
             api_url: agentic_api_url(&llm_api_url),
-            model: llm_model,
-            api_key: llm_api_key,
+            model: llm_model.clone(),
+            api_key: llm_api_key.clone(),
             temperature: 0.35,
             max_tokens: 2048,
         };
@@ -1207,6 +1212,15 @@ impl Agent {
             let mut pending_messages = conversation_messages.clone();
             let mut continuation_hint: Option<String> = None;
             let mut marked_initial_messages = false;
+            let conversation_summary_context = self
+                .maybe_refresh_conversation_compaction_summary(
+                    &conversation_id,
+                    &llm_api_url,
+                    &llm_model,
+                    llm_api_key.as_deref(),
+                    &system_prompt,
+                )
+                .await;
 
             for turn in 1..=CHAT_MAX_AUTONOMOUS_TURNS {
                 let turn_trigger_message_ids: Vec<String> =
@@ -1245,8 +1259,11 @@ impl Agent {
                 let recent_chat_context = {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
-                        db.get_chat_context_for_conversation(&conversation_id, 20)
-                            .unwrap_or_default()
+                        db.get_chat_context_for_conversation(
+                            &conversation_id,
+                            CHAT_CONTEXT_RECENT_LIMIT,
+                        )
+                        .unwrap_or_default()
                     } else {
                         String::new()
                     }
@@ -1256,6 +1273,7 @@ impl Agent {
                     &pending_messages,
                     &working_memory_context,
                     &recent_chat_context,
+                    conversation_summary_context.as_deref(),
                     continuation_hint.as_deref(),
                 );
                 let event_tx = self.event_tx.clone();
@@ -1536,6 +1554,170 @@ impl Agent {
     }
 }
 
+impl Agent {
+    async fn maybe_refresh_conversation_compaction_summary(
+        &self,
+        conversation_id: &str,
+        llm_api_url: &str,
+        llm_model: &str,
+        llm_api_key: Option<&str>,
+        system_prompt: &str,
+    ) -> Option<String> {
+        let (message_count, existing_summary) = {
+            let db_lock = self.database.read().await;
+            let db = db_lock.as_ref()?;
+            let count = db
+                .count_chat_messages_for_conversation(conversation_id)
+                .ok()
+                .unwrap_or(0);
+            let summary = db
+                .get_chat_conversation_summary(conversation_id)
+                .ok()
+                .flatten();
+            (count, summary)
+        };
+
+        if message_count < CHAT_COMPACTION_TRIGGER_MESSAGES {
+            return None;
+        }
+
+        let older_message_count = message_count.saturating_sub(CHAT_CONTEXT_RECENT_LIMIT);
+        if older_message_count == 0 {
+            return None;
+        }
+
+        let mut summary_text = existing_summary.as_ref().map(|s| s.summary_text.clone());
+        let covered_count = existing_summary
+            .as_ref()
+            .map(|s| s.summarized_message_count)
+            .unwrap_or(0);
+        let needs_refresh = covered_count == 0
+            || covered_count > older_message_count
+            || older_message_count.saturating_sub(covered_count) >= CHAT_COMPACTION_RESUMMARY_DELTA;
+
+        if needs_refresh {
+            let source_limit = older_message_count.min(CHAT_COMPACTION_SOURCE_MAX_MESSAGES);
+            let source_messages = {
+                let db_lock = self.database.read().await;
+                let db = db_lock.as_ref()?;
+                db.get_chat_history_slice_for_conversation(
+                    conversation_id,
+                    CHAT_CONTEXT_RECENT_LIMIT,
+                    source_limit,
+                )
+                .ok()
+                .unwrap_or_default()
+            };
+
+            if !source_messages.is_empty() {
+                let refreshed = self
+                    .summarize_conversation_slice_with_llm(
+                        &source_messages,
+                        llm_api_url,
+                        llm_model,
+                        llm_api_key,
+                        system_prompt,
+                    )
+                    .await
+                    .unwrap_or_else(|| fallback_chat_summary_snapshot(&source_messages));
+
+                if !refreshed.trim().is_empty() {
+                    let db_lock = self.database.read().await;
+                    if let Some(ref db) = *db_lock {
+                        if let Err(e) = db.upsert_chat_conversation_summary(
+                            conversation_id,
+                            refreshed.trim(),
+                            older_message_count,
+                        ) {
+                            tracing::warn!(
+                                "Failed to persist conversation summary snapshot [{}]: {}",
+                                truncate_for_event(conversation_id, 12),
+                                e
+                            );
+                        } else {
+                            summary_text = Some(refreshed.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        summary_text
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                format!(
+                    "{}\n\n_Covers approximately {} earlier message(s)._",
+                    s, older_message_count
+                )
+            })
+    }
+
+    async fn summarize_conversation_slice_with_llm(
+        &self,
+        messages: &[crate::database::ChatMessage],
+        llm_api_url: &str,
+        llm_model: &str,
+        llm_api_key: Option<&str>,
+        system_prompt: &str,
+    ) -> Option<String> {
+        if messages.is_empty() {
+            return None;
+        }
+
+        let transcript = format_chat_summary_transcript(messages);
+        if transcript.trim().is_empty() {
+            return None;
+        }
+
+        let summarizer_system_prompt = format!(
+            "{}\n\nYou are summarizing private operator-agent chat history for internal context compaction.\nProduce concise markdown with these sections exactly: `### Objectives`, `### Decisions & Findings`, `### Open Threads`.\nStay factual, avoid roleplay, and keep the summary under 220 words.",
+            system_prompt.trim()
+        );
+        let summarizer_user_prompt = format!(
+            "Summarize this older conversation slice so future turns can retain continuity without replaying full history.\n\n{}",
+            transcript
+        );
+        let client = LlmClient::new(
+            agentic_api_url(llm_api_url),
+            llm_api_key.unwrap_or("").to_string(),
+            llm_model.to_string(),
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.generate_with_model(
+                vec![
+                    LlmMessage {
+                        role: "system".to_string(),
+                        content: summarizer_system_prompt,
+                    },
+                    LlmMessage {
+                        role: "user".to_string(),
+                        content: summarizer_user_prompt,
+                    },
+                ],
+                llm_model,
+            ),
+        )
+        .await
+        .ok()?
+        .ok()?;
+
+        let (without_turn_control, _) = extract_metadata_block(
+            &result,
+            CHAT_TURN_CONTROL_BLOCK_START,
+            CHAT_TURN_CONTROL_BLOCK_END,
+        );
+        let cleaned = strip_inline_thinking_tags(&without_turn_control);
+        let normalized = cleaned.trim();
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized.to_string())
+        }
+    }
+}
+
 fn load_pending_checklist_items(path: &str) -> Result<Vec<String>> {
     let raw = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -1633,6 +1815,7 @@ fn build_private_chat_agentic_prompt(
     new_messages: &[crate::database::ChatMessage],
     working_memory_context: &str,
     recent_chat_context: &str,
+    summary_snapshot: Option<&str>,
     continuation_hint: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
@@ -1645,6 +1828,15 @@ fn build_private_chat_agentic_prompt(
     if !recent_chat_context.trim().is_empty() {
         prompt.push_str("## Recent Conversation Context\n\n");
         prompt.push_str(recent_chat_context.trim());
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    if let Some(summary) = summary_snapshot
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+    {
+        prompt.push_str("## Conversation Summary Snapshot\n\n");
+        prompt.push_str(summary);
         prompt.push_str("\n\n---\n\n");
     }
 
@@ -1718,6 +1910,77 @@ fn build_skill_events_agentic_prompt(
         "Decide whether to act. If replying to Graphchan, call `graphchan_skill` with action=`reply` and include `post_id`/`event_id` plus `content` (and `thread_id` when available). If no action is needed, explain why briefly.",
     );
     prompt
+}
+
+fn format_chat_summary_transcript(messages: &[crate::database::ChatMessage]) -> String {
+    let mut transcript = String::from("## Older Conversation Slice\n\n");
+    for message in messages {
+        let role = if message.role.eq_ignore_ascii_case("operator") {
+            "Operator"
+        } else {
+            "Agent"
+        };
+        let content = truncate_for_event(&message.content.replace('\n', " "), 260);
+        transcript.push_str(&format!("- {}: {}\n", role, content.trim()));
+    }
+    transcript
+}
+
+fn fallback_chat_summary_snapshot(messages: &[crate::database::ChatMessage]) -> String {
+    let mut operator_points = Vec::new();
+    let mut agent_points = Vec::new();
+
+    for message in messages.iter().rev() {
+        let collapsed = message.content.replace('\n', " ");
+        let content = truncate_for_event(collapsed.trim(), 180);
+        if content.is_empty() {
+            continue;
+        }
+        if message.role.eq_ignore_ascii_case("operator") {
+            if operator_points.len() < 4 {
+                operator_points.push(content);
+            }
+        } else if agent_points.len() < 4 {
+            agent_points.push(content);
+        }
+        if operator_points.len() >= 4 && agent_points.len() >= 4 {
+            break;
+        }
+    }
+
+    operator_points.reverse();
+    agent_points.reverse();
+
+    let mut summary = String::new();
+    summary.push_str("### Objectives\n");
+    if operator_points.is_empty() {
+        summary.push_str("- Operator intent not explicitly captured in older turns.\n");
+    } else {
+        for point in &operator_points {
+            summary.push_str(&format!("- {}\n", point));
+        }
+    }
+
+    summary.push_str("\n### Decisions & Findings\n");
+    if agent_points.is_empty() {
+        summary.push_str("- No stable agent conclusions recorded in the compacted window.\n");
+    } else {
+        for point in &agent_points {
+            summary.push_str(&format!("- {}\n", point));
+        }
+    }
+
+    summary.push_str("\n### Open Threads\n");
+    if let Some(last_operator) = operator_points.last() {
+        summary.push_str(&format!(
+            "- Revisit latest operator objective: {}\n",
+            last_operator
+        ));
+    } else {
+        summary.push_str("- Validate whether additional operator input is needed.\n");
+    }
+
+    summary
 }
 
 fn format_chat_message_with_metadata(
@@ -1962,6 +2225,21 @@ fn strip_legacy_continue_prefix(text: &str) -> &str {
     }
 }
 
+fn strip_inline_thinking_tags(input: &str) -> String {
+    let mut output = input.to_string();
+    for (start, end) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
+        while let Some(start_idx) = output.find(start) {
+            let Some(relative_end) = output[start_idx + start.len()..].find(end) else {
+                output.truncate(start_idx);
+                break;
+            };
+            let end_idx = start_idx + start.len() + relative_end + end.len();
+            output.replace_range(start_idx..end_idx, "");
+        }
+    }
+    output
+}
+
 fn looks_like_hallucinated_user_turn(message: &str) -> bool {
     let lower = message.trim_start().to_ascii_lowercase();
     let starts_like_user_turn = [
@@ -2198,7 +2476,7 @@ not a checklist item
             created_at: now,
             processed: false,
         }];
-        let prompt = build_private_chat_agentic_prompt(&msgs, "", "", None);
+        let prompt = build_private_chat_agentic_prompt(&msgs, "", "", None, None);
         assert!(prompt.contains("Please list files"));
         assert!(prompt.contains("Use tools"));
     }
@@ -2209,10 +2487,24 @@ not a checklist item
             &[],
             "",
             "",
+            None,
             Some("Previous autonomous turn: status=still_working, tools=1"),
         );
         assert!(prompt.contains("Autonomous Continuation Context"));
         assert!(!prompt.contains("New Operator Message(s)"));
+    }
+
+    #[test]
+    fn chat_prompt_includes_summary_snapshot_when_available() {
+        let prompt = build_private_chat_agentic_prompt(
+            &[],
+            "",
+            "",
+            Some("### Objectives\n- Ship session compaction"),
+            None,
+        );
+        assert!(prompt.contains("Conversation Summary Snapshot"));
+        assert!(prompt.contains("Ship session compaction"));
     }
 
     #[test]
@@ -2286,5 +2578,13 @@ not a checklist item
         let response = "[turn_control]\n{\"decision\":\"yield\",\"status\":\"done\",\"needs_user_input\":false,\"user_message\":\"User: please continue with step 2\",\"reason\":\"done\"}\n[/turn_control]";
         let parsed = parse_turn_control(response, 0);
         assert_eq!(parsed.operator_response, "");
+    }
+
+    #[test]
+    fn strips_inline_thinking_tags_from_summary_text() {
+        let raw = "<think>hidden</think>\n### Objectives\n- Keep visible";
+        let cleaned = strip_inline_thinking_tags(raw);
+        assert!(!cleaned.contains("hidden"));
+        assert!(cleaned.contains("### Objectives"));
     }
 }

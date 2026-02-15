@@ -163,6 +163,14 @@ pub struct ChatConversation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatConversationSummary {
+    pub conversation_id: String,
+    pub summary_text: String,
+    pub summarized_message_count: usize,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatTurn {
     pub id: String,
     pub session_id: String,
@@ -494,6 +502,17 @@ impl AgentDatabase {
             [],
         )?;
 
+        // Compacted long-context snapshot for one conversation.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS chat_conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                summary_text TEXT NOT NULL,
+                summarized_message_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )"#,
+            [],
+        )?;
+
         // Private chat between operator and agent.
         conn.execute(
             r#"CREATE TABLE IF NOT EXISTS chat_messages (
@@ -565,6 +584,10 @@ impl AgentDatabase {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_conversations_runtime_state ON chat_conversations(runtime_state)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_conversation_summaries_updated_at ON chat_conversation_summaries(updated_at DESC)",
             [],
         )?;
         conn.execute(
@@ -2057,6 +2080,116 @@ impl AgentDatabase {
         Ok(messages.into_iter().rev().collect())
     }
 
+    /// Get a chronological message window using offset from latest messages.
+    ///
+    /// `offset_from_latest = 0` means the newest `limit` messages.
+    /// `offset_from_latest = 20` skips the most recent 20 messages, then returns
+    /// the next `limit` older messages.
+    pub fn get_chat_history_slice_for_conversation(
+        &self,
+        conversation_id: &str,
+        offset_from_latest: usize,
+        limit: usize,
+    ) -> Result<Vec<ChatMessage>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, role, content, created_at, processed FROM chat_messages
+             WHERE conversation_id = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2 OFFSET ?3",
+        )?;
+
+        let messages = stmt
+            .query_map(params![conversation_id, limit, offset_from_latest], |row| {
+                Ok(ChatMessage {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    created_at: row.get::<_, String>(4)?.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    processed: row.get::<_, i64>(5)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(messages.into_iter().rev().collect())
+    }
+
+    /// Count messages in one conversation.
+    pub fn count_chat_messages_for_conversation(&self, conversation_id: &str) -> Result<usize> {
+        let conn = self.lock_conn()?;
+        let count = conn.query_row(
+            "SELECT COUNT(1) FROM chat_messages WHERE conversation_id = ?1",
+            [conversation_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Upsert a compacted summary snapshot for a conversation.
+    pub fn upsert_chat_conversation_summary(
+        &self,
+        conversation_id: &str,
+        summary_text: &str,
+        summarized_message_count: usize,
+    ) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO chat_conversation_summaries (conversation_id, summary_text, summarized_message_count, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                summary_text = excluded.summary_text,
+                summarized_message_count = excluded.summarized_message_count,
+                updated_at = excluded.updated_at",
+            params![
+                conversation_id,
+                summary_text,
+                summarized_message_count as i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch compacted summary snapshot for one conversation.
+    pub fn get_chat_conversation_summary(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ChatConversationSummary>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, summary_text, summarized_message_count, updated_at
+             FROM chat_conversation_summaries
+             WHERE conversation_id = ?1",
+        )?;
+        let mut rows = stmt.query([conversation_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+
+        let updated_at_raw: String = row.get(3)?;
+        let updated_at = updated_at_raw.parse().map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+        Ok(Some(ChatConversationSummary {
+            conversation_id: row.get(0)?,
+            summary_text: row.get(1)?,
+            summarized_message_count: row.get::<_, i64>(2)?.max(0) as usize,
+            updated_at,
+        }))
+    }
+
     /// Get chat history as formatted string for context
     pub fn get_chat_context(&self, limit: usize) -> Result<String> {
         let messages = self.get_chat_history(limit)?;
@@ -2263,6 +2396,49 @@ mod tests {
             .expect("daily log exists");
         assert!(item.content.contains("Ran memory search tool"));
         assert!(item.content.contains("Answered operator request"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn chat_conversation_summary_roundtrip_and_history_slice() {
+        let path = temp_db_path("chat_summary_roundtrip");
+        let db = AgentDatabase::new(&path).expect("db init");
+
+        let conversation = db
+            .create_chat_conversation(Some("Summary test"))
+            .expect("create conversation");
+
+        for idx in 0..8 {
+            let role = if idx % 2 == 0 { "operator" } else { "agent" };
+            db.add_chat_message_in_conversation(
+                &conversation.id,
+                role,
+                &format!("message {}", idx),
+            )
+            .expect("insert chat message");
+        }
+
+        let total = db
+            .count_chat_messages_for_conversation(&conversation.id)
+            .expect("count conversation messages");
+        assert_eq!(total, 8);
+
+        let slice = db
+            .get_chat_history_slice_for_conversation(&conversation.id, 2, 3)
+            .expect("slice chat messages");
+        assert_eq!(slice.len(), 3);
+        assert!(slice[0].content.contains("message 3"));
+        assert!(slice[2].content.contains("message 5"));
+
+        db.upsert_chat_conversation_summary(&conversation.id, "Older context summary", 5)
+            .expect("upsert summary");
+        let summary = db
+            .get_chat_conversation_summary(&conversation.id)
+            .expect("get summary")
+            .expect("summary exists");
+        assert_eq!(summary.summarized_message_count, 5);
+        assert!(summary.summary_text.contains("Older context summary"));
 
         let _ = std::fs::remove_file(&path);
     }
