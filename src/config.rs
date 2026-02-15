@@ -117,6 +117,10 @@ pub struct CapabilityProfileConfig {
     pub skill_events: CapabilityProfileOverride,
     #[serde(default)]
     pub heartbeat: CapabilityProfileOverride,
+    #[serde(default)]
+    pub ambient: CapabilityProfileOverride,
+    #[serde(default)]
+    pub dream: CapabilityProfileOverride,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +148,20 @@ pub struct AgentConfig {
     // Polling and Response
     #[serde(default = "default_poll_interval", alias = "check_interval_seconds")]
     pub poll_interval_secs: u64,
+    #[serde(default)]
+    pub enable_ambient_loop: bool,
+    #[serde(default = "default_ambient_min_interval_secs")]
+    pub ambient_min_interval_secs: u64,
+    #[serde(default)]
+    pub enable_journal: bool,
+    #[serde(default = "default_journal_min_interval_secs")]
+    pub journal_min_interval_secs: u64,
+    #[serde(default)]
+    pub enable_concerns: bool,
+    #[serde(default)]
+    pub enable_dream_cycle: bool,
+    #[serde(default = "default_dream_min_interval_secs")]
+    pub dream_min_interval_secs: u64,
     #[serde(default)]
     pub enable_heartbeat: bool,
     #[serde(default = "default_heartbeat_interval_mins")]
@@ -253,6 +271,18 @@ fn default_poll_interval() -> u64 {
     60
 }
 
+fn default_ambient_min_interval_secs() -> u64 {
+    30
+}
+
+fn default_journal_min_interval_secs() -> u64 {
+    300
+}
+
+fn default_dream_min_interval_secs() -> u64 {
+    3600
+}
+
 fn default_reflection_interval() -> u64 {
     24
 }
@@ -287,6 +317,13 @@ impl Default for AgentConfig {
             username: default_username(),
             system_prompt: default_system_prompt(),
             poll_interval_secs: default_poll_interval(),
+            enable_ambient_loop: false,
+            ambient_min_interval_secs: default_ambient_min_interval_secs(),
+            enable_journal: true,
+            journal_min_interval_secs: default_journal_min_interval_secs(),
+            enable_concerns: true,
+            enable_dream_cycle: false,
+            dream_min_interval_secs: default_dream_min_interval_secs(),
             enable_heartbeat: false,
             heartbeat_interval_mins: default_heartbeat_interval_mins(),
             heartbeat_checklist_path: default_heartbeat_checklist_path(),
@@ -412,6 +449,52 @@ impl AgentConfig {
         if let Ok(interval) = env::var("AGENT_CHECK_INTERVAL") {
             if let Ok(seconds) = interval.parse() {
                 config.poll_interval_secs = seconds;
+            }
+        }
+
+        if let Ok(enabled) = env::var("AGENT_ENABLE_AMBIENT_LOOP") {
+            let enabled = enabled.eq_ignore_ascii_case("1")
+                || enabled.eq_ignore_ascii_case("true")
+                || enabled.eq_ignore_ascii_case("yes");
+            config.enable_ambient_loop = enabled;
+        }
+
+        if let Ok(interval) = env::var("AGENT_AMBIENT_MIN_INTERVAL_SECS") {
+            if let Ok(seconds) = interval.parse() {
+                config.ambient_min_interval_secs = seconds;
+            }
+        }
+
+        if let Ok(enabled) = env::var("AGENT_ENABLE_JOURNAL") {
+            let enabled = enabled.eq_ignore_ascii_case("1")
+                || enabled.eq_ignore_ascii_case("true")
+                || enabled.eq_ignore_ascii_case("yes");
+            config.enable_journal = enabled;
+        }
+
+        if let Ok(interval) = env::var("AGENT_JOURNAL_MIN_INTERVAL_SECS") {
+            if let Ok(seconds) = interval.parse() {
+                config.journal_min_interval_secs = seconds;
+            }
+        }
+
+        if let Ok(enabled) = env::var("AGENT_ENABLE_CONCERNS") {
+            let enabled = enabled.eq_ignore_ascii_case("1")
+                || enabled.eq_ignore_ascii_case("true")
+                || enabled.eq_ignore_ascii_case("yes");
+            config.enable_concerns = enabled;
+        }
+
+        if let Ok(enabled) = env::var("AGENT_ENABLE_DREAM_CYCLE") {
+            let enabled = enabled.eq_ignore_ascii_case("1")
+                || enabled.eq_ignore_ascii_case("true")
+                || enabled.eq_ignore_ascii_case("yes");
+            config.enable_dream_cycle = enabled;
+        }
+
+        if let Ok(interval) = env::var("AGENT_DREAM_MIN_INTERVAL_SECS") {
+            if let Ok(seconds) = interval.parse() {
+                config.dream_min_interval_secs = seconds;
             }
         }
 

@@ -1,7 +1,7 @@
 # capability_profiles.rs
 
 ## Purpose
-Defines explicit tool-capability profiles for agent loop contexts (`private_chat`, `skill_events`, `heartbeat`) and resolves config overrides into executable `ToolContext` policies.
+Defines explicit tool-capability profiles for agent loop contexts (`private_chat`, `skill_events`, `heartbeat`, `ambient`, `dream`) and resolves config overrides into executable `ToolContext` policies.
 
 ## Components
 
@@ -37,3 +37,5 @@ Defines explicit tool-capability profiles for agent loop contexts (`private_chat
 ## Notes
 - `allowed_tools` and `disallowed_tools` overrides are replacement-based when provided.
 - Tool names are normalized (trimmed, deduplicated case-insensitively) before policy application.
+- `ambient` defaults are read-oriented (blocks write/shell/posting/media-publish operations).
+- `dream` defaults are internal-memory-only via explicit allowlist (`search_memory`, `write_memory`).

@@ -6,6 +6,8 @@ pub enum AgentCapabilityProfile {
     PrivateChat,
     SkillEvents,
     Heartbeat,
+    Ambient,
+    Dream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,8 @@ pub fn resolve_capability_policy(
         AgentCapabilityProfile::PrivateChat => &config.private_chat,
         AgentCapabilityProfile::SkillEvents => &config.skill_events,
         AgentCapabilityProfile::Heartbeat => &config.heartbeat,
+        AgentCapabilityProfile::Ambient => &config.ambient,
+        AgentCapabilityProfile::Dream => &config.dream,
     };
     apply_override(default_policy, override_cfg)
 }
@@ -68,6 +72,31 @@ fn default_policy(profile: AgentCapabilityProfile) -> ToolCapabilityPolicy {
         AgentCapabilityProfile::Heartbeat => ToolCapabilityPolicy {
             autonomous: true,
             allowed_tools: None,
+            disallowed_tools: vec![
+                "graphchan_skill".to_string(),
+                "post_to_graphchan".to_string(),
+            ],
+        },
+        AgentCapabilityProfile::Ambient => ToolCapabilityPolicy {
+            autonomous: true,
+            allowed_tools: None,
+            disallowed_tools: vec![
+                "graphchan_skill".to_string(),
+                "post_to_graphchan".to_string(),
+                "write_file".to_string(),
+                "patch_file".to_string(),
+                "shell".to_string(),
+                "write_memory".to_string(),
+                "generate_comfy_media".to_string(),
+                "publish_media_to_chat".to_string(),
+            ],
+        },
+        AgentCapabilityProfile::Dream => ToolCapabilityPolicy {
+            autonomous: true,
+            allowed_tools: Some(vec![
+                "search_memory".to_string(),
+                "write_memory".to_string(),
+            ]),
             disallowed_tools: vec![
                 "graphchan_skill".to_string(),
                 "post_to_graphchan".to_string(),
@@ -156,6 +185,37 @@ mod tests {
             .disallowed_tools
             .iter()
             .any(|tool| tool.eq_ignore_ascii_case("graphchan_skill")));
+    }
+
+    #[test]
+    fn ambient_profile_is_read_oriented_by_default() {
+        let cfg = AgentConfig::default();
+        let policy =
+            resolve_capability_policy(AgentCapabilityProfile::Ambient, &cfg.capability_profiles);
+        assert!(policy.autonomous);
+        assert!(policy
+            .disallowed_tools
+            .iter()
+            .any(|tool| tool.eq_ignore_ascii_case("shell")));
+        assert!(policy
+            .disallowed_tools
+            .iter()
+            .any(|tool| tool.eq_ignore_ascii_case("write_memory")));
+    }
+
+    #[test]
+    fn dream_profile_is_memory_only_by_default() {
+        let cfg = AgentConfig::default();
+        let policy =
+            resolve_capability_policy(AgentCapabilityProfile::Dream, &cfg.capability_profiles);
+        assert!(policy.autonomous);
+        assert_eq!(
+            policy.allowed_tools,
+            Some(vec![
+                "search_memory".to_string(),
+                "write_memory".to_string()
+            ])
+        );
     }
 
     #[test]

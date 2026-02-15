@@ -1,7 +1,7 @@
 # mod.rs
 
 ## Purpose
-Coordinates the core autonomous agent loop: polling skills, reasoning over events, managing visual state, running periodic heartbeat checks, handling private operator chat, and persisting long-lived behavior through the shared database. It is the runtime orchestrator that binds skills, tools, reasoning, memory, and UI events.
+Coordinates the core autonomous agent loop with explicit three-loop architecture (Ambient/Engaged/Dream): polling skills, reasoning over events, managing visual state, running periodic ambient maintenance, handling private operator chat, and persisting long-lived behavior through the shared database. It is the runtime orchestrator that binds skills, tools, reasoning, memory, and UI events.
 
 ## Components
 
@@ -22,8 +22,16 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 - **Interacts with**: `ui::app` via shared flume channel
 
 ### `run_loop`
-- **Does**: Main background loop; checks pause/rate limits, runs periodic maintenance, then executes the main cycle
-- **Interacts with**: `maybe_evolve_persona`, `maybe_run_heartbeat`, `run_cycle`, sleep scheduling based on config
+- **Does**: Main background loop; checks pause/rate limits, then executes either legacy single-loop mode or phase-5 three-loop mode (`run_engaged_tick`, `run_ambient_tick`, `run_dream_cycle`) depending on config
+- **Interacts with**: `maybe_evolve_persona`, `run_engaged_tick`, `run_ambient_tick`, `should_dream`, `run_dream_cycle`, `run_cycle`
+
+### `run_engaged_tick`
+- **Does**: Runs operator chat processing and skill-event handling as the engaged loop, returning the filtered skill events used as ambient context input
+- **Interacts with**: `process_chat_messages`, skill polling, `AgenticLoop` skill-event pass
+
+### `run_ambient_tick`
+- **Does**: Runs orientation + disposition execution + optional concern decay + merged heartbeat scheduling in the ambient loop
+- **Interacts with**: `maybe_update_orientation`, `execute_disposition`, `maybe_run_heartbeat`, `ConcernsManager`
 
 ### `maybe_run_heartbeat`
 - **Does**: Schedules autonomous heartbeat cycles, reads pending checklist/reminder signals, and invokes the tool-calling loop only when work exists
@@ -65,6 +73,10 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 - **Does**: Capture persona snapshots and run trajectory inference on schedule
 - **Interacts with**: `agent::trajectory`, `database::persona_history`, reflection timestamps in `agent_state`
 
+### `calculate_tick_duration` / `should_dream` / `run_dream_cycle`
+- **Does**: Computes adaptive ambient tick frequency from user-state estimate, decides dream-trigger windows (away/deep-night + interval gate), and runs dream-cycle consolidation (trajectory check, journal digest, concern pruning)
+- **Interacts with**: `presence/mod.rs`, `orientation.rs`, `database.rs` state keys and working memory
+
 ### Chat formatting helpers
 - **Does**: Builds operator-chat prompts and serializes tool-call/thinking/media metadata into `[tool_calls]...[/tool_calls]`, `[thinking]...[/thinking]`, and `[media]...[/media]` blocks for inline UI rendering
 - **Interacts with**: `ui/chat.rs` parser for collapsible tool details and media previews
@@ -74,6 +86,7 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
 | `main.rs` | `Agent::new(...).run_loop()` drives autonomous behavior without extra orchestration | Changing constructor or loop entrypoint signatures |
+| `config.rs` | Three-loop fields (`enable_ambient_loop`, `ambient_min_interval_secs`, `enable_journal`, `journal_min_interval_secs`, `enable_concerns`, `enable_dream_cycle`, `dream_min_interval_secs`) control phase-5 architecture | Renaming/removing loop-control fields |
 | `ui/app.rs` | `AgentEvent` variants remain stable enough for chat/state rendering, including `ChatStreaming { conversation_id, content, done }`, `ToolCallProgress { ... }`, `OrientationUpdate(...)`, `JournalWritten(...)`, `ConcernCreated { ... }`, and `ConcernTouched { ... }` | Renaming/removing emitted event types |
 | `database.rs` | Chat and memory APIs are available and synchronous; private chat relies on conversation-scoped context plus turn lifecycle APIs (`begin_chat_turn`, `record_chat_turn_tool_call`, `complete_chat_turn`, `fail_chat_turn`, `add_chat_message_in_turn`) | Changing DB API names, turn-state semantics, or message persistence order |
 | `tools/mod.rs` | `ToolRegistry` can be shared and used in autonomous context, including bridged skill tools | Removing registry injection or bridged tool names used by prompts |
@@ -93,6 +106,8 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 - Turn-control parsing treats visible assistant text as authoritative; block `user_message` is only fallback when visible text is empty and does not resemble a hallucinated `User:`/`Operator:` transcript.
 - Private-chat prompts now include concern-priority context ahead of general working memory to bias retrieval toward ongoing topics.
 - Concern lifecycle now runs in-loop: decay demotes stale concerns, mention matching reactivates them, and structured concern signals create/touch concerns explicitly.
+- Ambient mode merges heartbeat scheduling into ambient ticks instead of a separate pre-cycle call.
+- Dream mode is gated by inactivity/time-of-day and minimum interval, then consolidates journal/context into working memory.
 - Tool-call progress is streamed as events during a turn so the UI can show real-time execution output (for example shell output snippets) before final reply persistence.
 - Each autonomous private-chat turn is persisted in DB before/after execution, including tool-call lineage and terminal state (`completed`, `awaiting_approval`, or `failed`), but only the final yielded assistant message is added to chat history.
 - Orientation is now refreshed once per cycle as a log-only signal: it emits `OrientationUpdate`, persists `orientation_snapshots`, and uses an input signature cache to avoid repeated LLM calls when context is unchanged.

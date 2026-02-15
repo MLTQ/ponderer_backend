@@ -1,7 +1,7 @@
 # settings.rs
 
 ## Purpose
-Implements the Settings modal window where users configure LLM connection, agent identity, behavior parameters, autonomous heartbeat scheduling, self-reflection, memory/database, image generation (ComfyUI), and the system prompt.
+Implements the Settings modal window where users configure LLM connection, agent identity, behavior parameters, living-loop controls (ambient/journal/concerns/dream), autonomous heartbeat scheduling, self-reflection, memory/database, image generation (ComfyUI), and the system prompt.
 
 ## Components
 
@@ -18,6 +18,7 @@ Implements the Settings modal window where users configure LLM connection, agent
   - **LLM Configuration**: API URL, model name, optional API key
   - **Agent Identity**: Username
   - **Behavior**: Poll interval, max posts/hour, response strategy (selective/all/mentions), opt-in screen capture toggle for the agentic tool loop
+  - **Living Loop**: Ambient-loop toggle, ambient minimum tick, journal toggle + interval, concerns toggle, dream-cycle toggle + interval
   - **Autonomous Heartbeat**: Enable toggle, interval (minutes), checklist file path, optional memory-evolution scheduling controls
   - **Self-Reflection**: Enable toggle, interval, guiding principles (multiline)
   - **Memory & Database**: Database path, max important posts
@@ -31,7 +32,7 @@ Implements the Settings modal window where users configure LLM connection, agent
 |-----------|---------|------------------|
 | `app.rs` | `config` field is `pub` for cross-panel sync | Making it private breaks `CharacterPanel` save flow |
 | `app.rs` | `render()` returns `Option<AgentConfig>` | Changing return type breaks save logic |
-| `AgentConfig` | Fields: `graphchan_api_url`, `llm_api_url`, `llm_model`, `llm_api_key`, `username`, `poll_interval_secs`, `max_posts_per_hour`, `respond_to.response_type`, `enable_screen_capture_in_loop`, `enable_heartbeat`, `heartbeat_interval_mins`, `heartbeat_checklist_path`, `enable_memory_evolution`, `memory_evolution_interval_hours`, `memory_eval_trace_set_path`, `enable_self_reflection`, `reflection_interval_hours`, `guiding_principles`, `database_path`, `max_important_posts`, `enable_image_generation`, `comfyui.api_url`, `comfyui.workflow_type`, `comfyui.model_name`, `system_prompt` | Renaming any field breaks this panel |
+| `AgentConfig` | Fields: `graphchan_api_url`, `llm_api_url`, `llm_model`, `llm_api_key`, `username`, `poll_interval_secs`, `max_posts_per_hour`, `respond_to.response_type`, `enable_screen_capture_in_loop`, `enable_ambient_loop`, `ambient_min_interval_secs`, `enable_journal`, `journal_min_interval_secs`, `enable_concerns`, `enable_dream_cycle`, `dream_min_interval_secs`, `enable_heartbeat`, `heartbeat_interval_mins`, `heartbeat_checklist_path`, `enable_memory_evolution`, `memory_evolution_interval_hours`, `memory_eval_trace_set_path`, `enable_self_reflection`, `reflection_interval_hours`, `guiding_principles`, `database_path`, `max_important_posts`, `enable_image_generation`, `comfyui.api_url`, `comfyui.workflow_type`, `comfyui.model_name`, `system_prompt` | Renaming any field breaks this panel |
 
 ## Notes
 - The config is edited in-place on `self.config`; only returned on explicit save.

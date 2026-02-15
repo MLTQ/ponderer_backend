@@ -44,6 +44,7 @@ use crate::tools::ToolRegistry;
 const HEARTBEAT_LAST_RUN_STATE_KEY: &str = "heartbeat_last_run_at";
 const MEMORY_EVOLUTION_LAST_RUN_STATE_KEY: &str = "memory_evolution_last_run_at";
 const JOURNAL_LAST_WRITTEN_STATE_KEY: &str = "journal_last_written_at";
+const DREAM_LAST_RUN_STATE_KEY: &str = "dream_last_run_at";
 const CHAT_TOOL_BLOCK_START: &str = "[tool_calls]";
 const CHAT_TOOL_BLOCK_END: &str = "[/tool_calls]";
 const CHAT_THINKING_BLOCK_START: &str = "[thinking]";
@@ -361,35 +362,50 @@ impl Agent {
             }
 
             self.set_state(AgentVisualState::Idle).await;
+            let config_snapshot = { self.config.read().await.clone() };
 
             // Check if it's time for persona evolution (Ludonarrative Assonantic Tracing)
             self.maybe_evolve_persona().await;
 
-            // Run periodic autonomous heartbeat tasks (if enabled and due)
-            self.maybe_run_heartbeat().await;
-
-            // Get poll interval from config
-            let poll_interval = {
-                let config = self.config.read().await;
-                config.poll_interval_secs
-            };
-            sleep(Duration::from_secs(poll_interval)).await;
-
             // Check for rate limiting
-            {
-                let state = self.state.read().await;
-                let config = self.config.read().await;
-                if state.actions_this_hour >= config.max_posts_per_hour {
-                    self.emit(AgentEvent::Observation(format!(
-                        "Rate limit reached ({}/{}), waiting...",
-                        state.actions_this_hour, config.max_posts_per_hour
-                    )))
-                    .await;
-                    continue;
-                }
+            if self.is_rate_limited().await {
+                sleep(Duration::from_secs(10)).await;
+                continue;
             }
 
-            // Main agent logic
+            if config_snapshot.enable_ambient_loop {
+                let engaged_events = match self.run_engaged_tick().await {
+                    Ok(events) => events,
+                    Err(e) => {
+                        tracing::error!("Engaged tick error: {}", e);
+                        self.emit(AgentEvent::Error(e.to_string())).await;
+                        self.set_state(AgentVisualState::Confused).await;
+                        sleep(Duration::from_secs(10)).await;
+                        continue;
+                    }
+                };
+
+                let orientation = self.run_ambient_tick(&engaged_events).await;
+
+                if self
+                    .should_dream(&config_snapshot, orientation.as_ref())
+                    .await
+                {
+                    self.run_dream_cycle(&config_snapshot, orientation.as_ref())
+                        .await;
+                }
+
+                let tick = self.calculate_tick_duration(&config_snapshot, orientation.as_ref());
+                sleep(tick).await;
+                continue;
+            }
+
+            // Legacy single-loop behavior (backward compatible when ambient loop disabled)
+            self.maybe_run_heartbeat().await;
+
+            let poll_interval = config_snapshot.poll_interval_secs;
+            sleep(Duration::from_secs(poll_interval)).await;
+
             if let Err(e) = self.run_cycle().await {
                 tracing::error!("Agent cycle error: {}", e);
                 self.emit(AgentEvent::Error(e.to_string())).await;
@@ -397,6 +413,21 @@ impl Agent {
                 sleep(Duration::from_secs(10)).await;
             }
         }
+    }
+
+    async fn is_rate_limited(&self) -> bool {
+        let state = self.state.read().await;
+        let config = self.config.read().await;
+        if state.actions_this_hour < config.max_posts_per_hour {
+            return false;
+        }
+
+        self.emit(AgentEvent::Observation(format!(
+            "Rate limit reached ({}/{}), waiting...",
+            state.actions_this_hour, config.max_posts_per_hour
+        )))
+        .await;
+        true
     }
 
     /// Capture initial persona snapshot if database is empty
@@ -1246,6 +1277,402 @@ impl Agent {
                 .await;
             }
         }
+    }
+
+    async fn run_engaged_tick(&self) -> Result<Vec<SkillEvent>> {
+        // Engaged loop handles direct operator chat + external skill events.
+        self.process_chat_messages().await?;
+
+        self.set_state(AgentVisualState::Reading).await;
+        self.emit(AgentEvent::Observation(
+            "Polling skills for new events...".to_string(),
+        ))
+        .await;
+
+        let username = {
+            let config = self.config.read().await;
+            config.username.clone()
+        };
+
+        let skill_ctx = SkillContext {
+            username: username.clone(),
+        };
+
+        let mut all_events: Vec<SkillEvent> = Vec::new();
+        {
+            let skills = self.skills.read().await;
+            for skill in skills.iter() {
+                match skill.poll(&skill_ctx).await {
+                    Ok(events) => {
+                        if !events.is_empty() {
+                            tracing::debug!(
+                                "Skill '{}' produced {} events",
+                                skill.name(),
+                                events.len()
+                            );
+                        }
+                        all_events.extend(events);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Skill '{}' poll failed: {}", skill.name(), e);
+                        self.emit(AgentEvent::Error(format!(
+                            "Skill '{}' error: {}",
+                            skill.name(),
+                            e
+                        )))
+                        .await;
+                    }
+                }
+            }
+        }
+
+        let processed_events = {
+            let state = self.state.read().await;
+            state.processed_events.clone()
+        };
+
+        let filtered_events: Vec<SkillEvent> = all_events
+            .into_iter()
+            .filter(|event| {
+                let SkillEvent::NewContent {
+                    ref id, ref author, ..
+                } = event;
+                let already_processed = processed_events.contains(id);
+                let is_own = author == &username;
+                !already_processed && !is_own
+            })
+            .collect();
+
+        let ambient_context_events = filtered_events.clone();
+        if filtered_events.is_empty() {
+            self.emit(AgentEvent::Observation(
+                "No new events from skills.".to_string(),
+            ))
+            .await;
+            self.set_state(AgentVisualState::Idle).await;
+            return Ok(ambient_context_events);
+        }
+
+        self.emit(AgentEvent::Observation(format!(
+            "Found {} new events to analyze",
+            filtered_events.len()
+        )))
+        .await;
+
+        let (working_memory_context, concerns_priority_context, chat_context) = {
+            let db_lock = self.database.read().await;
+            if let Some(ref db) = *db_lock {
+                let wm = db.get_working_memory_context().unwrap_or_default();
+                let concerns_ctx =
+                    ConcernsManager::build_priority_context(db, 8, 180).unwrap_or_default();
+                let chat = db.get_chat_context(10).unwrap_or_default();
+                (wm, concerns_ctx, chat)
+            } else {
+                (String::new(), String::new(), String::new())
+            }
+        };
+
+        self.set_state(AgentVisualState::Thinking).await;
+        self.emit(AgentEvent::Observation(
+            "Analyzing skill events via agentic loop...".to_string(),
+        ))
+        .await;
+
+        let config_snapshot = { self.config.read().await.clone() };
+        let llm_api_url = config_snapshot.llm_api_url.clone();
+        let llm_model = config_snapshot.llm_model.clone();
+        let llm_api_key = config_snapshot.llm_api_key.clone();
+        let system_prompt = config_snapshot.system_prompt.clone();
+        let loop_config = AgenticConfig {
+            max_iterations: 8,
+            api_url: agentic_api_url(&llm_api_url),
+            model: llm_model,
+            api_key: llm_api_key,
+            temperature: 0.35,
+            max_tokens: 1536,
+        };
+        let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
+        let tool_ctx = build_tool_context_for_profile(
+            &config_snapshot,
+            AgentCapabilityProfile::SkillEvents,
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".to_string()),
+            username.clone(),
+        );
+        let skill_system_prompt = format!(
+            "{}\n\nYou are processing external skill events. Decide whether to take action.\nUse tools when needed.\nIf replying on Graphchan, call tool `graphchan_skill` with action=`reply` and params containing `post_id` (or `event_id`) and `content`; include `thread_id` when known.\nYou may use `write_memory` for durable notes and `search_memory` for recall.\nIf no action is needed, explain briefly and return.",
+            system_prompt
+        );
+        let user_message = build_skill_events_agentic_prompt(
+            &filtered_events,
+            &concerns_priority_context,
+            &working_memory_context,
+            &chat_context,
+        );
+
+        match agentic_loop
+            .run(&skill_system_prompt, &user_message, &tool_ctx)
+            .await
+        {
+            Ok(result) => {
+                let mut trace_lines = vec![format!(
+                    "Skill-event agentic pass ({} event(s), {} tool call(s))",
+                    filtered_events.len(),
+                    result.tool_calls_made.len()
+                )];
+                if !result.thinking_blocks.is_empty() {
+                    trace_lines.push(format!(
+                        "Model emitted {} thinking block(s) (hidden from operator-facing outputs)",
+                        result.thinking_blocks.len()
+                    ));
+                }
+                trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
+                self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
+
+                if let Some(response) = result.response.as_deref().filter(|r| !r.trim().is_empty())
+                {
+                    self.emit(AgentEvent::Observation(format!(
+                        "Skill-event summary: {}",
+                        truncate_for_event(&response.replace('\n', " "), 220)
+                    )))
+                    .await;
+                }
+
+                let successful_graphchan_calls = result
+                    .tool_calls_made
+                    .iter()
+                    .filter(|call| call.tool_name == "graphchan_skill" && call.output.is_success())
+                    .count();
+                if successful_graphchan_calls > 0 {
+                    let mut state = self.state.write().await;
+                    state.actions_this_hour += successful_graphchan_calls as u32;
+                    state.last_action_time = Some(chrono::Utc::now());
+                    drop(state);
+                    self.emit(AgentEvent::ActionTaken {
+                        action: "Graphchan action(s) via agentic loop".to_string(),
+                        result: format!(
+                            "{} successful graphchan_skill call(s)",
+                            successful_graphchan_calls
+                        ),
+                    })
+                    .await;
+                    self.set_state(AgentVisualState::Happy).await;
+                    sleep(Duration::from_secs(2)).await;
+                } else {
+                    self.emit(AgentEvent::Observation(
+                        "No external reply action was required.".to_string(),
+                    ))
+                    .await;
+                }
+
+                let mut state = self.state.write().await;
+                for event in &filtered_events {
+                    let SkillEvent::NewContent { ref id, .. } = event;
+                    state.processed_events.insert(id.clone());
+                }
+            }
+            Err(e) => {
+                self.emit(AgentEvent::Error(format!(
+                    "Skill-event agentic loop failed: {}",
+                    e
+                )))
+                .await;
+                self.set_state(AgentVisualState::Confused).await;
+            }
+        }
+
+        self.set_state(AgentVisualState::Idle).await;
+        Ok(ambient_context_events)
+    }
+
+    async fn run_ambient_tick(&self, pending_events: &[SkillEvent]) -> Option<Orientation> {
+        let config_snapshot = { self.config.read().await.clone() };
+
+        if config_snapshot.enable_concerns {
+            self.maybe_decay_concerns().await;
+        }
+
+        let previous_orientation = self.last_orientation.read().await.clone();
+        let orientation = self.maybe_update_orientation(pending_events).await;
+        if let Some(ref orientation) = orientation {
+            self.execute_disposition(
+                &config_snapshot,
+                orientation,
+                previous_orientation.as_ref().map(|o| o.disposition),
+                pending_events,
+            )
+            .await;
+        }
+
+        if config_snapshot.enable_heartbeat {
+            self.maybe_run_heartbeat().await;
+        }
+
+        orientation
+    }
+
+    async fn execute_disposition(
+        &self,
+        config: &AgentConfig,
+        orientation: &Orientation,
+        previous_disposition: Option<Disposition>,
+        pending_events: &[SkillEvent],
+    ) {
+        match orientation.disposition {
+            Disposition::Journal => {
+                if should_write_journal_for_disposition(
+                    config.enable_journal,
+                    orientation.disposition,
+                ) {
+                    self.maybe_write_journal_entry(
+                        orientation,
+                        previous_disposition,
+                        pending_events,
+                    )
+                    .await;
+                }
+            }
+            Disposition::Maintain => {
+                if config.enable_concerns {
+                    self.maybe_decay_concerns().await;
+                }
+            }
+            Disposition::Surface => {
+                if let Some(thought) = orientation.pending_thoughts.first() {
+                    self.emit(AgentEvent::Observation(format!(
+                        "Pending thought: {}",
+                        truncate_for_event(&thought.content, 180)
+                    )))
+                    .await;
+                } else if let Some(anomaly) = orientation.anomalies.first() {
+                    self.emit(AgentEvent::Observation(format!(
+                        "Notable anomaly: {}",
+                        truncate_for_event(&anomaly.description, 180)
+                    )))
+                    .await;
+                }
+            }
+            Disposition::Interrupt => {
+                self.emit(AgentEvent::Observation(
+                    "Disposition suggests interrupt-level attention.".to_string(),
+                ))
+                .await;
+            }
+            Disposition::Observe | Disposition::Idle => {}
+        }
+    }
+
+    fn calculate_tick_duration(
+        &self,
+        config: &AgentConfig,
+        orientation: Option<&Orientation>,
+    ) -> Duration {
+        if !config.enable_ambient_loop {
+            return Duration::from_secs(config.poll_interval_secs.max(1));
+        }
+
+        let seconds = adaptive_tick_secs(
+            config.ambient_min_interval_secs,
+            orientation.map(|o| &o.user_state),
+        );
+        Duration::from_secs(seconds)
+    }
+
+    async fn should_dream(&self, config: &AgentConfig, orientation: Option<&Orientation>) -> bool {
+        if !config.enable_dream_cycle {
+            return false;
+        }
+
+        let now = Utc::now();
+        let min_interval = config.dream_min_interval_secs.max(3600);
+        let last_dream = {
+            let db_lock = self.database.read().await;
+            let Some(db) = db_lock.as_ref() else {
+                return false;
+            };
+            db.get_state(DREAM_LAST_RUN_STATE_KEY)
+                .ok()
+                .flatten()
+                .and_then(|raw| raw.parse::<chrono::DateTime<Utc>>().ok())
+        };
+
+        if let Some(last) = last_dream {
+            let elapsed = (now - last).num_seconds().max(0) as u64;
+            if elapsed < min_interval {
+                return false;
+            }
+        }
+
+        let presence = {
+            let mut monitor = self.presence_monitor.lock().await;
+            monitor.sample()
+        };
+        let away_long_enough = presence.user_idle_seconds >= 1800;
+        let deep_night = presence.time_context.is_deep_night || presence.time_context.is_late_night;
+        let oriented_away = orientation
+            .map(|o| matches!(o.user_state, orientation::UserStateEstimate::Away { .. }))
+            .unwrap_or(false);
+
+        should_trigger_dream_with_signals(away_long_enough, deep_night, oriented_away)
+    }
+
+    async fn run_dream_cycle(&self, config: &AgentConfig, orientation: Option<&Orientation>) {
+        self.emit(AgentEvent::Observation(
+            "Starting dream cycle (ambient consolidation)...".to_string(),
+        ))
+        .await;
+        self.set_state(AgentVisualState::Thinking).await;
+
+        // Dream cycle can trigger deeper persona trajectory updates when due.
+        self.maybe_evolve_persona().await;
+
+        if config.enable_concerns {
+            self.maybe_decay_concerns().await;
+        }
+
+        let db_lock = self.database.read().await;
+        if let Some(db) = db_lock.as_ref() {
+            if let Ok(entries) = db.get_recent_journal(24) {
+                if !entries.is_empty() {
+                    let digest = entries
+                        .iter()
+                        .take(12)
+                        .map(|entry| {
+                            format!(
+                                "- [{}] ({}) {}",
+                                entry.timestamp.format("%Y-%m-%d %H:%M"),
+                                entry.entry_type.as_db_str(),
+                                truncate_for_event(&entry.content, 160)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let key = format!("dream-journal-{}", Utc::now().format("%Y-%m-%d"));
+                    let _ = db.set_working_memory(
+                        &key,
+                        &format!("Dream-cycle journal digest\n\n{}", digest),
+                    );
+                }
+            }
+
+            if let Some(orientation) = orientation {
+                let _ = db.append_daily_activity_log(&format!(
+                    "dream cycle: disposition={}, anomalies={}, salient={}",
+                    summarize_disposition(orientation.disposition),
+                    orientation.anomalies.len(),
+                    orientation.salience_map.len()
+                ));
+            }
+            let _ = db.set_state(DREAM_LAST_RUN_STATE_KEY, &Utc::now().to_rfc3339());
+        }
+
+        self.emit(AgentEvent::ActionTaken {
+            action: "Dream cycle complete".to_string(),
+            result: "Consolidated recent journal and updated dormant concern state.".to_string(),
+        })
+        .await;
+        self.set_state(AgentVisualState::Idle).await;
     }
 
     async fn run_cycle(&self) -> Result<()> {
@@ -2731,6 +3158,32 @@ fn collect_heartbeat_memory_hints(entries: &[WorkingMemoryEntry]) -> Vec<String>
         .collect()
 }
 
+fn should_write_journal_for_disposition(enable_journal: bool, disposition: Disposition) -> bool {
+    enable_journal && disposition == Disposition::Journal
+}
+
+fn adaptive_tick_secs(
+    ambient_min_interval_secs: u64,
+    user_state: Option<&orientation::UserStateEstimate>,
+) -> u64 {
+    let base = ambient_min_interval_secs.max(5);
+    match user_state {
+        Some(orientation::UserStateEstimate::DeepWork { .. }) => base.max(120),
+        Some(orientation::UserStateEstimate::LightWork { .. }) => base.max(45),
+        Some(orientation::UserStateEstimate::Idle { .. }) => base.max(30),
+        Some(orientation::UserStateEstimate::Away { .. }) => base.max(180),
+        None => base,
+    }
+}
+
+fn should_trigger_dream_with_signals(
+    away_long_enough: bool,
+    deep_night: bool,
+    oriented_away: bool,
+) -> bool {
+    away_long_enough || deep_night || oriented_away
+}
+
 fn summarize_user_state(state: &orientation::UserStateEstimate) -> String {
     match state {
         orientation::UserStateEstimate::DeepWork { activity, .. } => {
@@ -3032,5 +3485,57 @@ not a checklist item
         );
         assert!(prompt.contains("Concern Priority Context"));
         assert!(prompt.contains("Ship concerns manager"));
+    }
+
+    #[test]
+    fn adaptive_tick_changes_with_user_state() {
+        let base = 30;
+        assert_eq!(adaptive_tick_secs(base, None), 30);
+        assert_eq!(
+            adaptive_tick_secs(
+                base,
+                Some(&orientation::UserStateEstimate::DeepWork {
+                    activity: "coding".to_string(),
+                    duration_estimate_secs: 60,
+                    confidence: 0.7,
+                })
+            ),
+            120
+        );
+        assert_eq!(
+            adaptive_tick_secs(
+                base,
+                Some(&orientation::UserStateEstimate::Away {
+                    since_secs: 2000,
+                    likely_reason: None,
+                    confidence: 0.6,
+                })
+            ),
+            180
+        );
+    }
+
+    #[test]
+    fn dream_trigger_requires_away_or_night_or_oriented_away() {
+        assert!(should_trigger_dream_with_signals(true, false, false));
+        assert!(should_trigger_dream_with_signals(false, true, false));
+        assert!(should_trigger_dream_with_signals(false, false, true));
+        assert!(!should_trigger_dream_with_signals(false, false, false));
+    }
+
+    #[test]
+    fn disposition_execution_gate_for_journal() {
+        assert!(should_write_journal_for_disposition(
+            true,
+            Disposition::Journal
+        ));
+        assert!(!should_write_journal_for_disposition(
+            false,
+            Disposition::Journal
+        ));
+        assert!(!should_write_journal_for_disposition(
+            true,
+            Disposition::Observe
+        ));
     }
 }

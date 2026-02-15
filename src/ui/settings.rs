@@ -139,6 +139,46 @@ impl SettingsPanel {
                     ui.add_space(16.0);
 
                     ui.separator();
+                    ui.heading("Living Loop");
+                    ui.add_space(8.0);
+
+                    ui.checkbox(
+                        &mut self.config.enable_ambient_loop,
+                        "Enable ambient loop architecture",
+                    );
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Ambient min tick (seconds):");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.ambient_min_interval_secs)
+                                .range(5..=600),
+                        );
+                    });
+                    ui.add_space(4.0);
+
+                    ui.checkbox(&mut self.config.enable_journal, "Enable ambient journaling");
+                    ui.horizontal(|ui| {
+                        ui.label("Journal min interval (seconds):");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.journal_min_interval_secs)
+                                .range(30..=7200),
+                        );
+                    });
+                    ui.add_space(4.0);
+
+                    ui.checkbox(&mut self.config.enable_concerns, "Enable concern lifecycle");
+                    ui.checkbox(&mut self.config.enable_dream_cycle, "Enable dream cycle");
+                    ui.horizontal(|ui| {
+                        ui.label("Dream min interval (seconds):");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.dream_min_interval_secs)
+                                .range(300..=86400),
+                        );
+                    });
+                    ui.add_space(16.0);
+
+                    ui.separator();
                     ui.heading("Autonomous Heartbeat");
                     ui.add_space(8.0);
 
