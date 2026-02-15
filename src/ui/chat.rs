@@ -121,6 +121,18 @@ pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
                     );
                     ui.add_space(4.0);
                 }
+                AgentEvent::OrientationUpdate(orientation) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "🧭 Orientation: disposition={:?}, anomalies={}, salient={}",
+                            orientation.disposition,
+                            orientation.anomalies.len(),
+                            orientation.salience_map.len()
+                        ))
+                        .color(Color32::LIGHT_YELLOW),
+                    );
+                    ui.add_space(4.0);
+                }
                 AgentEvent::Error(e) => {
                     ui.label(RichText::new(format!("❌ Error: {}", e)).color(Color32::RED));
                     ui.add_space(4.0);

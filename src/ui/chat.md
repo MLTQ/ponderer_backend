@@ -6,7 +6,7 @@ Provides two scrollable display panels: an event log showing agent activity and 
 ## Components
 
 ### `render_event_log(ui, events)`
-- **Does**: Renders a scrollable list of `AgentEvent` variants with color-coded labels: observations (light blue), reasoning traces (gray, grouped), tool progress (khaki), actions (green), and errors (red). `StateChanged` and `ChatStreaming` events are skipped (rendered elsewhere).
+- **Does**: Renders a scrollable list of `AgentEvent` variants with color-coded labels: observations (light blue), reasoning traces (gray, grouped), tool progress (khaki), actions (green), orientation updates (light yellow), and errors (red). `StateChanged` and `ChatStreaming` events are skipped (rendered elsewhere).
 - **Interacts with**: `AgentEvent` enum from `crate::agent`
 
 ### `render_private_chat(ui, messages, streaming_preview, media_cache)`
@@ -26,7 +26,7 @@ Provides two scrollable display panels: an event log showing agent activity and 
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
 | `app.rs` | `render_private_chat` takes `&mut ChatMediaCache` and message slices | Changing signature breaks `AgentApp::update` |
-| `AgentEvent` | Variants: `Observation(String)`, `ReasoningTrace(Vec<String>)`, `ToolCallProgress { ... }`, `ActionTaken { action, result }`, `Error(String)`, `StateChanged(...)`, `ChatStreaming { ... }` | Removing/renaming breaks match arms |
+| `AgentEvent` | Variants: `Observation(String)`, `ReasoningTrace(Vec<String>)`, `ToolCallProgress { ... }`, `ActionTaken { action, result }`, `OrientationUpdate(...)`, `Error(String)`, `StateChanged(...)`, `ChatStreaming { ... }` | Removing/renaming breaks match arms |
 | `ChatMessage` | Fields `role`, `content`, `created_at` (with `.format()`), `processed` | Renaming fields breaks rendering |
 | `agent/mod.rs` | Metadata delimiters and JSON shape for tool/thinking/media blocks | Changing block names or payload fields without parser updates |
 
@@ -38,5 +38,6 @@ Provides two scrollable display panels: an event log showing agent activity and 
 - When both metadata sets exist, Thinking and Tool Calls sections render in side-by-side columns to avoid overlap.
 - Long unbroken tokens (paths/JSON/chunks without spaces) are force-wrapped based on bubble width so text cannot expand message bubbles past the window.
 - Streaming preview intentionally shows raw in-flight text (including internal narration markers) before final post-processing/persistence.
+- Orientation events render as compact summaries (`disposition`, anomaly count, salience count) in the activity log instead of full payload dumps.
 - Tool and thinking detail blocks are intentionally hidden by default behind `egui::CollapsingHeader` sections to keep chat readable.
 - Image media entries attempt inline previews from local paths; non-image media shows typed file cards with path + MIME details.

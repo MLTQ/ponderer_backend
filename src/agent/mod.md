@@ -37,6 +37,11 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 - **Does**: Polls skills, filters new events, then runs a dedicated agentic pass over those events so tool calls (including bridged skill actions) happen in the same loop architecture as private chat
 - **Interacts with**: `Skill::poll`, `tools::agentic::AgenticLoop`, `ToolRegistry` (notably `graphchan_skill`), `AgentDatabase` memory/chat helpers
 
+### `maybe_update_orientation`
+- **Does**: Samples presence + context, computes a coarse signature, skips redundant orientation calls when unchanged, and otherwise runs orientation synthesis and persists snapshot records
+- **Interacts with**: `presence/mod.rs` (`PresenceMonitor`), `agent/orientation.rs` (`OrientationEngine`, `OrientationContext`), `database.rs` (`save_orientation_snapshot`), `AgentEvent::OrientationUpdate`
+- **Rationale**: Adds situational awareness without changing existing action behavior in phase 2
+
 ### `process_chat_messages`
 - **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, emits per-tool progress updates, and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol
 - **Interacts with**: `database::chat_messages`, `database::chat_conversations`, `database::chat_turns`, `database::chat_turn_tool_calls`, `tools::agentic::AgenticLoop::run_with_history_streaming_and_tool_events`, `ToolRegistry`
@@ -59,7 +64,7 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
 | `main.rs` | `Agent::new(...).run_loop()` drives autonomous behavior without extra orchestration | Changing constructor or loop entrypoint signatures |
-| `ui/app.rs` | `AgentEvent` variants remain stable enough for chat/state rendering, including `ChatStreaming { conversation_id, content, done }` and `ToolCallProgress { ... }` | Renaming/removing emitted event types |
+| `ui/app.rs` | `AgentEvent` variants remain stable enough for chat/state rendering, including `ChatStreaming { conversation_id, content, done }`, `ToolCallProgress { ... }`, and `OrientationUpdate(...)` | Renaming/removing emitted event types |
 | `database.rs` | Chat and memory APIs are available and synchronous; private chat relies on conversation-scoped context plus turn lifecycle APIs (`begin_chat_turn`, `record_chat_turn_tool_call`, `complete_chat_turn`, `fail_chat_turn`, `add_chat_message_in_turn`) | Changing DB API names, turn-state semantics, or message persistence order |
 | `tools/mod.rs` | `ToolRegistry` can be shared and used in autonomous context, including bridged skill tools | Removing registry injection or bridged tool names used by prompts |
 | `tools/agentic.rs` | `AgenticLoop` accepts OpenAI-compatible endpoint and ToolContext for autonomous runs | Changing loop constructor/run signatures |
@@ -78,6 +83,7 @@ Coordinates the core autonomous agent loop: polling skills, reasoning over event
 - Turn-control parsing treats visible assistant text as authoritative; block `user_message` is only fallback when visible text is empty and does not resemble a hallucinated `User:`/`Operator:` transcript.
 - Tool-call progress is streamed as events during a turn so the UI can show real-time execution output (for example shell output snippets) before final reply persistence.
 - Each autonomous private-chat turn is persisted in DB before/after execution, including tool-call lineage and terminal state (`completed`, `awaiting_approval`, or `failed`), but only the final yielded assistant message is added to chat history.
+- Orientation is now refreshed once per cycle as a log-only signal: it emits `OrientationUpdate`, persists `orientation_snapshots`, and uses an input signature cache to avoid repeated LLM calls when context is unchanged.
 - Tool access is now enforced by explicit capability profiles per loop (`private_chat`, `skill_events`, `heartbeat`), with optional config overrides for allow/deny lists.
 - Operator messages and per-turn agent outcomes now append to daily memory log keys (`activity-log-YYYY-MM-DD`) for longitudinal context.
 - Heartbeat mode is guarded by config + due-time checks and is intentionally quiet when no pending tasks/reminders are found.

@@ -3,6 +3,7 @@ pub mod capability_profiles;
 pub mod concerns;
 pub mod image_gen;
 pub mod journal;
+pub mod orientation;
 pub mod reasoning;
 pub mod trajectory;
 
@@ -14,18 +15,23 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 
 use crate::agent::capability_profiles::{build_tool_context_for_profile, AgentCapabilityProfile};
+use crate::agent::orientation::{
+    context_signature as orientation_context_signature, Disposition, Orientation,
+    OrientationContext, OrientationEngine,
+};
 use crate::config::AgentConfig;
-use crate::database::{AgentDatabase, ChatTurnPhase};
+use crate::database::{AgentDatabase, ChatTurnPhase, OrientationSnapshotRecord};
 use crate::llm_client::{LlmClient, Message as LlmMessage};
 use crate::memory::archive::{MemoryEvalRunRecord, MemoryPromotionPolicy, PromotionOutcome};
 use crate::memory::eval::{
     default_replay_trace_set, evaluate_trace_set, load_trace_set, EvalBackendKind, MemoryEvalReport,
 };
 use crate::memory::WorkingMemoryEntry;
+use crate::presence::PresenceMonitor;
 use crate::skills::{Skill, SkillContext, SkillEvent};
 use crate::tools::agentic::{AgenticConfig, AgenticLoop, ToolCallRecord};
 use crate::tools::ToolOutput;
@@ -78,6 +84,7 @@ pub enum AgentEvent {
         action: String,
         result: String,
     },
+    OrientationUpdate(Orientation),
     Error(String),
 }
 
@@ -111,6 +118,10 @@ pub struct Agent {
     image_gen: Arc<RwLock<Option<image_gen::ImageGenerator>>>,
     database: Arc<RwLock<Option<AgentDatabase>>>,
     trajectory_engine: Arc<RwLock<Option<trajectory::TrajectoryEngine>>>,
+    orientation_engine: Arc<RwLock<OrientationEngine>>,
+    presence_monitor: Arc<Mutex<PresenceMonitor>>,
+    last_orientation_signature: Arc<RwLock<Option<String>>>,
+    last_orientation: Arc<RwLock<Option<Orientation>>>,
 }
 
 impl Agent {
@@ -125,6 +136,11 @@ impl Agent {
             config.llm_model.clone(),
             config.llm_api_key.clone(),
             config.system_prompt.clone(),
+        );
+        let orientation_engine = OrientationEngine::new(
+            config.llm_api_url.clone(),
+            config.llm_model.clone(),
+            config.llm_api_key.clone(),
         );
 
         // Initialize image generator if workflow is configured
@@ -192,6 +208,10 @@ impl Agent {
             image_gen: Arc::new(RwLock::new(image_gen)),
             database: Arc::new(RwLock::new(database)),
             trajectory_engine: Arc::new(RwLock::new(trajectory_engine)),
+            orientation_engine: Arc::new(RwLock::new(orientation_engine)),
+            presence_monitor: Arc::new(Mutex::new(PresenceMonitor::new())),
+            last_orientation_signature: Arc::new(RwLock::new(None)),
+            last_orientation: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -205,6 +225,11 @@ impl Agent {
             new_config.llm_model.clone(),
             new_config.llm_api_key.clone(),
             new_config.system_prompt.clone(),
+        );
+        let new_orientation = OrientationEngine::new(
+            new_config.llm_api_url.clone(),
+            new_config.llm_model.clone(),
+            new_config.llm_api_key.clone(),
         );
 
         // Recreate image generator if needed
@@ -249,8 +274,10 @@ impl Agent {
         // Update all components atomically
         *self.config.write().await = new_config;
         *self.reasoning.write().await = new_reasoning;
+        *self.orientation_engine.write().await = new_orientation;
         *self.image_gen.write().await = new_image_gen;
         *self.trajectory_engine.write().await = new_trajectory;
+        *self.last_orientation_signature.write().await = None;
 
         self.emit(AgentEvent::Observation(
             "Configuration reloaded".to_string(),
@@ -893,6 +920,107 @@ impl Agent {
         Ok(snapshot)
     }
 
+    async fn maybe_update_orientation(&self, pending_events: &[SkillEvent]) {
+        let presence = {
+            let mut monitor = self.presence_monitor.lock().await;
+            monitor.sample()
+        };
+
+        let (concerns, recent_journal, persona) = {
+            let db_lock = self.database.read().await;
+            if let Some(db) = db_lock.as_ref() {
+                (
+                    db.get_active_concerns().unwrap_or_default(),
+                    db.get_recent_journal(8).unwrap_or_default(),
+                    db.get_latest_persona().unwrap_or_default(),
+                )
+            } else {
+                (Vec::new(), Vec::new(), None)
+            }
+        };
+
+        let context = OrientationContext {
+            presence,
+            concerns,
+            recent_journal,
+            pending_events: pending_events.to_vec(),
+            persona,
+        };
+
+        let signature = orientation_context_signature(&context);
+        let signature_matches = {
+            let guard = self.last_orientation_signature.read().await;
+            guard
+                .as_ref()
+                .is_some_and(|previous| previous == &signature)
+        };
+
+        if signature_matches {
+            if let Some(orientation) = self.last_orientation.read().await.clone() {
+                self.emit(AgentEvent::OrientationUpdate(orientation)).await;
+            }
+            return;
+        }
+
+        let orientation = {
+            let engine = self.orientation_engine.read().await;
+            match engine.orient(context).await {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!("Orientation update failed: {}", error);
+                    self.emit(AgentEvent::Error(format!(
+                        "Orientation update failed: {}",
+                        error
+                    )))
+                    .await;
+                    return;
+                }
+            }
+        };
+
+        {
+            let mut guard = self.last_orientation_signature.write().await;
+            *guard = Some(signature);
+        }
+        {
+            let mut guard = self.last_orientation.write().await;
+            *guard = Some(orientation.clone());
+        }
+
+        let snapshot = OrientationSnapshotRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: orientation.generated_at,
+            user_state: serde_json::to_value(&orientation.user_state)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            disposition: format!("{:?}", orientation.disposition).to_ascii_lowercase(),
+            synthesis: orientation.raw_synthesis.clone(),
+            salience_map: serde_json::to_value(&orientation.salience_map)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            anomalies: serde_json::to_value(&orientation.anomalies)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            pending_thoughts: serde_json::to_value(&orientation.pending_thoughts)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            mood_valence: Some(orientation.mood_estimate.valence),
+            mood_arousal: Some(orientation.mood_estimate.arousal),
+        };
+        let db_lock = self.database.read().await;
+        if let Some(db) = db_lock.as_ref() {
+            if let Err(error) = db.save_orientation_snapshot(&snapshot) {
+                tracing::warn!("Failed to save orientation snapshot: {}", error);
+            }
+        }
+
+        self.emit(AgentEvent::Observation(format!(
+            "Orientation: state={} disposition={} anomalies={} salient={}",
+            summarize_user_state(&orientation.user_state),
+            summarize_disposition(orientation.disposition),
+            orientation.anomalies.len(),
+            orientation.salience_map.len()
+        )))
+        .await;
+        self.emit(AgentEvent::OrientationUpdate(orientation)).await;
+    }
+
     async fn run_cycle(&self) -> Result<()> {
         // First, check for and process any private chat messages
         self.process_chat_messages().await?;
@@ -959,6 +1087,10 @@ impl Agent {
                 !already_processed && !is_own
             })
             .collect();
+
+        // Phase-2 Living Loop integration: orientation is synthesized each cycle
+        // for situational awareness and logging only (no behavior control yet).
+        self.maybe_update_orientation(&filtered_events).await;
 
         if filtered_events.is_empty() {
             self.emit(AgentEvent::Observation(
@@ -1116,6 +1248,11 @@ impl Agent {
 
         if unprocessed_messages.is_empty() {
             return Ok(());
+        }
+
+        {
+            let mut monitor = self.presence_monitor.lock().await;
+            monitor.record_interaction();
         }
 
         let mut messages_by_conversation: Vec<(String, Vec<crate::database::ChatMessage>)> =
@@ -2312,6 +2449,30 @@ fn collect_heartbeat_memory_hints(entries: &[WorkingMemoryEntry]) -> Vec<String>
             )
         })
         .collect()
+}
+
+fn summarize_user_state(state: &orientation::UserStateEstimate) -> String {
+    match state {
+        orientation::UserStateEstimate::DeepWork { activity, .. } => {
+            format!("deep_work({})", truncate_for_event(activity, 32))
+        }
+        orientation::UserStateEstimate::LightWork { activity, .. } => {
+            format!("light_work({})", truncate_for_event(activity, 32))
+        }
+        orientation::UserStateEstimate::Idle { since_secs, .. } => format!("idle({}s)", since_secs),
+        orientation::UserStateEstimate::Away { since_secs, .. } => format!("away({}s)", since_secs),
+    }
+}
+
+fn summarize_disposition(disposition: Disposition) -> &'static str {
+    match disposition {
+        Disposition::Idle => "idle",
+        Disposition::Observe => "observe",
+        Disposition::Journal => "journal",
+        Disposition::Maintain => "maintain",
+        Disposition::Surface => "surface",
+        Disposition::Interrupt => "interrupt",
+    }
 }
 
 fn truncate_for_event(input: &str, max_chars: usize) -> String {
