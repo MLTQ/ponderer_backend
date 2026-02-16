@@ -3,6 +3,7 @@
 //! - `evaluate_local_image`: evaluates a local image file with a vision-capable model.
 //! - `publish_media_to_chat`: emits media metadata for private chat rendering.
 //! - `capture_screen`: optional screen capture tool gated by explicit config opt-in.
+//! - `capture_camera_snapshot`: optional camera snapshot tool gated by explicit config opt-in.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -261,6 +262,14 @@ impl CaptureScreenTool {
     }
 }
 
+pub struct CaptureCameraSnapshotTool;
+
+impl CaptureCameraSnapshotTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 #[async_trait]
 impl Tool for CaptureScreenTool {
     fn name(&self) -> &str {
@@ -340,7 +349,105 @@ impl Tool for CaptureScreenTool {
     }
 }
 
-async fn capture_screen_to_path(output_path: &Path) -> Result<()> {
+#[async_trait]
+impl Tool for CaptureCameraSnapshotTool {
+    fn name(&self) -> &str {
+        "capture_camera_snapshot"
+    }
+
+    fn description(&self) -> &str {
+        "Capture a camera snapshot on demand and publish it as media metadata. Disabled unless explicitly enabled in settings."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "output_path": {
+                    "type": "string",
+                    "description": "Optional output path for the snapshot file (.jpg/.png). Defaults to camera_<timestamp>.jpg in working directory."
+                },
+                "device_index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional camera index (default: 0)."
+                },
+                "device_name": {
+                    "type": "string",
+                    "description": "Optional camera device name. Primarily used on Windows with ffmpeg/dshow."
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        let config = AgentConfig::load();
+        if !config.enable_camera_capture_tool {
+            return Ok(ToolOutput::Error(
+                "Camera snapshots are disabled. Enable 'Allow camera snapshots in agentic loop (opt-in)' in Settings first."
+                    .to_string(),
+            ));
+        }
+
+        let output_path = params
+            .get("output_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(&ctx.working_directory)
+                    .join(format!("camera_{}.jpg", Utc::now().format("%Y%m%d_%H%M%S")))
+            });
+
+        let device_index = params
+            .get("device_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let device_name = params
+            .get("device_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create camera snapshot parent directory '{}'",
+                    parent.display()
+                )
+            })?;
+        }
+
+        capture_camera_to_path(&output_path, device_index, device_name.as_deref()).await?;
+
+        let abs_path = canonicalize_or_original(output_path.to_string_lossy().as_ref());
+        Ok(ToolOutput::Json(json!({
+            "status": "ok",
+            "path": abs_path,
+            "device_index": device_index,
+            "media": [
+                {
+                    "path": abs_path,
+                    "media_kind": "image",
+                    "mime_type": mime_type_from_path(&abs_path),
+                    "source": "capture_camera_snapshot"
+                }
+            ]
+        })))
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::General
+    }
+}
+
+pub async fn capture_screen_to_path(output_path: &Path) -> Result<()> {
     let path_str = output_path.to_string_lossy().to_string();
 
     if cfg!(target_os = "macos") {
@@ -381,6 +488,136 @@ async fn capture_screen_to_path(output_path: &Path) -> Result<()> {
     }
 
     anyhow::bail!("Screen capture is not supported on this OS")
+}
+
+async fn capture_camera_to_path(
+    output_path: &Path,
+    device_index: u32,
+    device_name: Option<&str>,
+) -> Result<()> {
+    let path_str = output_path.to_string_lossy().to_string();
+
+    if cfg!(target_os = "macos") {
+        let imagesnap_args = if let Some(name) = device_name {
+            vec![
+                "-q".to_string(),
+                "-d".to_string(),
+                name.to_string(),
+                path_str.clone(),
+            ]
+        } else {
+            vec!["-q".to_string(), path_str.clone()]
+        };
+        if try_capture_command("imagesnap", &imagesnap_args).await {
+            return Ok(());
+        }
+
+        let ffmpeg_args = vec![
+            "-y".to_string(),
+            "-f".to_string(),
+            "avfoundation".to_string(),
+            "-framerate".to_string(),
+            "1".to_string(),
+            "-i".to_string(),
+            format!("{}:none", device_index),
+            "-frames:v".to_string(),
+            "1".to_string(),
+            path_str.clone(),
+        ];
+        if try_capture_command("ffmpeg", &ffmpeg_args).await {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "No supported macOS camera capture command succeeded (tried imagesnap and ffmpeg)"
+        );
+    }
+
+    if cfg!(target_os = "linux") {
+        let device_path = format!("/dev/video{}", device_index);
+        let ffmpeg_args = vec![
+            "-y".to_string(),
+            "-f".to_string(),
+            "video4linux2".to_string(),
+            "-i".to_string(),
+            device_path.clone(),
+            "-frames:v".to_string(),
+            "1".to_string(),
+            path_str.clone(),
+        ];
+        if try_capture_command("ffmpeg", &ffmpeg_args).await {
+            return Ok(());
+        }
+
+        let fswebcam_args = vec![
+            "-d".to_string(),
+            device_path.clone(),
+            "--no-banner".to_string(),
+            path_str.clone(),
+        ];
+        if try_capture_command("fswebcam", &fswebcam_args).await {
+            return Ok(());
+        }
+
+        let libcamera_args = vec![
+            "-n".to_string(),
+            "--camera".to_string(),
+            device_index.to_string(),
+            "-o".to_string(),
+            path_str.clone(),
+        ];
+        if try_capture_command("libcamera-still", &libcamera_args).await {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "No supported Linux camera capture command succeeded (tried ffmpeg, fswebcam, libcamera-still)"
+        );
+    }
+
+    if cfg!(target_os = "windows") {
+        if let Some(name) = device_name {
+            let ffmpeg_args = vec![
+                "-y".to_string(),
+                "-f".to_string(),
+                "dshow".to_string(),
+                "-i".to_string(),
+                format!("video={}", name),
+                "-frames:v".to_string(),
+                "1".to_string(),
+                path_str.clone(),
+            ];
+            if try_capture_command("ffmpeg", &ffmpeg_args).await {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "ffmpeg camera capture failed for device '{}'; verify the camera name and permissions",
+                name
+            );
+        }
+
+        anyhow::bail!(
+            "Camera capture on Windows currently requires `device_name` plus ffmpeg (dshow input)"
+        );
+    }
+
+    anyhow::bail!("Camera capture is not supported on this OS")
+}
+
+async fn try_capture_command(cmd: &str, args: &[String]) -> bool {
+    let borrowed_args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_capture_command(cmd, &borrowed_args).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!(
+                "Capture command '{}' failed with args {:?}: {}",
+                cmd,
+                borrowed_args,
+                error
+            );
+            false
+        }
+    }
 }
 
 async fn run_capture_command(cmd: &str, args: &[&str]) -> Result<()> {

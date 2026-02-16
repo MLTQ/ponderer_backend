@@ -11,9 +11,10 @@ use anyhow::Result;
 use chrono::{Duration as ChronoDuration, Utc};
 use flume::Sender;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
@@ -24,8 +25,8 @@ use crate::agent::journal::{
     journal_skip_reason, JournalEngine, JournalSkipReason, DEFAULT_JOURNAL_MIN_INTERVAL_SECS,
 };
 use crate::agent::orientation::{
-    context_signature as orientation_context_signature, Disposition, Orientation,
-    OrientationContext, OrientationEngine,
+    context_signature as orientation_context_signature, DesktopObservation, Disposition,
+    Orientation, OrientationContext, OrientationEngine,
 };
 use crate::config::AgentConfig;
 use crate::database::{AgentDatabase, ChatTurnPhase, OrientationSnapshotRecord};
@@ -38,6 +39,7 @@ use crate::memory::WorkingMemoryEntry;
 use crate::presence::PresenceMonitor;
 use crate::skills::{Skill, SkillContext, SkillEvent};
 use crate::tools::agentic::{AgenticConfig, AgenticLoop, ToolCallRecord};
+use crate::tools::vision::capture_screen_to_path;
 use crate::tools::ToolOutput;
 use crate::tools::ToolRegistry;
 
@@ -57,10 +59,13 @@ const CHAT_CONCERNS_BLOCK_START: &str = "[concerns]";
 const CHAT_CONCERNS_BLOCK_END: &str = "[/concerns]";
 const CHAT_CONTINUE_MARKER_LEGACY: &str = "[CONTINUE]";
 const CHAT_MAX_AUTONOMOUS_TURNS: usize = 4;
+const CHAT_BACKGROUND_MAX_TURNS: usize = 8;
+const CHAT_BACKGROUND_ITERATION_OFFSET: i64 = 100;
 const CHAT_CONTEXT_RECENT_LIMIT: usize = 18;
 const CHAT_COMPACTION_TRIGGER_MESSAGES: usize = 36;
 const CHAT_COMPACTION_RESUMMARY_DELTA: usize = 8;
 const CHAT_COMPACTION_SOURCE_MAX_MESSAGES: usize = 140;
+static ORIENTATION_SCREEN_CAPTURE_FAILURE_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub enum AgentVisualState {
@@ -140,6 +145,8 @@ pub struct Agent {
     presence_monitor: Arc<Mutex<PresenceMonitor>>,
     last_orientation_signature: Arc<RwLock<Option<String>>>,
     last_orientation: Arc<RwLock<Option<Orientation>>>,
+    background_subtasks:
+        Arc<Mutex<HashMap<String, tokio::task::JoinHandle<BackgroundSubtaskResult>>>>,
 }
 
 impl Agent {
@@ -236,6 +243,7 @@ impl Agent {
             presence_monitor: Arc::new(Mutex::new(PresenceMonitor::new())),
             last_orientation_signature: Arc::new(RwLock::new(None)),
             last_orientation: Arc::new(RwLock::new(None)),
+            background_subtasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -616,7 +624,7 @@ impl Agent {
         );
 
         let loop_config = AgenticConfig {
-            max_iterations: 8,
+            max_iterations: configured_agentic_max_iterations(&config_snapshot),
             api_url: agentic_api_url(&llm_api_url),
             model: llm_model,
             api_key: llm_api_key,
@@ -981,10 +989,16 @@ impl Agent {
     }
 
     async fn maybe_update_orientation(&self, pending_events: &[SkillEvent]) -> Option<Orientation> {
+        let config_snapshot = { self.config.read().await.clone() };
+
         let presence = {
             let mut monitor = self.presence_monitor.lock().await;
             monitor.sample()
         };
+
+        let desktop_observation = self
+            .maybe_capture_desktop_observation(&config_snapshot)
+            .await;
 
         let (concerns, recent_journal, persona) = {
             let db_lock = self.database.read().await;
@@ -1005,6 +1019,7 @@ impl Agent {
             recent_journal,
             pending_events: pending_events.to_vec(),
             persona,
+            desktop_observation,
         };
 
         let signature = orientation_context_signature(&context);
@@ -1083,6 +1098,83 @@ impl Agent {
         self.emit(AgentEvent::OrientationUpdate(orientation.clone()))
             .await;
         Some(orientation)
+    }
+
+    async fn maybe_capture_desktop_observation(
+        &self,
+        config: &AgentConfig,
+    ) -> Option<DesktopObservation> {
+        if !config.enable_screen_capture_in_loop {
+            return None;
+        }
+
+        let screenshot_path = std::env::temp_dir().join("ponderer_orientation_latest.png");
+        if let Err(error) = capture_screen_to_path(&screenshot_path).await {
+            let error_text = error.to_string();
+            let first_warn =
+                !ORIENTATION_SCREEN_CAPTURE_FAILURE_WARNED.swap(true, Ordering::SeqCst);
+            if first_warn {
+                if cfg!(target_os = "macos")
+                    && error_text
+                        .to_ascii_lowercase()
+                        .contains("could not create image from display")
+                {
+                    tracing::warn!(
+                        "Orientation screenshot capture failed: {}. On macOS this usually means Screen Recording permission is missing for this app/binary (System Settings > Privacy & Security > Screen Recording). Further identical warnings will be suppressed.",
+                        error_text
+                    );
+                } else {
+                    tracing::warn!(
+                        "Orientation screenshot capture failed: {}. Further identical warnings will be suppressed.",
+                        error_text
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    "Orientation screenshot capture still unavailable (suppressed repeat): {}",
+                    error_text
+                );
+            }
+            return None;
+        }
+
+        let image_bytes = match fs::read(&screenshot_path) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => {
+                tracing::warn!("Orientation screenshot capture returned empty file");
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!("Failed to read orientation screenshot: {}", error);
+                return None;
+            }
+        };
+
+        let llm_client = LlmClient::new(
+            config.llm_api_url.clone(),
+            config.llm_api_key.clone().unwrap_or_default(),
+            config.llm_model.clone(),
+        );
+        let evaluation = match llm_client
+            .evaluate_image(
+                &image_bytes,
+                "Summarize what is visible on this desktop screenshot. Focus on probable user activity and immediate intent.",
+                "This is a private orientation pass for a desktop companion agent. Keep summary concise and factual.",
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!("Orientation screenshot evaluation failed: {}", error);
+                return None;
+            }
+        };
+
+        Some(DesktopObservation {
+            captured_at: Utc::now(),
+            screenshot_path: screenshot_path.display().to_string(),
+            summary: truncate_for_event(evaluation.reasoning.trim(), 420),
+        })
     }
 
     async fn maybe_write_journal_entry(
@@ -1279,7 +1371,98 @@ impl Agent {
         }
     }
 
+    async fn reap_finished_background_subtasks(&self) {
+        let finished: Vec<(String, tokio::task::JoinHandle<BackgroundSubtaskResult>)> = {
+            let mut tasks = self.background_subtasks.lock().await;
+            let finished_ids: Vec<String> = tasks
+                .iter()
+                .filter_map(|(id, handle)| {
+                    if handle.is_finished() {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let mut finished_handles = Vec::with_capacity(finished_ids.len());
+            for id in finished_ids {
+                if let Some(handle) = tasks.remove(&id) {
+                    finished_handles.push((id, handle));
+                }
+            }
+            finished_handles
+        };
+
+        for (conversation_id, handle) in finished {
+            match handle.await {
+                Ok(result) => {
+                    self.emit(AgentEvent::ActionTaken {
+                        action: "Background subtask finished".to_string(),
+                        result: format!(
+                            "[{}] status={}, turns={}, tools={}",
+                            truncate_for_event(&conversation_id, 12),
+                            result.status,
+                            result.turns_executed,
+                            result.total_tool_calls
+                        ),
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    self.emit(AgentEvent::Error(format!(
+                        "Background subtask join failed [{}]: {}",
+                        truncate_for_event(&conversation_id, 12),
+                        e
+                    )))
+                    .await;
+                }
+            }
+        }
+    }
+
+    async fn is_background_subtask_active(&self, conversation_id: &str) -> bool {
+        let mut tasks = self.background_subtasks.lock().await;
+        tasks.retain(|_, handle| !handle.is_finished());
+        tasks.contains_key(conversation_id)
+    }
+
+    async fn spawn_background_subtask(&self, request: BackgroundSubtaskRequest) -> bool {
+        let mut tasks = self.background_subtasks.lock().await;
+        tasks.retain(|_, handle| !handle.is_finished());
+
+        if tasks.contains_key(&request.conversation_id) {
+            return false;
+        }
+
+        let conversation_id = request.conversation_id.clone();
+        let tool_registry = self.tool_registry.clone();
+        let event_tx = self.event_tx.clone();
+        let handle =
+            tokio::task::spawn_blocking(
+                move || match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(run_background_chat_subtask(
+                        request,
+                        tool_registry,
+                        event_tx,
+                    )),
+                    Err(e) => BackgroundSubtaskResult {
+                        status: format!("failed: runtime init error ({})", e),
+                        turns_executed: 0,
+                        total_tool_calls: 0,
+                    },
+                },
+            );
+        tasks.insert(conversation_id, handle);
+        true
+    }
+
     async fn run_engaged_tick(&self) -> Result<Vec<SkillEvent>> {
+        self.reap_finished_background_subtasks().await;
+
         // Engaged loop handles direct operator chat + external skill events.
         self.process_chat_messages().await?;
 
@@ -1384,7 +1567,7 @@ impl Agent {
         let llm_api_key = config_snapshot.llm_api_key.clone();
         let system_prompt = config_snapshot.system_prompt.clone();
         let loop_config = AgenticConfig {
-            max_iterations: 8,
+            max_iterations: configured_agentic_max_iterations(&config_snapshot),
             api_url: agentic_api_url(&llm_api_url),
             model: llm_model,
             api_key: llm_api_key,
@@ -1797,7 +1980,7 @@ impl Agent {
         let llm_api_key = config_snapshot.llm_api_key.clone();
         let system_prompt = config_snapshot.system_prompt.clone();
         let loop_config = AgenticConfig {
-            max_iterations: 8,
+            max_iterations: configured_agentic_max_iterations(&config_snapshot),
             api_url: agentic_api_url(&llm_api_url),
             model: llm_model,
             api_key: llm_api_key,
@@ -1913,6 +2096,8 @@ impl Agent {
             }
         };
 
+        self.reap_finished_background_subtasks().await;
+
         if unprocessed_messages.is_empty() {
             return Ok(());
         }
@@ -1970,7 +2155,7 @@ impl Agent {
         let username = config_snapshot.username.clone();
 
         let loop_config = AgenticConfig {
-            max_iterations: 10,
+            max_iterations: configured_agentic_max_iterations(&config_snapshot),
             api_url: agentic_api_url(&llm_api_url),
             model: llm_model.clone(),
             api_key: llm_api_key.clone(),
@@ -1997,6 +2182,15 @@ impl Agent {
         );
 
         for (conversation_id, conversation_messages) in messages_by_conversation {
+            if self.is_background_subtask_active(&conversation_id).await {
+                self.emit(AgentEvent::Observation(format!(
+                    "Conversation [{}] already has a background task running; deferring new operator message(s) until it finishes.",
+                    truncate_for_event(&conversation_id, 12)
+                )))
+                .await;
+                continue;
+            }
+
             let mut pending_messages = conversation_messages.clone();
             let mut continuation_hint: Option<String> = None;
             let mut marked_initial_messages = false;
@@ -2142,21 +2336,68 @@ impl Agent {
                 let (response_without_concerns, concern_signals) =
                     parse_concern_signals(&base_response);
                 let turn_control = parse_turn_control(&response_without_concerns, tool_count);
-                let should_continue = turn_control.decision == TurnDecision::Continue
-                    && !turn_control.needs_user_input
-                    && turn < CHAT_MAX_AUTONOMOUS_TURNS
-                    && (tool_count > 0 || turn_control.status == "still_working");
-                let operator_visible_response = if !turn_control.operator_response.trim().is_empty()
-                {
-                    turn_control.operator_response.clone()
-                } else if should_continue {
-                    turn_control
-                        .reason
-                        .clone()
-                        .unwrap_or_else(|| "Still working on your request...".to_string())
-                } else {
-                    response_without_concerns.clone()
-                };
+                let should_continue = should_continue_autonomous_turn(
+                    &turn_control,
+                    tool_count,
+                    turn,
+                    CHAT_MAX_AUTONOMOUS_TURNS,
+                );
+                let should_offload_to_background = should_offload_to_background_subtask(
+                    &turn_control,
+                    tool_count,
+                    turn,
+                    CHAT_MAX_AUTONOMOUS_TURNS,
+                );
+                let continuation_hint_text = format!(
+                    "Previous autonomous turn: status={}, tools={}, summary=\"{}\", reason=\"{}\". Continue only if meaningful progress is still possible without operator input.",
+                    turn_control.status,
+                    tool_count,
+                    truncate_for_event(
+                        &response_without_concerns.replace('\n', " "),
+                        220
+                    ),
+                    truncate_for_event(turn_control.reason.as_deref().unwrap_or(""), 180)
+                );
+
+                let mut background_subtask_spawned = false;
+                let mut operator_visible_response =
+                    if !turn_control.operator_response.trim().is_empty() {
+                        turn_control.operator_response.clone()
+                    } else if should_continue || should_offload_to_background {
+                        turn_control
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "Still working on your request...".to_string())
+                    } else {
+                        response_without_concerns.clone()
+                    };
+
+                if should_offload_to_background {
+                    background_subtask_spawned = self
+                        .spawn_background_subtask(BackgroundSubtaskRequest {
+                            conversation_id: conversation_id.clone(),
+                            initial_continuation_hint: continuation_hint_text.clone(),
+                            working_memory_context: working_memory_context.clone(),
+                            concerns_priority_context: concerns_priority_context.clone(),
+                            summary_snapshot: conversation_summary_context.clone(),
+                            chat_system_prompt: chat_system_prompt.clone(),
+                            config_snapshot: config_snapshot.clone(),
+                        })
+                        .await;
+
+                    if background_subtask_spawned {
+                        operator_visible_response = format!(
+                            "I am continuing this in the background and will post an update here when it completes. Latest progress: {}",
+                            truncate_for_event(operator_visible_response.trim(), 180)
+                        );
+                    } else {
+                        self.emit(AgentEvent::Observation(format!(
+                            "Background handoff skipped [{}]: a subtask is already active.",
+                            truncate_for_event(&conversation_id, 12)
+                        )))
+                        .await;
+                    }
+                }
 
                 self.apply_chat_concern_updates(
                     &conversation_id,
@@ -2248,8 +2489,12 @@ impl Agent {
                 }
 
                 if let Some(turn_id) = turn_id.as_deref() {
-                    let completion_phase = if should_continue {
-                        ChatTurnPhase::Completed
+                    let completion_phase = if should_continue || background_subtask_spawned {
+                        if background_subtask_spawned {
+                            ChatTurnPhase::Processing
+                        } else {
+                            ChatTurnPhase::Completed
+                        }
                     } else if turn_control.needs_user_input {
                         ChatTurnPhase::AwaitingApproval
                     } else if turn_control.status == "blocked" {
@@ -2318,17 +2563,21 @@ impl Agent {
                     .await;
 
                     pending_messages.clear();
-                    continuation_hint = Some(format!(
-                        "Previous autonomous turn: status={}, tools={}, summary=\"{}\", reason=\"{}\". Continue only if meaningful progress is still possible without operator input.",
-                        turn_control.status,
-                        tool_count,
-                        truncate_for_event(&operator_visible_response.replace('\n', " "), 220),
-                        truncate_for_event(
-                            turn_control.reason.as_deref().unwrap_or(""),
-                            180
-                        )
-                    ));
+                    continuation_hint = Some(continuation_hint_text.clone());
                     continue;
+                }
+
+                if background_subtask_spawned {
+                    self.emit(AgentEvent::ActionTaken {
+                        action: "Continuing operator task in background".to_string(),
+                        result: format!(
+                            "[{}] handoff complete; {} tool call(s) already executed.",
+                            truncate_for_event(&conversation_id, 12),
+                            tool_count
+                        ),
+                    })
+                    .await;
+                    break;
                 }
 
                 self.emit(AgentEvent::ActionTaken {
@@ -2608,6 +2857,24 @@ struct TurnControlBlock {
     needs_user_input: Option<bool>,
     user_message: Option<String>,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundSubtaskRequest {
+    conversation_id: String,
+    initial_continuation_hint: String,
+    working_memory_context: String,
+    concerns_priority_context: String,
+    summary_snapshot: Option<String>,
+    chat_system_prompt: String,
+    config_snapshot: AgentConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BackgroundSubtaskResult {
+    status: String,
+    turns_executed: usize,
+    total_tool_calls: usize,
 }
 
 fn parse_concern_signals(response: &str) -> (String, Vec<ConcernSignal>) {
@@ -2942,12 +3209,394 @@ fn tool_trace_lines(tool_calls: &[ToolCallRecord]) -> Vec<String> {
         .collect()
 }
 
+async fn run_background_chat_subtask(
+    request: BackgroundSubtaskRequest,
+    tool_registry: Arc<ToolRegistry>,
+    event_tx: Sender<AgentEvent>,
+) -> BackgroundSubtaskResult {
+    let conversation_tag = truncate_for_event(&request.conversation_id, 12);
+    let _ = event_tx.send(AgentEvent::ActionTaken {
+        action: "Background subtask started".to_string(),
+        result: format!("[{}] continuing autonomous work", conversation_tag),
+    });
+
+    let db = match AgentDatabase::new(&request.config_snapshot.database_path) {
+        Ok(db) => db,
+        Err(e) => {
+            let _ = event_tx.send(AgentEvent::Error(format!(
+                "Background subtask failed to open database [{}]: {}",
+                conversation_tag, e
+            )));
+            return BackgroundSubtaskResult {
+                status: "failed".to_string(),
+                turns_executed: 0,
+                total_tool_calls: 0,
+            };
+        }
+    };
+
+    let loop_config = AgenticConfig {
+        max_iterations: configured_agentic_max_iterations(&request.config_snapshot),
+        api_url: agentic_api_url(&request.config_snapshot.llm_api_url),
+        model: request.config_snapshot.llm_model.clone(),
+        api_key: request.config_snapshot.llm_api_key.clone(),
+        temperature: 0.35,
+        max_tokens: 2048,
+    };
+    let agentic_loop = AgenticLoop::new(loop_config, tool_registry);
+    let tool_ctx = build_tool_context_for_profile(
+        &request.config_snapshot,
+        AgentCapabilityProfile::PrivateChat,
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string()),
+        request.config_snapshot.username.clone(),
+    );
+
+    let mut turns_executed = 0usize;
+    let mut total_tool_calls = 0usize;
+    let mut continuation_hint = Some(request.initial_continuation_hint);
+
+    for turn in 1..=CHAT_BACKGROUND_MAX_TURNS {
+        turns_executed = turn;
+        let trigger_message_ids: Vec<String> = Vec::new();
+        let turn_id = match db.begin_chat_turn(
+            &request.conversation_id,
+            &trigger_message_ids,
+            CHAT_BACKGROUND_ITERATION_OFFSET + turn as i64,
+        ) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to persist start of background chat turn [{}]: {}",
+                    conversation_tag,
+                    e
+                );
+                None
+            }
+        };
+
+        let _ = event_tx.send(AgentEvent::ToolCallProgress {
+            conversation_id: request.conversation_id.clone(),
+            tool_name: "background_subtask".to_string(),
+            output_preview: format!("turn {}/{} running", turn, CHAT_BACKGROUND_MAX_TURNS),
+        });
+
+        let recent_chat_context = db
+            .get_chat_context_for_conversation(&request.conversation_id, CHAT_CONTEXT_RECENT_LIMIT)
+            .unwrap_or_default();
+        let user_message = build_private_chat_agentic_prompt(
+            &[],
+            &request.concerns_priority_context,
+            &request.working_memory_context,
+            &recent_chat_context,
+            request.summary_snapshot.as_deref(),
+            continuation_hint.as_deref(),
+        );
+
+        let stream_tx = event_tx.clone();
+        let stream_conversation_id = request.conversation_id.clone();
+        let stream_callback = move |content: &str, done: bool| {
+            let _ = stream_tx.send(AgentEvent::ChatStreaming {
+                conversation_id: stream_conversation_id.clone(),
+                content: content.to_string(),
+                done,
+            });
+        };
+        let tool_event_tx = event_tx.clone();
+        let tool_event_conversation_id = request.conversation_id.clone();
+        let tool_event_callback = move |record: &ToolCallRecord| {
+            let output_preview =
+                truncate_for_event(&record.output.to_llm_string().replace('\n', " "), 220);
+            let _ = tool_event_tx.send(AgentEvent::ToolCallProgress {
+                conversation_id: tool_event_conversation_id.clone(),
+                tool_name: record.tool_name.clone(),
+                output_preview,
+            });
+        };
+
+        let result = match agentic_loop
+            .run_with_history_streaming_and_tool_events(
+                &request.chat_system_prompt,
+                vec![],
+                &user_message,
+                &tool_ctx,
+                &stream_callback,
+                Some(&tool_event_callback),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                if let Some(turn_id) = turn_id.as_deref() {
+                    let _ = db.fail_chat_turn(turn_id, &e.to_string());
+                }
+                let _ = event_tx.send(AgentEvent::Error(format!(
+                    "Background subtask turn failed [{}]: {}",
+                    conversation_tag, e
+                )));
+                let _ = event_tx.send(AgentEvent::ChatStreaming {
+                    conversation_id: request.conversation_id.clone(),
+                    content: String::new(),
+                    done: true,
+                });
+                return BackgroundSubtaskResult {
+                    status: "failed".to_string(),
+                    turns_executed,
+                    total_tool_calls,
+                };
+            }
+        };
+
+        let base_response = result.response.unwrap_or_else(|| {
+            if result.tool_calls_made.is_empty() {
+                "I do not have a useful response yet.".to_string()
+            } else {
+                "I ran tools for your request. Details are attached below.".to_string()
+            }
+        });
+        let tool_count = result.tool_calls_made.len();
+        total_tool_calls += tool_count;
+
+        let (response_without_concerns, concern_signals) = parse_concern_signals(&base_response);
+        let turn_control = parse_turn_control(&response_without_concerns, tool_count);
+        let should_continue = should_continue_autonomous_turn(
+            &turn_control,
+            tool_count,
+            turn,
+            CHAT_BACKGROUND_MAX_TURNS,
+        );
+
+        let operator_visible_response = if !turn_control.operator_response.trim().is_empty() {
+            turn_control.operator_response.clone()
+        } else if should_continue {
+            turn_control
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Still working on your request...".to_string())
+        } else {
+            response_without_concerns.clone()
+        };
+
+        apply_background_concern_updates(
+            &db,
+            &request.conversation_id,
+            &operator_visible_response,
+            &concern_signals,
+            &event_tx,
+        );
+
+        let chat_content = format_chat_message_with_metadata(
+            &operator_visible_response,
+            &result.tool_calls_made,
+            &result.thinking_blocks,
+        );
+
+        let mut agent_message_id: Option<String> = None;
+        if !should_continue {
+            let add_result = if let Some(turn_id) = turn_id.as_deref() {
+                db.add_chat_message_in_turn(
+                    &request.conversation_id,
+                    turn_id,
+                    "agent",
+                    &chat_content,
+                )
+            } else {
+                db.add_chat_message_in_conversation(
+                    &request.conversation_id,
+                    "agent",
+                    &chat_content,
+                )
+            };
+            if let Ok(message_id) = add_result {
+                agent_message_id = Some(message_id);
+            }
+        }
+
+        if let Some(turn_id) = turn_id.as_deref() {
+            for (idx, record) in result.tool_calls_made.iter().enumerate() {
+                let _ = db.record_chat_turn_tool_call(
+                    turn_id,
+                    idx,
+                    &record.tool_name,
+                    &record.arguments.to_string(),
+                    &record.output.to_llm_string(),
+                );
+            }
+
+            let completion_phase = if turn_control.needs_user_input {
+                ChatTurnPhase::AwaitingApproval
+            } else if turn_control.status == "blocked" {
+                ChatTurnPhase::Failed
+            } else {
+                ChatTurnPhase::Completed
+            };
+            let decision_text = match turn_control.decision {
+                TurnDecision::Continue => "continue",
+                TurnDecision::Yield => "yield",
+            };
+
+            let _ = db.complete_chat_turn(
+                turn_id,
+                completion_phase,
+                decision_text,
+                &turn_control.status,
+                &operator_visible_response,
+                turn_control.reason.as_deref(),
+                tool_count,
+                agent_message_id.as_deref(),
+            );
+
+            let _ = db.append_daily_activity_log(&format!(
+                "background [{}] turn {}: decision={}, status={}, tools={}",
+                conversation_tag, turn, decision_text, turn_control.status, tool_count
+            ));
+        }
+
+        let mut trace_lines = vec![format!(
+            "Background chat [{}] turn {}/{} ({} tool call(s))",
+            conversation_tag, turn, CHAT_BACKGROUND_MAX_TURNS, tool_count
+        )];
+        if !result.thinking_blocks.is_empty() {
+            trace_lines.push(format!(
+                "Model emitted {} thinking block(s) (hidden from main reply)",
+                result.thinking_blocks.len()
+            ));
+        }
+        trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
+        let _ = event_tx.send(AgentEvent::ReasoningTrace(trace_lines));
+
+        if should_continue {
+            continuation_hint = Some(format!(
+                "Previous autonomous turn: status={}, tools={}, summary=\"{}\", reason=\"{}\". Continue only if meaningful progress is still possible without operator input.",
+                turn_control.status,
+                tool_count,
+                truncate_for_event(&operator_visible_response.replace('\n', " "), 220),
+                truncate_for_event(turn_control.reason.as_deref().unwrap_or(""), 180)
+            ));
+            continue;
+        }
+
+        let final_status = if turn_control.status == "blocked" {
+            "blocked".to_string()
+        } else {
+            "done".to_string()
+        };
+        let _ = event_tx.send(AgentEvent::ChatStreaming {
+            conversation_id: request.conversation_id.clone(),
+            content: String::new(),
+            done: true,
+        });
+        return BackgroundSubtaskResult {
+            status: final_status,
+            turns_executed,
+            total_tool_calls,
+        };
+    }
+
+    let fallback_message = "Background task reached its turn budget. Send a follow-up message if you want me to continue.";
+    let fallback_chat = format_chat_message_with_metadata(fallback_message, &[], &[]);
+    let _ = db.add_chat_message_in_conversation(&request.conversation_id, "agent", &fallback_chat);
+    let _ = event_tx.send(AgentEvent::ChatStreaming {
+        conversation_id: request.conversation_id.clone(),
+        content: String::new(),
+        done: true,
+    });
+
+    BackgroundSubtaskResult {
+        status: "paused".to_string(),
+        turns_executed,
+        total_tool_calls,
+    }
+}
+
+fn apply_background_concern_updates(
+    db: &AgentDatabase,
+    conversation_id: &str,
+    response_text: &str,
+    concern_signals: &[ConcernSignal],
+    event_tx: &Sender<AgentEvent>,
+) {
+    let reason = format!(
+        "background mention [{}]",
+        truncate_for_event(conversation_id, 12)
+    );
+    let touched_from_text =
+        ConcernsManager::touch_from_text(db, response_text, &reason).unwrap_or_default();
+    let ingest_report =
+        ConcernsManager::ingest_signals(db, concern_signals, "private_chat_background")
+            .unwrap_or_default();
+
+    if !ingest_report.created.is_empty() || !ingest_report.touched.is_empty() {
+        let _ = db.append_daily_activity_log(&format!(
+            "concerns/background [{}]: created={}, touched={}",
+            truncate_for_event(conversation_id, 12),
+            ingest_report.created.len(),
+            ingest_report.touched.len()
+        ));
+    }
+
+    for concern in ingest_report.created {
+        let _ = event_tx.send(AgentEvent::ConcernCreated {
+            id: concern.id,
+            summary: concern.summary,
+        });
+    }
+
+    let mut touched_ids = HashSet::new();
+    for concern in touched_from_text
+        .into_iter()
+        .chain(ingest_report.touched.into_iter())
+    {
+        if touched_ids.insert(concern.id.clone()) {
+            let _ = event_tx.send(AgentEvent::ConcernTouched {
+                id: concern.id,
+                summary: concern.summary,
+            });
+        }
+    }
+}
+
+fn should_attempt_autonomous_continuation(
+    turn_control: &ParsedTurnControl,
+    tool_count: usize,
+) -> bool {
+    turn_control.decision == TurnDecision::Continue
+        && !turn_control.needs_user_input
+        && (tool_count > 0 || turn_control.status == "still_working")
+}
+
+fn should_continue_autonomous_turn(
+    turn_control: &ParsedTurnControl,
+    tool_count: usize,
+    turn: usize,
+    turn_limit: usize,
+) -> bool {
+    should_attempt_autonomous_continuation(turn_control, tool_count) && turn < turn_limit
+}
+
+fn should_offload_to_background_subtask(
+    turn_control: &ParsedTurnControl,
+    tool_count: usize,
+    turn: usize,
+    turn_limit: usize,
+) -> bool {
+    should_attempt_autonomous_continuation(turn_control, tool_count) && turn >= turn_limit
+}
+
 fn parse_turn_control(response: &str, tool_call_count: usize) -> ParsedTurnControl {
     let (cleaned_response, block_json) = extract_metadata_block(
         response,
         CHAT_TURN_CONTROL_BLOCK_START,
         CHAT_TURN_CONTROL_BLOCK_END,
     );
+    let (cleaned_response, block_json) = if block_json.is_none() {
+        extract_open_ended_metadata_block(response, CHAT_TURN_CONTROL_BLOCK_START)
+            .map(|(cleaned, raw)| (cleaned, Some(raw)))
+            .unwrap_or((cleaned_response, block_json))
+    } else {
+        (cleaned_response, block_json)
+    };
     let mut fallback_decision = TurnDecision::Yield;
     let mut fallback_reason = None;
     let cleaned_trimmed = cleaned_response.trim().to_string();
@@ -2965,7 +3614,7 @@ fn parse_turn_control(response: &str, tool_call_count: usize) -> ParsedTurnContr
 
     let parsed_block = block_json
         .as_deref()
-        .and_then(|raw| serde_json::from_str::<TurnControlBlock>(raw).ok());
+        .and_then(parse_turn_control_block_json);
 
     let decision = parsed_block
         .as_ref()
@@ -3121,6 +3770,108 @@ fn extract_metadata_block(
     (cleaned, Some(raw))
 }
 
+fn extract_open_ended_metadata_block(
+    content: &str,
+    start_marker: &str,
+) -> Option<(String, String)> {
+    let start_idx = content.find(start_marker)?;
+    let after_start = start_idx + start_marker.len();
+    let raw = content[after_start..].trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let cleaned = content[..start_idx].trim_end().to_string();
+    Some((cleaned, raw))
+}
+
+fn parse_turn_control_block_json(raw: &str) -> Option<TurnControlBlock> {
+    if let Ok(parsed) = serde_json::from_str::<TurnControlBlock>(raw.trim()) {
+        return Some(parsed);
+    }
+
+    let cleaned = strip_optional_json_fence(raw);
+    if let Ok(parsed) = serde_json::from_str::<TurnControlBlock>(cleaned) {
+        return Some(parsed);
+    }
+
+    let extracted = extract_json_object_or_array(cleaned)?;
+    serde_json::from_str::<TurnControlBlock>(extracted).ok()
+}
+
+fn strip_optional_json_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed;
+    }
+
+    let after_start = &trimmed[3..];
+    let end_rel = after_start.find("```");
+    let inner = end_rel
+        .map(|idx| after_start[..idx].trim())
+        .unwrap_or_else(|| after_start.trim());
+
+    let first_line = inner.lines().next().unwrap_or_default().trim();
+    let first_lower = first_line.to_ascii_lowercase();
+    if first_lower == "json" || first_lower == "jsonc" {
+        if let Some(newline_idx) = inner.find('\n') {
+            return inner[newline_idx + 1..].trim();
+        }
+    }
+
+    inner
+}
+
+fn extract_json_object_or_array(text: &str) -> Option<&str> {
+    let mut start_idx = None;
+    for (idx, ch) in text.char_indices() {
+        if ch == '{' || ch == '[' {
+            start_idx = Some(idx);
+            break;
+        }
+    }
+    let start = start_idx?;
+    let slice = &text[start..];
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (rel_idx, ch) in slice.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                let expected = stack.pop()?;
+                if ch != expected {
+                    return None;
+                }
+                if stack.is_empty() {
+                    let end = start + rel_idx + ch.len_utf8();
+                    return Some(&text[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn parse_pending_checklist_items(markdown: &str) -> Vec<String> {
     markdown
         .lines()
@@ -3247,6 +3998,14 @@ fn agentic_api_url(base_url: &str) -> String {
     }
 }
 
+fn configured_agentic_max_iterations(config: &AgentConfig) -> Option<usize> {
+    if config.disable_tool_iteration_limit {
+        None
+    } else {
+        Some(config.max_tool_iterations.max(1) as usize)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3305,6 +4064,22 @@ not a checklist item
             agentic_api_url("http://localhost:11434/v1/"),
             "http://localhost:11434/v1"
         );
+    }
+
+    #[test]
+    fn uses_configured_agentic_max_iterations_when_enabled() {
+        let mut cfg = AgentConfig::default();
+        cfg.max_tool_iterations = 27;
+        cfg.disable_tool_iteration_limit = false;
+        assert_eq!(configured_agentic_max_iterations(&cfg), Some(27));
+    }
+
+    #[test]
+    fn disables_agentic_iteration_limit_when_configured() {
+        let mut cfg = AgentConfig::default();
+        cfg.max_tool_iterations = 27;
+        cfg.disable_tool_iteration_limit = true;
+        assert_eq!(configured_agentic_max_iterations(&cfg), None);
     }
 
     #[test]
@@ -3427,6 +4202,24 @@ not a checklist item
     }
 
     #[test]
+    fn turn_control_block_without_closing_marker_is_parsed() {
+        let response = "Working...\n[turn_control]\n{\"decision\":\"continue\",\"status\":\"still_working\",\"needs_user_input\":false,\"reason\":\"Need one more tool call\"}";
+        let parsed = parse_turn_control(response, 1);
+        assert_eq!(parsed.decision, TurnDecision::Continue);
+        assert_eq!(parsed.status, "still_working");
+        assert_eq!(parsed.operator_response, "Working...");
+    }
+
+    #[test]
+    fn turn_control_block_json_fence_is_parsed() {
+        let response = "Working...\n[turn_control]\n```json\n{\"decision\":\"continue\",\"status\":\"still_working\",\"needs_user_input\":false,\"reason\":\"Need one more tool call\"}\n```\n[/turn_control]";
+        let parsed = parse_turn_control(response, 1);
+        assert_eq!(parsed.decision, TurnDecision::Continue);
+        assert_eq!(parsed.status, "still_working");
+        assert_eq!(parsed.operator_response, "Working...");
+    }
+
+    #[test]
     fn legacy_continue_marker_remains_supported() {
         let parsed = parse_turn_control("[CONTINUE] still gathering more context", 1);
         assert_eq!(parsed.decision, TurnDecision::Continue);
@@ -3453,6 +4246,26 @@ not a checklist item
         let response = "[turn_control]\n{\"decision\":\"yield\",\"status\":\"done\",\"needs_user_input\":false,\"user_message\":\"User: please continue with step 2\",\"reason\":\"done\"}\n[/turn_control]";
         let parsed = parse_turn_control(response, 0);
         assert_eq!(parsed.operator_response, "");
+    }
+
+    #[test]
+    fn autonomous_continuation_helper_requires_progress_or_working_status() {
+        let parsed = parse_turn_control(
+            "[turn_control]\n{\"decision\":\"continue\",\"status\":\"done\",\"needs_user_input\":false,\"user_message\":\"\",\"reason\":\"\"}\n[/turn_control]",
+            0,
+        );
+        assert!(!should_attempt_autonomous_continuation(&parsed, 0));
+        assert!(should_attempt_autonomous_continuation(&parsed, 1));
+    }
+
+    #[test]
+    fn continuation_offloads_when_turn_limit_is_hit() {
+        let parsed = parse_turn_control(
+            "[turn_control]\n{\"decision\":\"continue\",\"status\":\"still_working\",\"needs_user_input\":false,\"user_message\":\"\",\"reason\":\"need more steps\"}\n[/turn_control]",
+            1,
+        );
+        assert!(!should_continue_autonomous_turn(&parsed, 1, 4, 4));
+        assert!(should_offload_to_background_subtask(&parsed, 1, 4, 4));
     }
 
     #[test]

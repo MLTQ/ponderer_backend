@@ -17,8 +17,8 @@ use super::{ToolCall, ToolContext, ToolDef, ToolOutput, ToolRegistry};
 /// Configuration for the agentic loop
 #[derive(Debug, Clone)]
 pub struct AgenticConfig {
-    /// Maximum iterations before stopping
-    pub max_iterations: usize,
+    /// Maximum iterations before stopping. `None` means unlimited.
+    pub max_iterations: Option<usize>,
     /// LLM API URL
     pub api_url: String,
     /// LLM model name
@@ -34,7 +34,7 @@ pub struct AgenticConfig {
 impl Default for AgenticConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 10,
+            max_iterations: Some(10),
             api_url: "http://localhost:11434/v1".to_string(),
             model: "llama3.2".to_string(),
             api_key: None,
@@ -214,21 +214,20 @@ impl AgenticLoop {
         loop {
             iterations += 1;
 
-            if iterations > self.config.max_iterations {
-                tracing::warn!(
-                    "Agentic loop hit iteration limit ({})",
-                    self.config.max_iterations
-                );
-                return Ok(AgenticResult {
-                    response: Some(format!(
-                        "[Reached maximum of {} tool-calling iterations]",
-                        self.config.max_iterations
-                    )),
-                    thinking_blocks: Vec::new(),
-                    tool_calls_made,
-                    iterations: iterations - 1,
-                    hit_limit: true,
-                });
+            if let Some(max_iterations) = self.config.max_iterations {
+                if iterations > max_iterations {
+                    tracing::warn!("Agentic loop hit iteration limit ({})", max_iterations);
+                    return Ok(AgenticResult {
+                        response: Some(format!(
+                            "[Reached maximum of {} tool-calling iterations]",
+                            max_iterations
+                        )),
+                        thinking_blocks: Vec::new(),
+                        tool_calls_made,
+                        iterations: iterations - 1,
+                        hit_limit: true,
+                    });
+                }
             }
 
             // Call LLM
@@ -733,7 +732,7 @@ mod tests {
     #[test]
     fn test_agentic_config_default() {
         let config = AgenticConfig::default();
-        assert_eq!(config.max_iterations, 10);
+        assert_eq!(config.max_iterations, Some(10));
         assert_eq!(config.temperature, 0.7);
     }
 

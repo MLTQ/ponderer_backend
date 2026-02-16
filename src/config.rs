@@ -148,6 +148,10 @@ pub struct AgentConfig {
     // Polling and Response
     #[serde(default = "default_poll_interval", alias = "check_interval_seconds")]
     pub poll_interval_secs: u64,
+    #[serde(default = "default_max_tool_iterations")]
+    pub max_tool_iterations: u32,
+    #[serde(default)]
+    pub disable_tool_iteration_limit: bool,
     #[serde(default)]
     pub enable_ambient_loop: bool,
     #[serde(default = "default_ambient_min_interval_secs")]
@@ -204,6 +208,8 @@ pub struct AgentConfig {
     pub enable_image_generation: bool,
     #[serde(default)]
     pub enable_screen_capture_in_loop: bool,
+    #[serde(default)]
+    pub enable_camera_capture_tool: bool,
     #[serde(default)]
     pub comfyui: ComfyUIConfig,
 
@@ -271,6 +277,10 @@ fn default_poll_interval() -> u64 {
     60
 }
 
+fn default_max_tool_iterations() -> u32 {
+    10
+}
+
 fn default_ambient_min_interval_secs() -> u64 {
     30
 }
@@ -317,6 +327,8 @@ impl Default for AgentConfig {
             username: default_username(),
             system_prompt: default_system_prompt(),
             poll_interval_secs: default_poll_interval(),
+            max_tool_iterations: default_max_tool_iterations(),
+            disable_tool_iteration_limit: false,
             enable_ambient_loop: false,
             ambient_min_interval_secs: default_ambient_min_interval_secs(),
             enable_journal: true,
@@ -344,6 +356,7 @@ impl Default for AgentConfig {
             max_important_posts: default_max_important_posts(),
             enable_image_generation: false,
             enable_screen_capture_in_loop: false,
+            enable_camera_capture_tool: false,
             comfyui: ComfyUIConfig::default(),
             workflow_path: None,
             workflow_settings: None,
@@ -452,6 +465,19 @@ impl AgentConfig {
             }
         }
 
+        if let Ok(limit) = env::var("AGENT_MAX_TOOL_ITERATIONS") {
+            if let Ok(iterations) = limit.parse() {
+                config.max_tool_iterations = iterations;
+            }
+        }
+
+        if let Ok(disabled) = env::var("AGENT_DISABLE_TOOL_ITERATION_LIMIT") {
+            let disabled = disabled.eq_ignore_ascii_case("1")
+                || disabled.eq_ignore_ascii_case("true")
+                || disabled.eq_ignore_ascii_case("yes");
+            config.disable_tool_iteration_limit = disabled;
+        }
+
         if let Ok(enabled) = env::var("AGENT_ENABLE_AMBIENT_LOOP") {
             let enabled = enabled.eq_ignore_ascii_case("1")
                 || enabled.eq_ignore_ascii_case("true")
@@ -541,6 +567,13 @@ impl AgentConfig {
                 || enabled.eq_ignore_ascii_case("true")
                 || enabled.eq_ignore_ascii_case("yes");
             config.enable_screen_capture_in_loop = enabled;
+        }
+
+        if let Ok(enabled) = env::var("AGENT_ENABLE_CAMERA_CAPTURE") {
+            let enabled = enabled.eq_ignore_ascii_case("1")
+                || enabled.eq_ignore_ascii_case("true")
+                || enabled.eq_ignore_ascii_case("yes");
+            config.enable_camera_capture_tool = enabled;
         }
 
         if let Ok(name) = env::var("AGENT_NAME") {

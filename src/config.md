@@ -1,7 +1,7 @@
 # config.rs
 
 ## Purpose
-Defines all configuration for the Ponderer agent, including LLM connection, identity, polling behavior, three-loop living-loop toggles (ambient/journal/concerns/dream), autonomous heartbeat scheduling, explicit per-loop tool capability profiles, image generation (ComfyUI), screen-capture privacy gating, character card fields, and self-reflection settings. Supports loading from TOML files with environment variable fallback.
+Defines all configuration for the Ponderer agent, including LLM connection, identity, polling behavior, agentic loop iteration controls, three-loop living-loop toggles (ambient/journal/concerns/dream), autonomous heartbeat scheduling, explicit per-loop tool capability profiles, image generation (ComfyUI), screen/camera capture privacy gating, character card fields, and self-reflection settings. Supports loading from TOML files with environment variable fallback.
 
 ## Components
 
@@ -18,7 +18,7 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - **Interacts with**: UI settings panel for persisting changes
 
 ### `AgentConfig::from_env()`
-- **Does**: Populates config from environment variables (`GRAPHCHAN_API_URL`, `LLM_API_URL`, `LLM_MODEL`, `LLM_API_KEY`, `AGENT_CHECK_INTERVAL`, `AGENT_ENABLE_AMBIENT_LOOP`, `AGENT_AMBIENT_MIN_INTERVAL_SECS`, `AGENT_ENABLE_JOURNAL`, `AGENT_JOURNAL_MIN_INTERVAL_SECS`, `AGENT_ENABLE_CONCERNS`, `AGENT_ENABLE_DREAM_CYCLE`, `AGENT_DREAM_MIN_INTERVAL_SECS`, `AGENT_ENABLE_HEARTBEAT`, `AGENT_HEARTBEAT_INTERVAL_MINS`, `AGENT_HEARTBEAT_CHECKLIST_PATH`, `AGENT_ENABLE_MEMORY_EVOLUTION`, `AGENT_MEMORY_EVOLUTION_INTERVAL_HOURS`, `AGENT_MEMORY_TRACE_SET_PATH`, `AGENT_ENABLE_SCREEN_CAPTURE`, `AGENT_NAME`)
+- **Does**: Populates config from environment variables (`GRAPHCHAN_API_URL`, `LLM_API_URL`, `LLM_MODEL`, `LLM_API_KEY`, `AGENT_CHECK_INTERVAL`, `AGENT_MAX_TOOL_ITERATIONS`, `AGENT_DISABLE_TOOL_ITERATION_LIMIT`, `AGENT_ENABLE_AMBIENT_LOOP`, `AGENT_AMBIENT_MIN_INTERVAL_SECS`, `AGENT_ENABLE_JOURNAL`, `AGENT_JOURNAL_MIN_INTERVAL_SECS`, `AGENT_ENABLE_CONCERNS`, `AGENT_ENABLE_DREAM_CYCLE`, `AGENT_DREAM_MIN_INTERVAL_SECS`, `AGENT_ENABLE_HEARTBEAT`, `AGENT_HEARTBEAT_INTERVAL_MINS`, `AGENT_HEARTBEAT_CHECKLIST_PATH`, `AGENT_ENABLE_MEMORY_EVOLUTION`, `AGENT_MEMORY_EVOLUTION_INTERVAL_HOURS`, `AGENT_MEMORY_TRACE_SET_PATH`, `AGENT_ENABLE_SCREEN_CAPTURE`, `AGENT_ENABLE_CAMERA_CAPTURE`, `AGENT_NAME`)
 - **Rationale**: Legacy support for env-var-only configuration
 
 ### `ComfyUIConfig`
@@ -38,8 +38,8 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
 | `main.rs` | `AgentConfig::load()` returns valid config | Changing `load()` return type |
-| `agent::Agent` | Fields: `llm_api_url`, `llm_model`, `llm_api_key`, `system_prompt`, `poll_interval_secs`, `enable_ambient_loop`, `ambient_min_interval_secs`, `enable_journal`, `journal_min_interval_secs`, `enable_concerns`, `enable_dream_cycle`, `dream_min_interval_secs`, `enable_heartbeat`, `heartbeat_interval_mins`, `heartbeat_checklist_path`, `enable_memory_evolution`, `memory_evolution_interval_hours`, `memory_eval_trace_set_path`, `capability_profiles`, `enable_self_reflection`, `enable_image_generation`, `enable_screen_capture_in_loop`, `guiding_principles` | Renaming/removing any of these fields |
-| `tools/vision.rs` | `enable_screen_capture_in_loop` must be present and default false | Removing/renaming this privacy gate field |
+| `agent::Agent` | Fields: `llm_api_url`, `llm_model`, `llm_api_key`, `system_prompt`, `poll_interval_secs`, `max_tool_iterations`, `disable_tool_iteration_limit`, `enable_ambient_loop`, `ambient_min_interval_secs`, `enable_journal`, `journal_min_interval_secs`, `enable_concerns`, `enable_dream_cycle`, `dream_min_interval_secs`, `enable_heartbeat`, `heartbeat_interval_mins`, `heartbeat_checklist_path`, `enable_memory_evolution`, `memory_evolution_interval_hours`, `memory_eval_trace_set_path`, `capability_profiles`, `enable_self_reflection`, `enable_image_generation`, `enable_screen_capture_in_loop`, `enable_camera_capture_tool`, `guiding_principles` | Renaming/removing any of these fields |
+| `tools/vision.rs` | `enable_screen_capture_in_loop` and `enable_camera_capture_tool` must be present and default false | Removing/renaming these privacy gate fields |
 | `comfy_client.rs` | `comfyui.api_url` is a valid HTTP URL | Changing `ComfyUIConfig` structure |
 | TOML file | Serde field names and aliases (`agent_name` -> `username`, `check_interval_seconds` -> `poll_interval_secs`) | Removing serde aliases breaks existing config files |
 
@@ -48,7 +48,8 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - Default LLM is `llama3.2` at `localhost:11434` (Ollama).
 - Living-loop defaults keep phase-5 architecture opt-in (`enable_ambient_loop=false`, `enable_dream_cycle=false`), while `enable_journal`/`enable_concerns` default true for continuity.
 - Heartbeat defaults: disabled, 30-minute interval, checklist path `HEARTBEAT.md`.
+- Agentic loop defaults: max 10 tool-calling iterations per turn, with optional config to disable the limit entirely.
 - Memory evolution defaults: disabled, 24-hour interval, built-in replay trace set.
 - Capability profile overrides default to empty, so loop policies fall back to code-defined defaults.
-- Screen capture in loop defaults to disabled and must be explicitly enabled in settings.
+- Screen and camera capture tools default to disabled and must be explicitly enabled in settings.
 - Default Graphchan URL derives from `GRAPHCHAN_PORT` env var if set.

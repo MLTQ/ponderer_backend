@@ -25,4 +25,4 @@ Application entry point for Ponderer. Initializes logging, loads configuration, 
 - The UI database and agent database share the same SQLite file via WAL mode for concurrent access.
 - Memory backend logic is initialized through `AgentDatabase` (currently `kv_v1` default behavior).
 - If the database fails to open, the UI still launches (with `ui_database = None`).
-- Tool registry includes shell/files/http/memory plus skill-bridge + media-capable tools (`graphchan_skill`, `generate_comfy_media`, `post_to_graphchan`, `evaluate_local_image`, `publish_media_to_chat`, `capture_screen`) for unified agentic runs.
+- Tool registry includes shell/files/http/memory plus skill-bridge + media-capable tools (`graphchan_skill`, `generate_comfy_media`, `post_to_graphchan`, `evaluate_local_image`, `publish_media_to_chat`, `capture_screen`, `capture_camera_snapshot`) for unified agentic runs.

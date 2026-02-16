@@ -92,6 +92,28 @@ impl SettingsPanel {
                     });
                     ui.add_space(8.0);
 
+                    ui.checkbox(
+                        &mut self.config.disable_tool_iteration_limit,
+                        "Disable tool-iteration limit (unbounded)",
+                    );
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Max tool iterations per turn:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.max_tool_iterations)
+                                .range(1..=500),
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Applies to autonomous tool loops. Disable limit for fully unbounded loops.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+
                     ui.horizontal(|ui| {
                         ui.label("Max posts per hour:");
                         ui.add(
@@ -132,6 +154,19 @@ impl SettingsPanel {
                     ui.label(
                         egui::RichText::new(
                             "Enables the capture_screen tool so the agent can inspect your current desktop.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+
+                    ui.checkbox(
+                        &mut self.config.enable_camera_capture_tool,
+                        "Allow camera snapshots in agentic loop (opt-in)",
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Enables the capture_camera_snapshot tool so the agent can capture a camera image on demand.",
                         )
                         .small()
                         .weak(),

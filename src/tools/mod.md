@@ -24,7 +24,7 @@ Defines the shared tool abstraction (`Tool` trait), typed tool I/O (`ToolOutput`
   - `memory` for persistent note search/write
   - `skill_bridge` for exposing external skill actions (Graphchan) inside the tool loop
   - `comfy` for ComfyUI generation + Graphchan publishing
-  - `vision` for local image evaluation, chat media publication, and optional screenshot capture
+  - `vision` for local image evaluation, chat media publication, optional screenshot capture, and optional camera snapshots
   - `agentic`, `approval`, `safety` for orchestration and policy
 
 ## Contracts

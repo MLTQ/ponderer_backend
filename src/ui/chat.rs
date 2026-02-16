@@ -12,6 +12,8 @@ const CHAT_THINKING_BLOCK_START: &str = "[thinking]";
 const CHAT_THINKING_BLOCK_END: &str = "[/thinking]";
 const CHAT_MEDIA_BLOCK_START: &str = "[media]";
 const CHAT_MEDIA_BLOCK_END: &str = "[/media]";
+const CHAT_TURN_CONTROL_BLOCK_START: &str = "[turn_control]";
+const CHAT_TURN_CONTROL_BLOCK_END: &str = "[/turn_control]";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ChatToolCallDetail {
@@ -32,12 +34,35 @@ struct ChatMediaDetail {
     source: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ChatTurnControlBlock {
+    #[serde(default)]
+    decision: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    needs_user_input: Option<bool>,
+    #[serde(default)]
+    user_message: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChatTurnControlDetail {
+    decision: String,
+    status: String,
+    needs_user_input: bool,
+    reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ChatRenderPayload {
     display_content: String,
     tool_details: Vec<ChatToolCallDetail>,
     thinking_details: Vec<String>,
     media_details: Vec<ChatMediaDetail>,
+    turn_control: Option<ChatTurnControlDetail>,
 }
 
 #[derive(Default)]
@@ -217,30 +242,42 @@ pub fn render_private_chat(
                 let time_str = msg.created_at.format("%H:%M").to_string();
                 let payload = parse_chat_payload(&msg.content);
                 let row_width = ui.available_width();
-                let max_bubble_width = (row_width * 0.7).clamp(220.0, (row_width - 8.0).max(120.0));
-                let row_layout = if is_operator {
-                    egui::Layout::right_to_left(egui::Align::TOP)
-                } else {
-                    egui::Layout::left_to_right(egui::Align::TOP)
-                };
+                let bubble_cap = (row_width - 8.0).max(120.0);
+                let max_bubble_width = (row_width * 0.7).max(120.0).min(bubble_cap);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(row_width, 0.0),
+                    egui::Layout::left_to_right(egui::Align::TOP),
+                    |ui| {
+                        let bubble_width = max_bubble_width.min(ui.available_width());
+                        if is_operator {
+                            let spacer = (ui.available_width() - bubble_width).max(0.0);
+                            if spacer > 0.0 {
+                                ui.add_space(spacer);
+                            }
+                        }
 
-                ui.allocate_ui_with_layout(egui::vec2(row_width, 0.0), row_layout, |ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(max_bubble_width, 0.0),
-                        egui::Layout::left_to_right(egui::Align::TOP),
-                        |ui| {
-                            render_chat_message_bubble(
-                                ui,
-                                msg,
-                                &time_str,
-                                &payload,
-                                is_operator,
-                                max_bubble_width,
-                                media_cache,
-                            );
-                        },
-                    );
-                });
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(bubble_width, 0.0),
+                            egui::Layout::left_to_right(egui::Align::TOP),
+                            |ui| {
+                                render_chat_message_bubble(
+                                    ui,
+                                    msg,
+                                    &time_str,
+                                    &payload,
+                                    is_operator,
+                                    bubble_width,
+                                    media_cache,
+                                );
+                            },
+                        );
+                    },
+                );
+
+                if let Some(turn_control) = payload.turn_control.as_ref() {
+                    render_turn_control_separator(ui, turn_control);
+                    ui.add_space(6.0);
+                }
 
                 ui.add_space(8.0);
             }
@@ -249,8 +286,8 @@ pub fn render_private_chat(
                 let trimmed = preview.trim();
                 if !trimmed.is_empty() {
                     let row_width = ui.available_width();
-                    let max_bubble_width =
-                        (row_width * 0.7).clamp(220.0, (row_width - 8.0).max(120.0));
+                    let bubble_cap = (row_width - 8.0).max(120.0);
+                    let max_bubble_width = (row_width * 0.7).max(120.0).min(bubble_cap);
                     ui.allocate_ui_with_layout(
                         egui::vec2(row_width, 0.0),
                         egui::Layout::left_to_right(egui::Align::TOP),
@@ -281,6 +318,8 @@ fn render_chat_message_bubble(
 ) {
     ui.group(|ui| {
         let inner_width = (max_bubble_width - 14.0).max(100.0);
+        ui.set_min_width(inner_width);
+        ui.set_width(inner_width);
         ui.set_max_width(inner_width);
         let wrap_token_len = max_token_len_for_width(inner_width);
 
@@ -305,10 +344,13 @@ fn render_chat_message_bubble(
             ui.label(RichText::new(time_str).weak().small());
         });
 
-        ui.label(force_wrap_long_tokens(
-            payload.display_content.as_str(),
-            wrap_token_len,
-        ));
+        ui.add(
+            egui::Label::new(force_wrap_long_tokens(
+                payload.display_content.as_str(),
+                wrap_token_len,
+            ))
+            .wrap(),
+        );
 
         if !payload.media_details.is_empty() {
             ui.add_space(6.0);
@@ -487,6 +529,8 @@ fn render_tool_calls_panel(
 fn render_streaming_preview_bubble(ui: &mut egui::Ui, preview: &str, max_bubble_width: f32) {
     ui.group(|ui| {
         let inner_width = (max_bubble_width - 14.0).max(100.0);
+        ui.set_min_width(inner_width);
+        ui.set_width(inner_width);
         ui.set_max_width(inner_width);
         let wrap_token_len = max_token_len_for_width(inner_width);
         ui.visuals_mut().widgets.noninteractive.bg_fill = Color32::from_rgb(30, 50, 40);
@@ -500,7 +544,32 @@ fn render_streaming_preview_bubble(ui: &mut egui::Ui, preview: &str, max_bubble_
             ui.label(RichText::new("live").weak().small().italics());
         });
 
-        ui.label(force_wrap_long_tokens(preview, wrap_token_len));
+        ui.add(egui::Label::new(force_wrap_long_tokens(preview, wrap_token_len)).wrap());
+    });
+}
+
+fn render_turn_control_separator(ui: &mut egui::Ui, detail: &ChatTurnControlDetail) {
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(format!(
+                "Turn control: {} · {} · needs_input={}",
+                detail.decision, detail.status, detail.needs_user_input
+            ))
+            .small()
+            .weak()
+            .italics(),
+        );
+        if let Some(reason) = detail.reason.as_deref() {
+            let reason = reason.trim();
+            if !reason.is_empty() {
+                ui.label(
+                    RichText::new(format!("({})", truncate_for_ui(reason, 160)))
+                        .small()
+                        .weak(),
+                );
+            }
+        }
     });
 }
 
@@ -560,7 +629,11 @@ fn parse_chat_payload(content: &str) -> ChatRenderPayload {
         .and_then(|raw| serde_json::from_str::<Vec<ChatMediaDetail>>(raw).ok())
         .unwrap_or_default();
 
-    let (display_content, inline_thinking) = strip_inline_thinking_tags(&without_media_blocks);
+    let (without_turn_control, raw_turn_control) =
+        extract_turn_control_block(&without_media_blocks);
+    let turn_control = raw_turn_control.as_deref().map(parse_turn_control_detail);
+
+    let (display_content, inline_thinking) = strip_inline_thinking_tags(&without_turn_control);
     thinking_details.extend(inline_thinking);
 
     ChatRenderPayload {
@@ -568,6 +641,7 @@ fn parse_chat_payload(content: &str) -> ChatRenderPayload {
         tool_details,
         thinking_details,
         media_details,
+        turn_control,
     }
 }
 
@@ -597,6 +671,101 @@ fn extract_block(content: &str, start_marker: &str, end_marker: &str) -> (String
 
     let raw = remaining[..relative_end].trim().to_string();
     (cleaned, Some(raw))
+}
+
+fn extract_turn_control_block(content: &str) -> (String, Option<String>) {
+    let Some(start_idx) = content.find(CHAT_TURN_CONTROL_BLOCK_START) else {
+        return (content.to_string(), None);
+    };
+    let after_start = start_idx + CHAT_TURN_CONTROL_BLOCK_START.len();
+    let remaining = &content[after_start..];
+
+    if let Some(relative_end) = remaining.find(CHAT_TURN_CONTROL_BLOCK_END) {
+        let end_idx = after_start + relative_end;
+        let full_end = end_idx + CHAT_TURN_CONTROL_BLOCK_END.len();
+        let mut cleaned = String::new();
+        cleaned.push_str(content[..start_idx].trim_end());
+        if full_end < content.len() {
+            let suffix = content[full_end..].trim_start();
+            if !suffix.is_empty() {
+                if !cleaned.is_empty() {
+                    cleaned.push('\n');
+                }
+                cleaned.push_str(suffix);
+            }
+        }
+        let raw = remaining[..relative_end].trim().to_string();
+        return (cleaned, Some(raw));
+    }
+
+    // Tolerate malformed output where the closing marker is missing.
+    let cleaned = content[..start_idx].trim_end().to_string();
+    let raw = remaining.trim().to_string();
+    (cleaned, Some(raw))
+}
+
+fn parse_turn_control_detail(raw: &str) -> ChatTurnControlDetail {
+    let cleaned = strip_optional_json_code_fence(raw);
+    if let Ok(parsed) = serde_json::from_str::<ChatTurnControlBlock>(cleaned) {
+        return ChatTurnControlDetail {
+            decision: parsed
+                .decision
+                .unwrap_or_else(|| "yield".to_string())
+                .trim()
+                .to_string(),
+            status: parsed
+                .status
+                .unwrap_or_else(|| "done".to_string())
+                .trim()
+                .to_string(),
+            needs_user_input: parsed.needs_user_input.unwrap_or(false),
+            reason: parsed
+                .reason
+                .or(parsed.user_message)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        };
+    }
+
+    ChatTurnControlDetail {
+        decision: "unknown".to_string(),
+        status: "unparsed".to_string(),
+        needs_user_input: false,
+        reason: Some(truncate_for_ui(cleaned.trim(), 160)),
+    }
+}
+
+fn strip_optional_json_code_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed;
+    }
+
+    let after_start = &trimmed[3..];
+    let end_rel = after_start.find("```");
+    let inner = end_rel
+        .map(|idx| after_start[..idx].trim())
+        .unwrap_or_else(|| after_start.trim());
+
+    let mut lines = inner.lines();
+    let first = lines.next().unwrap_or_default().trim();
+    let first_lower = first.to_ascii_lowercase();
+    if first_lower == "json" || first_lower == "jsonc" {
+        return inner[first.len()..].trim();
+    }
+    inner
+}
+
+fn truncate_for_ui(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in text.chars().enumerate() {
+        if i >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn strip_inline_thinking_tags(content: &str) -> (String, Vec<String>) {
@@ -678,5 +847,26 @@ mod tests {
         assert_eq!(payload.media_details.len(), 1);
         assert_eq!(payload.media_details[0].path, "/tmp/a.png");
         assert_eq!(payload.media_details[0].media_kind, "image");
+    }
+
+    #[test]
+    fn parses_turn_control_block_and_removes_it_from_message() {
+        let content = "Working...\n[turn_control]\n{\"decision\":\"continue\",\"status\":\"still_working\",\"needs_user_input\":false,\"reason\":\"checking files\"}\n[/turn_control]";
+        let payload = parse_chat_payload(content);
+        assert_eq!(payload.display_content, "Working...");
+        let turn_control = payload.turn_control.expect("turn control parsed");
+        assert_eq!(turn_control.decision, "continue");
+        assert_eq!(turn_control.status, "still_working");
+        assert!(!turn_control.needs_user_input);
+    }
+
+    #[test]
+    fn parses_turn_control_without_closing_marker() {
+        let content = "Still going.\n[turn_control]\n{\"decision\":\"continue\",\"status\":\"still_working\",\"needs_user_input\":false}\n";
+        let payload = parse_chat_payload(content);
+        assert_eq!(payload.display_content, "Still going.");
+        let turn_control = payload.turn_control.expect("turn control parsed");
+        assert_eq!(turn_control.decision, "continue");
+        assert_eq!(turn_control.status, "still_working");
     }
 }

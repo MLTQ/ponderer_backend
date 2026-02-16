@@ -10,15 +10,15 @@ HTTP client for OpenAI-compatible chat completion APIs (Ollama, LM Studio, vLLM,
 - **Interacts with**: `agent::Agent` (all LLM calls go through this), `config::AgentConfig` (constructed from config fields)
 
 ### `LlmClient::generate(messages)`
-- **Does**: Sends chat completion request to `{api_url}/chat/completions`, returns the first choice's content string
+- **Does**: Sends chat completion request to a normalized OpenAI-compatible endpoint (`.../v1/chat/completions`), returns the first choice's content string
 - **Interacts with**: Any OpenAI-compatible endpoint
 
 ### `LlmClient::generate_with_model(messages, model)`
-- **Does**: Same as `generate` but allows overriding the model (used for reflection with a different model)
+- **Does**: Same as `generate` but allows overriding the model (used for reflection with a different model); normalizes base URLs to OpenAI-compatible `/v1/chat/completions` when needed
 - **Rationale**: Enables using a cheaper/faster model for decision-making vs. a stronger model for generation
 
 ### `LlmClient::generate_json<T>(messages, model)`
-- **Does**: Generates a response and parses it as JSON type `T`, with fallback extraction from markdown code blocks and raw JSON object detection
+- **Does**: Generates a response and parses it as JSON type `T` via the shared robust parser (`parse_json`), including cleanup of `<think>` wrappers, markdown code fences, and bare JSON extraction
 - **Interacts with**: `agent::reasoning` (for `DecisionResponse`), `agent::trajectory` (for persona analysis)
 
 ### `LlmClient::decide_to_respond(messages, decision_model)`
@@ -26,11 +26,11 @@ HTTP client for OpenAI-compatible chat completion APIs (Ollama, LM Studio, vLLM,
 - **Interacts with**: `config::RespondTo.decision_model` for optional model override
 
 ### `LlmClient::evaluate_image(image_bytes, prompt, context)`
-- **Does**: Sends image + prompt to a vision model, returns `ImageEvaluation { satisfactory, reasoning, suggested_prompt_refinement }`
+- **Does**: Preprocesses images (resize/compress), sends image + prompt to a vision model using OpenAI-style multimodal content (`image_url`), and returns `ImageEvaluation { satisfactory, reasoning, suggested_prompt_refinement }`. Includes a constrained inline-base64 fallback path for providers that reject multimodal payloads.
 - **Interacts with**: `agent::image_gen` for evaluating ComfyUI outputs
 
 ### `LlmClient::parse_json<T>(response)`
-- **Does**: Robust JSON parser that strips `</think>` tags, markdown fences, and extracts bare JSON objects
+- **Does**: Robust JSON parser that tries multiple candidates from noisy model output (raw text, post-`</think>` tail, fenced code blocks, balanced JSON extraction), and also handles double-encoded JSON strings
 - **Rationale**: LLMs often wrap JSON in markdown or reasoning tags; this handles common output formats
 
 ### `Message`
@@ -47,5 +47,8 @@ HTTP client for OpenAI-compatible chat completion APIs (Ollama, LM Studio, vLLM,
 
 ## Notes
 - Temperature hardcoded to 0.7, max_tokens to 2000 (1000 for vision). Not configurable.
-- Vision support appends base64 image data inline in the message content rather than using the OpenAI vision API's `image_url` format. This may not work with all providers.
+- Vision requests now prefer OpenAI-compatible multimodal payloads (`content: [{type:text}, {type:image_url}]`) and downscale/compress images before upload to avoid context blowups from large desktop screenshots.
+- If multimodal parsing/response handling fails, vision falls back to a strict-size inline-base64 path for compatibility.
 - API key is sent as `Bearer` token only when non-empty (local models like Ollama need no key).
+- Chat endpoint normalization accepts base URL forms like `http://host:port`, `http://host:port/v1`, or full `.../v1/chat/completions`.
+- JSON extraction now tolerates markdown-wrapped ` ```json ... ``` ` payloads and quoted JSON payloads that some providers emit.

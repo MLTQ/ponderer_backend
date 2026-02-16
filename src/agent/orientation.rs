@@ -10,12 +10,20 @@ use crate::presence::{PresenceState, ProcessCategory};
 use crate::skills::SkillEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopObservation {
+    pub captured_at: DateTime<Utc>,
+    pub screenshot_path: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrientationContext {
     pub presence: PresenceState,
     pub concerns: Vec<Concern>,
     pub recent_journal: Vec<JournalEntry>,
     pub pending_events: Vec<SkillEvent>,
     pub persona: Option<PersonaSnapshot>,
+    pub desktop_observation: Option<DesktopObservation>,
 }
 
 impl OrientationContext {
@@ -113,6 +121,19 @@ impl OrientationContext {
             Some(traj) => format!("{} | {}", persona.self_description, traj),
             None => persona.self_description.clone(),
         }
+    }
+
+    pub fn format_desktop_observation(&self) -> String {
+        let Some(obs) = &self.desktop_observation else {
+            return "None".to_string();
+        };
+
+        format!(
+            "captured_at={} path={}\nsummary={}",
+            obs.captured_at.format("%Y-%m-%d %H:%M:%S UTC"),
+            obs.screenshot_path,
+            obs.summary.trim()
+        )
     }
 }
 
@@ -273,6 +294,7 @@ impl OrientationEngine {
              ## Active Concerns\n{}\n\n\
              ## Recent Journal Entries\n{}\n\n\
              ## Pending Events\n{}\n\n\
+             ## Desktop Observation\n{}\n\n\
              ## Current Persona Trajectory\n{}\n\n\
              Return JSON with keys:\n\
              user_state, salient_items, anomalies, pending_thoughts, disposition, disposition_reason, mood, synthesis.\n\
@@ -283,6 +305,7 @@ impl OrientationEngine {
             ctx.format_concerns(),
             ctx.format_journal(),
             ctx.format_events(),
+            ctx.format_desktop_observation(),
             ctx.format_trajectory(),
         )
     }
@@ -297,6 +320,8 @@ impl OrientationEngine {
         let salience_map = response
             .salient_items
             .into_iter()
+            .filter_map(normalize_salient_item)
+            .filter(|item| !item.summary.trim().is_empty())
             .map(|item| SalientItem {
                 source: item.source.unwrap_or_else(|| "orientation".to_string()),
                 summary: item.summary,
@@ -307,6 +332,8 @@ impl OrientationEngine {
         let anomalies = response
             .anomalies
             .into_iter()
+            .filter_map(normalize_anomaly)
+            .filter(|anomaly| !anomaly.description.trim().is_empty())
             .map(|anomaly| Anomaly {
                 id: anomaly
                     .id
@@ -322,6 +349,8 @@ impl OrientationEngine {
         let pending_thoughts = response
             .pending_thoughts
             .into_iter()
+            .filter_map(normalize_pending_thought)
+            .filter(|thought| !thought.content.trim().is_empty())
             .map(|thought| PendingThought {
                 id: uuid::Uuid::new_v4().to_string(),
                 content: thought.content,
@@ -330,7 +359,7 @@ impl OrientationEngine {
                 relates_to: thought.relates_to.unwrap_or_default(),
             })
             .collect::<Vec<_>>();
-        let mood = response.mood.unwrap_or_default();
+        let mood = parse_mood(response.mood);
 
         Orientation {
             user_state,
@@ -426,6 +455,14 @@ impl OrientationEngine {
             relevance: 0.65,
             relates_to: vec![concern.id.clone()],
         }));
+        if let Some(obs) = &ctx.desktop_observation {
+            salience_map.push(SalientItem {
+                source: "desktop_observation".to_string(),
+                summary: obs.summary.clone(),
+                relevance: 0.72,
+                relates_to: Vec::new(),
+            });
+        }
 
         let disposition = if !ctx.pending_events.is_empty() {
             Disposition::Observe
@@ -442,6 +479,12 @@ impl OrientationEngine {
             mem,
             ctx.pending_events.len()
         );
+        if let Some(obs) = &ctx.desktop_observation {
+            synthesis.push_str(&format!(
+                " desktop=\"{}\"",
+                obs.summary.replace('\n', " ").trim()
+            ));
+        }
         if let Some(note) = note {
             synthesis.push_str(&format!(" ({note})"));
         }
@@ -476,6 +519,7 @@ pub fn context_signature(ctx: &OrientationContext) -> String {
         journal_ids: Vec<&'a str>,
         event_ids: Vec<&'a str>,
         persona_id: Option<&'a str>,
+        desktop_observation: Option<String>,
     }
 
     let process_labels = ctx
@@ -516,12 +560,48 @@ pub fn context_signature(ctx: &OrientationContext) -> String {
         journal_ids,
         event_ids,
         persona_id: ctx.persona.as_ref().map(|p| p.id.as_str()),
+        desktop_observation: ctx
+            .desktop_observation
+            .as_ref()
+            .map(|obs| obs.summary.trim().chars().take(220).collect()),
     };
 
     serde_json::to_string(&sig).unwrap_or_else(|_| String::new())
 }
 
-fn parse_user_state(input: Option<LlmUserState>, idle_secs: u64) -> UserStateEstimate {
+fn parse_user_state(input: Option<LlmUserStateInput>, idle_secs: u64) -> UserStateEstimate {
+    if let Some(LlmUserStateInput::Label(label)) = input {
+        let normalized = label.trim().to_ascii_lowercase();
+        return match normalized.as_str() {
+            "deep_work" | "deepwork" | "focused" => UserStateEstimate::DeepWork {
+                activity: "focused work".to_string(),
+                duration_estimate_secs: idle_secs,
+                confidence: 0.55,
+            },
+            "light_work" | "lightwork" | "active" | "working" | "busy" => {
+                UserStateEstimate::LightWork {
+                    activity: "active session".to_string(),
+                    confidence: 0.55,
+                }
+            }
+            "away" | "afk" | "offline" => UserStateEstimate::Away {
+                since_secs: idle_secs,
+                likely_reason: None,
+                confidence: 0.6,
+            },
+            "idle" | "inactive" => UserStateEstimate::Idle {
+                since_secs: idle_secs,
+                confidence: 0.6,
+            },
+            _ => default_user_state(idle_secs),
+        };
+    }
+
+    let input = input.and_then(|state| match state {
+        LlmUserStateInput::Detailed(state) => Some(state),
+        LlmUserStateInput::Label(_) => None,
+    });
+
     let Some(state) = input else {
         return default_user_state(idle_secs);
     };
@@ -552,6 +632,100 @@ fn parse_user_state(input: Option<LlmUserState>, idle_secs: u64) -> UserStateEst
             since_secs: state.since_secs.unwrap_or(idle_secs),
             confidence,
         },
+    }
+}
+
+fn normalize_salient_item(input: LlmSalientItemInput) -> Option<LlmSalientItem> {
+    match input {
+        LlmSalientItemInput::Detailed(item) => Some(item),
+        LlmSalientItemInput::Text(summary) => {
+            let summary = summary.trim();
+            if summary.is_empty() {
+                None
+            } else {
+                Some(LlmSalientItem {
+                    source: None,
+                    summary: summary.to_string(),
+                    relevance: None,
+                    relates_to: None,
+                })
+            }
+        }
+    }
+}
+
+fn normalize_anomaly(input: LlmAnomalyInput) -> Option<LlmAnomaly> {
+    match input {
+        LlmAnomalyInput::Detailed(item) => Some(item),
+        LlmAnomalyInput::Text(description) => {
+            let description = description.trim();
+            if description.is_empty() {
+                None
+            } else {
+                Some(LlmAnomaly {
+                    id: None,
+                    description: description.to_string(),
+                    severity: Some("interesting".to_string()),
+                    related_concerns: None,
+                })
+            }
+        }
+    }
+}
+
+fn normalize_pending_thought(input: LlmPendingThoughtInput) -> Option<LlmPendingThought> {
+    match input {
+        LlmPendingThoughtInput::Detailed(item) => Some(item),
+        LlmPendingThoughtInput::Text(content) => {
+            let content = content.trim();
+            if content.is_empty() {
+                None
+            } else {
+                Some(LlmPendingThought {
+                    content: content.to_string(),
+                    context: None,
+                    priority: None,
+                    relates_to: None,
+                })
+            }
+        }
+    }
+}
+
+fn parse_mood(input: Option<LlmMoodInput>) -> LlmMood {
+    match input {
+        Some(LlmMoodInput::Detailed(mood)) => mood,
+        Some(LlmMoodInput::Label(label)) => {
+            let label = label.trim().to_ascii_lowercase();
+            match label.as_str() {
+                "positive" | "happy" => LlmMood {
+                    valence: Some(0.5),
+                    arousal: Some(0.55),
+                    confidence: Some(0.45),
+                },
+                "negative" | "sad" => LlmMood {
+                    valence: Some(-0.5),
+                    arousal: Some(0.45),
+                    confidence: Some(0.45),
+                },
+                "anxious" | "stressed" => LlmMood {
+                    valence: Some(-0.4),
+                    arousal: Some(0.75),
+                    confidence: Some(0.45),
+                },
+                "tired" | "low" => LlmMood {
+                    valence: Some(-0.2),
+                    arousal: Some(0.2),
+                    confidence: Some(0.45),
+                },
+                _ => LlmMood {
+                    valence: Some(0.0),
+                    arousal: Some(0.4),
+                    confidence: Some(0.45),
+                },
+            }
+        }
+        None => LlmMood::default(),
     }
 }
 
@@ -595,19 +769,26 @@ fn clamp_signed(value: f32) -> f32 {
 #[derive(Debug, Deserialize)]
 struct OrientationLlmResponse {
     #[serde(default)]
-    user_state: Option<LlmUserState>,
+    user_state: Option<LlmUserStateInput>,
+    #[serde(default, alias = "salience_map", alias = "salient")]
+    salient_items: Vec<LlmSalientItemInput>,
     #[serde(default)]
-    salient_items: Vec<LlmSalientItem>,
-    #[serde(default)]
-    anomalies: Vec<LlmAnomaly>,
-    #[serde(default)]
-    pending_thoughts: Vec<LlmPendingThought>,
+    anomalies: Vec<LlmAnomalyInput>,
+    #[serde(default, alias = "pending_actions", alias = "thoughts")]
+    pending_thoughts: Vec<LlmPendingThoughtInput>,
     #[serde(default)]
     disposition: String,
-    #[serde(default)]
-    mood: Option<LlmMood>,
+    #[serde(default, alias = "mood_estimate")]
+    mood: Option<LlmMoodInput>,
     #[serde(default)]
     synthesis: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LlmUserStateInput {
+    Detailed(LlmUserState),
+    Label(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -627,29 +808,53 @@ struct LlmUserState {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LlmSalientItemInput {
+    Detailed(LlmSalientItem),
+    Text(String),
+}
+
+#[derive(Debug, Deserialize)]
 struct LlmSalientItem {
     #[serde(default)]
     source: Option<String>,
+    #[serde(default, alias = "content", alias = "text")]
     summary: String,
-    #[serde(default)]
+    #[serde(default, alias = "score", alias = "importance")]
     relevance: Option<f32>,
     #[serde(default)]
     relates_to: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LlmAnomalyInput {
+    Detailed(LlmAnomaly),
+    Text(String),
+}
+
+#[derive(Debug, Deserialize)]
 struct LlmAnomaly {
     #[serde(default)]
     id: Option<String>,
+    #[serde(default, alias = "summary", alias = "issue")]
     description: String,
-    #[serde(default)]
+    #[serde(default, alias = "level")]
     severity: Option<String>,
     #[serde(default)]
     related_concerns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LlmPendingThoughtInput {
+    Detailed(LlmPendingThought),
+    Text(String),
+}
+
+#[derive(Debug, Deserialize)]
 struct LlmPendingThought {
+    #[serde(default, alias = "summary", alias = "thought")]
     content: String,
     #[serde(default)]
     context: Option<String>,
@@ -657,6 +862,13 @@ struct LlmPendingThought {
     priority: Option<f32>,
     #[serde(default)]
     relates_to: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LlmMoodInput {
+    Detailed(LlmMood),
+    Label(String),
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -703,6 +915,7 @@ mod tests {
             recent_journal: Vec::new(),
             pending_events: Vec::new(),
             persona: None,
+            desktop_observation: None,
         }
     }
 
@@ -712,6 +925,7 @@ mod tests {
         assert!(prompt.contains("## Current Time"));
         assert!(prompt.contains("## System State"));
         assert!(prompt.contains("## User Presence"));
+        assert!(prompt.contains("## Desktop Observation"));
     }
 
     #[test]
@@ -731,6 +945,22 @@ mod tests {
     }
 
     #[test]
+    fn context_signature_changes_with_desktop_observation() {
+        let mut ctx_a = sample_context();
+        let mut ctx_b = sample_context();
+        ctx_b.desktop_observation = Some(DesktopObservation {
+            captured_at: Utc::now(),
+            screenshot_path: "/tmp/shot.png".to_string(),
+            summary: "User is editing Rust source in terminal".to_string(),
+        });
+
+        assert_ne!(context_signature(&ctx_a), context_signature(&ctx_b));
+
+        ctx_a.desktop_observation = ctx_b.desktop_observation.clone();
+        assert_eq!(context_signature(&ctx_a), context_signature(&ctx_b));
+    }
+
+    #[test]
     fn default_user_state_transitions() {
         assert!(matches!(
             default_user_state(30),
@@ -744,5 +974,118 @@ mod tests {
             default_user_state(3000),
             UserStateEstimate::Away { .. }
         ));
+    }
+
+    #[test]
+    fn llm_response_deserializes_common_alias_fields() {
+        let value = serde_json::json!({
+            "salience_map": [
+                {
+                    "text": "User is coding in Rust",
+                    "score": 0.9
+                }
+            ],
+            "anomalies": [
+                {
+                    "summary": "High memory pressure",
+                    "level": "notable"
+                }
+            ],
+            "pending_actions": [
+                {
+                    "summary": "Offer to help profile memory usage",
+                    "priority": 0.7
+                }
+            ],
+            "mood_estimate": {
+                "valence": 0.2,
+                "arousal": 0.5,
+                "confidence": 0.8
+            },
+            "synthesis": "Context looks healthy overall."
+        });
+
+        let parsed: OrientationLlmResponse =
+            serde_json::from_value(value).expect("parse orientation aliases");
+        assert_eq!(parsed.salient_items.len(), 1);
+        match &parsed.salient_items[0] {
+            LlmSalientItemInput::Detailed(item) => {
+                assert_eq!(item.summary, "User is coding in Rust");
+            }
+            _ => panic!("expected detailed salient item"),
+        }
+        assert_eq!(parsed.anomalies.len(), 1);
+        match &parsed.anomalies[0] {
+            LlmAnomalyInput::Detailed(item) => {
+                assert_eq!(item.description, "High memory pressure");
+            }
+            _ => panic!("expected detailed anomaly"),
+        }
+        assert_eq!(parsed.pending_thoughts.len(), 1);
+        match &parsed.pending_thoughts[0] {
+            LlmPendingThoughtInput::Detailed(item) => {
+                assert_eq!(item.content, "Offer to help profile memory usage");
+            }
+            _ => panic!("expected detailed pending thought"),
+        }
+        assert!(parsed.mood.is_some());
+    }
+
+    #[test]
+    fn llm_response_deserializes_scalar_friendly_shapes() {
+        let value = serde_json::json!({
+            "user_state": "active",
+            "salient_items": [
+                "High CPU usage from system processes"
+            ],
+            "anomalies": [
+                "Potential fragmentation in AI persona trajectory"
+            ],
+            "pending_thoughts": [
+                "User appears engaged in software development"
+            ],
+            "disposition": "observe",
+            "mood": "neutral",
+            "synthesis": "User is active and should be observed."
+        });
+
+        let parsed: OrientationLlmResponse =
+            serde_json::from_value(value).expect("parse scalar-friendly orientation shape");
+        let user_state = parse_user_state(parsed.user_state, 42);
+        assert!(matches!(user_state, UserStateEstimate::LightWork { .. }));
+
+        let salient: Vec<LlmSalientItem> = parsed
+            .salient_items
+            .into_iter()
+            .filter_map(normalize_salient_item)
+            .collect();
+        assert_eq!(salient.len(), 1);
+        assert_eq!(salient[0].summary, "High CPU usage from system processes");
+
+        let anomalies: Vec<LlmAnomaly> = parsed
+            .anomalies
+            .into_iter()
+            .filter_map(normalize_anomaly)
+            .collect();
+        assert_eq!(anomalies.len(), 1);
+        assert_eq!(
+            anomalies[0].description,
+            "Potential fragmentation in AI persona trajectory"
+        );
+
+        let thoughts: Vec<LlmPendingThought> = parsed
+            .pending_thoughts
+            .into_iter()
+            .filter_map(normalize_pending_thought)
+            .collect();
+        assert_eq!(thoughts.len(), 1);
+        assert_eq!(
+            thoughts[0].content,
+            "User appears engaged in software development"
+        );
+
+        let mood = parse_mood(parsed.mood);
+        assert_eq!(mood.valence, Some(0.0));
+        assert_eq!(mood.arousal, Some(0.4));
     }
 }

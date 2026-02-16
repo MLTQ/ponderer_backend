@@ -6,7 +6,7 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 ## Components
 
 ### `AgenticConfig`
-- **Does**: Configures iteration limit and LLM request parameters (`api_url`, `model`, `temperature`, `max_tokens`)
+- **Does**: Configures optional iteration limit (`None` = unbounded) and LLM request parameters (`api_url`, `model`, `temperature`, `max_tokens`)
 - **Interacts with**: `Agent` runtime setup in `../agent/mod.rs`
 
 ### `AgenticLoop::run` / `run_with_history`

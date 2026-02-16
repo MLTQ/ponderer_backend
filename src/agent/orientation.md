@@ -1,13 +1,17 @@
 # orientation.rs
 
 ## Purpose
-Implements the Living Loop orientation engine: synthesizes presence, concerns, journal continuity, pending events, and persona trajectory into a typed situational model (`Orientation`).
+Implements the Living Loop orientation engine: synthesizes presence, concerns, journal continuity, pending events, persona trajectory, and optional desktop-vision observations into a typed situational model (`Orientation`).
 
 ## Components
 
 ### `OrientationContext`
-- **Does**: Bundles all orientation inputs and exposes formatter helpers for prompt construction
+- **Does**: Bundles all orientation inputs (including optional `DesktopObservation`) and exposes formatter helpers for prompt construction
 - **Interacts with**: `presence/mod.rs`, `agent/{concerns,journal}.rs`, `skills/mod.rs`, `database.rs` persona snapshots
+
+### `DesktopObservation`
+- **Does**: Captures one orientation-time desktop vision summary (`captured_at`, screenshot path, concise summary text)
+- **Interacts with**: `agent/mod.rs` screenshot capture/evaluation path and prompt context assembly
 
 ### `Orientation` and related types
 - **Does**: Typed output model including user-state estimate, salience map, anomalies, pending thoughts, disposition, mood, and synthesis narrative
@@ -19,7 +23,7 @@ Implements the Living Loop orientation engine: synthesizes presence, concerns, j
 - **Rationale**: Orientation should remain available even when local models are noisy or unavailable
 
 ### `context_signature`
-- **Does**: Produces a stable coarse signature of orientation inputs for fast-path skip of redundant LLM calls
+- **Does**: Produces a stable coarse signature of orientation inputs (including desktop-observation summary digest) for fast-path skip of redundant LLM calls
 - **Interacts with**: `agent/mod.rs` loop cache (`last_orientation_signature`)
 
 ## Contracts
@@ -32,4 +36,6 @@ Implements the Living Loop orientation engine: synthesizes presence, concerns, j
 
 ## Notes
 - `orient` currently tolerates model format drift by falling back to heuristic orientation.
+- Orientation JSON parsing accepts common alias field names (`salience_map`, `pending_actions`, `mood_estimate`, etc.) and mixed schema shapes (string or object forms for `user_state`, `mood`, and list entries), reducing parse failures with weaker/local models.
 - Fast-path signatures are intentionally bucketed (idle/cpu/memory/time) to reduce unnecessary model calls.
+- Desktop observations are optional and only present when the runtime orientation path supplies them.

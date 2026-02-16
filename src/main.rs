@@ -75,7 +75,10 @@ fn main() {
             memory::{MemorySearchTool, MemoryWriteTool},
             shell::ShellTool,
             skill_bridge::GraphchanSkillTool,
-            vision::{CaptureScreenTool, EvaluateLocalImageTool, PublishMediaToChatTool},
+            vision::{
+                CaptureCameraSnapshotTool, CaptureScreenTool, EvaluateLocalImageTool,
+                PublishMediaToChatTool,
+            },
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -102,6 +105,9 @@ fn main() {
                 .register(Arc::new(CaptureScreenTool::new()))
                 .await;
             tool_registry
+                .register(Arc::new(CaptureCameraSnapshotTool::new()))
+                .await;
+            tool_registry
                 .register(Arc::new(MemorySearchTool::new()))
                 .await;
             tool_registry
@@ -113,7 +119,7 @@ fn main() {
                 .await;
         });
     }
-    tracing::info!("Tool registry initialized with 14 built-in tools");
+    tracing::info!("Tool registry initialized with 15 built-in tools");
 
     // Create event channel
     let (event_tx, event_rx) = flume::unbounded();
