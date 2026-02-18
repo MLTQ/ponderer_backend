@@ -155,6 +155,42 @@ impl SettingsPanel {
                     ui.add_space(8.0);
 
                     ui.horizontal(|ui| {
+                        ui.label("Loop heat shock threshold:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.loop_heat_threshold).range(1..=200),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Loop similarity threshold:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.loop_similarity_threshold)
+                                .speed(0.01)
+                                .range(0.5..=0.999),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Loop signature window:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.loop_signature_window)
+                                .range(2..=200),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Loop heat cooldown:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.loop_heat_cooldown).range(1..=20),
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Heat rises when consecutive autonomous turns are highly similar; at threshold the agent is forced to yield with a loop-break notice.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
                         ui.label("Max posts per hour:");
                         ui.add(
                             egui::DragValue::new(&mut self.config.max_posts_per_hour)
