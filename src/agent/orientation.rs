@@ -24,6 +24,8 @@ pub struct OrientationContext {
     pub pending_events: Vec<SkillEvent>,
     pub persona: Option<PersonaSnapshot>,
     pub desktop_observation: Option<DesktopObservation>,
+    pub recent_action_digest: Option<String>,
+    pub previous_ooda_packet: Option<String>,
 }
 
 impl OrientationContext {
@@ -134,6 +136,24 @@ impl OrientationContext {
             obs.screenshot_path,
             obs.summary.trim()
         )
+    }
+
+    pub fn format_recent_action_digest(&self) -> String {
+        self.recent_action_digest
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("None")
+            .to_string()
+    }
+
+    pub fn format_previous_ooda_packet(&self) -> String {
+        self.previous_ooda_packet
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("None")
+            .to_string()
     }
 }
 
@@ -294,6 +314,8 @@ impl OrientationEngine {
              ## Active Concerns\n{}\n\n\
              ## Recent Journal Entries\n{}\n\n\
              ## Pending Events\n{}\n\n\
+             ## Recent Action Digest\n{}\n\n\
+             ## Previous OODA Packet\n{}\n\n\
              ## Desktop Observation\n{}\n\n\
              ## Current Persona Trajectory\n{}\n\n\
              Return JSON with keys:\n\
@@ -305,6 +327,8 @@ impl OrientationEngine {
             ctx.format_concerns(),
             ctx.format_journal(),
             ctx.format_events(),
+            ctx.format_recent_action_digest(),
+            ctx.format_previous_ooda_packet(),
             ctx.format_desktop_observation(),
             ctx.format_trajectory(),
         )
@@ -519,6 +543,8 @@ pub fn context_signature(ctx: &OrientationContext) -> String {
         journal_ids: Vec<&'a str>,
         event_ids: Vec<&'a str>,
         persona_id: Option<&'a str>,
+        recent_action_digest: Option<String>,
+        previous_ooda_packet: Option<String>,
         desktop_observation: Option<String>,
     }
 
@@ -560,6 +586,18 @@ pub fn context_signature(ctx: &OrientationContext) -> String {
         journal_ids,
         event_ids,
         persona_id: ctx.persona.as_ref().map(|p| p.id.as_str()),
+        recent_action_digest: ctx
+            .recent_action_digest
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(220).collect()),
+        previous_ooda_packet: ctx
+            .previous_ooda_packet
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(220).collect()),
         desktop_observation: ctx
             .desktop_observation
             .as_ref()
@@ -916,6 +954,8 @@ mod tests {
             pending_events: Vec::new(),
             persona: None,
             desktop_observation: None,
+            recent_action_digest: None,
+            previous_ooda_packet: None,
         }
     }
 
@@ -925,6 +965,8 @@ mod tests {
         assert!(prompt.contains("## Current Time"));
         assert!(prompt.contains("## System State"));
         assert!(prompt.contains("## User Presence"));
+        assert!(prompt.contains("## Recent Action Digest"));
+        assert!(prompt.contains("## Previous OODA Packet"));
         assert!(prompt.contains("## Desktop Observation"));
     }
 

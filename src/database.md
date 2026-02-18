@@ -66,8 +66,12 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - **Interacts with**: `agent::process_chat_messages` summary refresh/compaction prompt injection
 
 ### `ChatTurn` / `ChatTurnToolCall`
-- **Does**: Persist one agent turn with decision/status/error context and per-tool input/output records for replay/debug
+- **Does**: Persist one agent turn with decision/status/error context, stored prompt payloads (`prompt_text`, `system_prompt_text`), and per-tool input/output records for replay/debug
 - **Interacts with**: `agent::process_chat_messages`, future turn history/undo/resume UX
+
+### `OodaTurnPacketRecord`
+- **Does**: Persists per-turn OODA summaries (`observe`, `orient`, `decide`, `act`) linked to conversation/turn IDs
+- **Interacts with**: `agent/mod.rs` autonomous private-chat loops and orientation context hydration
 
 ### `OrientationSnapshotRecord` / `PendingThoughtRecord`
 - **Does**: Typed records for stored orientation snapshots and queued pending-thought items
@@ -76,6 +80,14 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 ### Chat lifecycle methods (`begin_chat_turn`, `record_chat_turn_tool_call`, `complete_chat_turn`, `fail_chat_turn`, `list_chat_turns_for_conversation`, `list_chat_turn_tool_calls`)
 - **Does**: Implements persisted turn state transitions and tool-call lineage for each conversation thread
 - **Interacts with**: `agent::process_chat_messages` autonomous turn loop, diagnostics/recovery tooling
+
+### Turn prompt methods (`set_chat_turn_prompt_bundle`, `get_chat_turn_prompt_bundle`, `get_chat_turn_prompt`)
+- **Does**: Stores and retrieves exact user/system prompt payloads that produced a turn so UI diagnostics can show “what context and system instruction generated this reply”
+- **Interacts with**: `agent::process_chat_messages`, `server.rs` prompt inspection route, frontend prompt inspector
+
+### OODA/action digest methods (`save_ooda_turn_packet`, `get_latest_ooda_turn_packet`, `get_latest_ooda_turn_packet_for_conversation`, `get_recent_ooda_turn_packets_for_conversation_before`, `get_recent_action_digest`, `get_recent_action_digest_for_conversation`)
+- **Does**: Stores structured OODA packets per completed turn, serves bounded packet windows before a compaction cutoff, and emits deterministic summaries of recent turn decisions/tool usage
+- **Interacts with**: `agent::maybe_update_orientation`, private-chat prompt assembly, and conversation-compaction summary generation
 
 ### Chat conversation methods (`create_chat_conversation`, `list_chat_conversations`, `get_chat_conversation`, `add_chat_message_in_conversation`, `add_chat_message_in_turn`, `get_chat_history_for_conversation`, `get_chat_context_for_conversation`)
 - **Does**: Creates/lists/fetches conversation threads, writes messages (optionally bound to a turn), and returns thread-scoped history/context
@@ -113,8 +125,10 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - All timestamps stored as RFC 3339 strings in SQLite, parsed back to `chrono::DateTime<Utc>`.
 - `ensure_schema()` uses `CREATE TABLE IF NOT EXISTS` -- no formal migration system. Adding columns requires manual ALTER TABLE handling.
 - `ensure_schema()` performs manual chat migrations by checking `PRAGMA table_info(...)` and adding missing columns (`conversation_id`, `turn_id`, `session_id`, `runtime_state`, `active_turn_id`) in place.
+- `ensure_schema()` also adds `chat_turns.prompt_text` and `chat_turns.system_prompt_text` in place for existing DBs so turn-level prompt inspection is backward-compatible.
 - Conversation compaction snapshots are stored in `chat_conversation_summaries` and updated opportunistically by the agent loop when message-count thresholds are exceeded.
 - Living Loop ll.1 adds four additive tables: `journal_entries`, `concerns`, `orientation_snapshots`, `pending_thoughts_queue`.
+- OODA continuity adds additive table `ooda_turn_packets` plus supporting indexes on `(conversation_id, created_at)` and `(turn_id)`.
 - Memory design metadata is stored in `agent_state` under `memory_design_id` and `memory_schema_version`.
 - Memory evolution archive uses three tables: `memory_design_archive`, `memory_eval_runs`, `memory_promotion_decisions`.
 - `memory_promotion_decisions` enforces rollback fields (`rollback_design_id`, `rollback_schema_version`) as NOT NULL.

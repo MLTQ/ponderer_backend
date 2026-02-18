@@ -29,7 +29,7 @@ use crate::agent::orientation::{
     Orientation, OrientationContext, OrientationEngine,
 };
 use crate::config::AgentConfig;
-use crate::database::{AgentDatabase, ChatTurnPhase, OrientationSnapshotRecord};
+use crate::database::{AgentDatabase, ChatTurnPhase, OodaTurnPacketRecord, OrientationSnapshotRecord};
 use crate::llm_client::{LlmClient, Message as LlmMessage};
 use crate::memory::archive::{MemoryEvalRunRecord, MemoryPromotionPolicy, PromotionOutcome};
 use crate::memory::eval::{
@@ -63,6 +63,12 @@ const CHAT_CONTEXT_RECENT_LIMIT: usize = 18;
 const CHAT_COMPACTION_TRIGGER_MESSAGES: usize = 36;
 const CHAT_COMPACTION_RESUMMARY_DELTA: usize = 8;
 const CHAT_COMPACTION_SOURCE_MAX_MESSAGES: usize = 140;
+const CHAT_COMPACTION_OODA_MAX_PACKETS: usize = 28;
+const CHAT_COMPACTION_OODA_SUMMARY_LINES: usize = 8;
+const CHAT_COMPACTION_OODA_LINE_MAX_CHARS: usize = 170;
+const ACTION_DIGEST_TURN_LIMIT: usize = 12;
+const ACTION_DIGEST_MAX_CHARS: usize = 1400;
+const OODA_PACKET_CONTEXT_MAX_CHARS: usize = 1400;
 static ORIENTATION_SCREEN_CAPTURE_FAILURE_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize)]
@@ -1072,16 +1078,30 @@ impl Agent {
             .maybe_capture_desktop_observation(&config_snapshot)
             .await;
 
-        let (concerns, recent_journal, persona) = {
+        let (concerns, recent_journal, persona, recent_action_digest, previous_ooda_packet) = {
             let db_lock = self.database.read().await;
             if let Some(db) = db_lock.as_ref() {
                 (
                     db.get_active_concerns().unwrap_or_default(),
                     db.get_recent_journal(8).unwrap_or_default(),
                     db.get_latest_persona().unwrap_or_default(),
+                    db.get_recent_action_digest(ACTION_DIGEST_TURN_LIMIT, ACTION_DIGEST_MAX_CHARS)
+                        .ok()
+                        .and_then(|digest| {
+                            let trimmed = digest.trim();
+                            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+                                None
+                            } else {
+                                Some(trimmed.to_string())
+                            }
+                        }),
+                    db.get_latest_ooda_turn_packet()
+                        .ok()
+                        .flatten()
+                        .map(|packet| format_ooda_packet_for_context(&packet, OODA_PACKET_CONTEXT_MAX_CHARS)),
                 )
             } else {
-                (Vec::new(), Vec::new(), None)
+                (Vec::new(), Vec::new(), None, None, None)
             }
         };
 
@@ -1092,6 +1112,8 @@ impl Agent {
             pending_events: pending_events.to_vec(),
             persona,
             desktop_observation,
+            recent_action_digest,
+            previous_ooda_packet,
         };
 
         let signature = orientation_context_signature(&context);
@@ -2339,16 +2361,41 @@ impl Agent {
                 )))
                 .await;
 
-                let recent_chat_context = {
+                let (recent_chat_context, recent_action_digest, previous_ooda_packet_context) = {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
-                        db.get_chat_context_for_conversation(
-                            &conversation_id,
-                            CHAT_CONTEXT_RECENT_LIMIT,
+                        (
+                            db.get_chat_context_for_conversation(
+                                &conversation_id,
+                                CHAT_CONTEXT_RECENT_LIMIT,
+                            )
+                            .unwrap_or_default(),
+                            db.get_recent_action_digest_for_conversation(
+                                &conversation_id,
+                                ACTION_DIGEST_TURN_LIMIT,
+                                ACTION_DIGEST_MAX_CHARS,
+                            )
+                            .ok()
+                            .and_then(|digest| {
+                                let trimmed = digest.trim();
+                                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+                                    None
+                                } else {
+                                    Some(trimmed.to_string())
+                                }
+                            }),
+                            db.get_latest_ooda_turn_packet_for_conversation(&conversation_id)
+                                .ok()
+                                .flatten()
+                                .map(|packet| {
+                                    format_ooda_packet_for_context(
+                                        &packet,
+                                        OODA_PACKET_CONTEXT_MAX_CHARS,
+                                    )
+                                }),
                         )
-                        .unwrap_or_default()
                     } else {
-                        String::new()
+                        (String::new(), None, None)
                     }
                 };
 
@@ -2360,7 +2407,23 @@ impl Agent {
                     conversation_summary_context.as_deref(),
                     continuation_hint.as_deref(),
                     latest_orientation.as_ref(),
+                    recent_action_digest.as_deref(),
+                    previous_ooda_packet_context.as_deref(),
                 );
+                if let Some(turn_id) = turn_id.as_deref() {
+                    let db_lock = self.database.read().await;
+                    if let Some(ref db) = *db_lock {
+                        if let Err(e) =
+                            db.set_chat_turn_prompt_bundle(turn_id, &user_message, &chat_system_prompt)
+                        {
+                            tracing::warn!(
+                                "Failed to persist chat turn prompt [{}]: {}",
+                                truncate_for_event(turn_id, 12),
+                                e
+                            );
+                        }
+                    }
+                }
                 let event_tx = self.event_tx.clone();
                 let stream_conversation_id = conversation_id.clone();
                 let stream_callback = move |content: &str, done: bool| {
@@ -2531,6 +2594,30 @@ impl Agent {
                     &result.tool_calls_made,
                     &result.thinking_blocks,
                 );
+                let observe_stage = build_observe_stage(
+                    &pending_messages,
+                    &recent_chat_context,
+                    recent_action_digest.as_deref(),
+                    previous_ooda_packet_context.as_deref(),
+                    continuation_hint.as_deref(),
+                );
+                let orient_stage = build_orient_stage(
+                    latest_orientation.as_ref(),
+                    &concerns_priority_context,
+                    &working_memory_context,
+                );
+                let decide_stage = build_decide_stage(
+                    &turn_control,
+                    &effective_status,
+                    should_continue,
+                    should_offload_to_background,
+                    &heat_update,
+                );
+                let act_stage = build_act_stage(
+                    &operator_visible_response,
+                    &result.tool_calls_made,
+                    background_subtask_spawned,
+                );
 
                 let mut agent_message_id: Option<String> = None;
                 if !should_continue {
@@ -2648,6 +2735,19 @@ impl Agent {
                             tool_count
                         )) {
                             tracing::warn!("Failed to append agent turn to activity log: {}", e);
+                        }
+                        let packet = OodaTurnPacketRecord {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            conversation_id: conversation_id.clone(),
+                            turn_id: Some(turn_id.to_string()),
+                            observe: observe_stage.clone(),
+                            orient: orient_stage.clone(),
+                            decide: decide_stage.clone(),
+                            act: act_stage.clone(),
+                            created_at: Utc::now(),
+                        };
+                        if let Err(e) = db.save_ooda_turn_packet(&packet) {
+                            tracing::warn!("Failed to persist OODA turn packet: {}", e);
                         }
                     }
                 }
@@ -2774,29 +2874,46 @@ impl Agent {
 
         if needs_refresh {
             let source_limit = older_message_count.min(CHAT_COMPACTION_SOURCE_MAX_MESSAGES);
-            let source_messages = {
+            let (source_messages, source_ooda_packets) = {
                 let db_lock = self.database.read().await;
                 let db = db_lock.as_ref()?;
-                db.get_chat_history_slice_for_conversation(
-                    conversation_id,
-                    CHAT_CONTEXT_RECENT_LIMIT,
-                    source_limit,
-                )
-                .ok()
-                .unwrap_or_default()
+                let messages = db
+                    .get_chat_history_slice_for_conversation(
+                        conversation_id,
+                        CHAT_CONTEXT_RECENT_LIMIT,
+                        source_limit,
+                    )
+                    .ok()
+                    .unwrap_or_default();
+                let packets = messages
+                    .last()
+                    .map(|message| {
+                        db.get_recent_ooda_turn_packets_for_conversation_before(
+                            conversation_id,
+                            &message.created_at,
+                            CHAT_COMPACTION_OODA_MAX_PACKETS,
+                        )
+                        .ok()
+                        .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                (messages, packets)
             };
 
             if !source_messages.is_empty() {
                 let refreshed = self
                     .summarize_conversation_slice_with_llm(
                         &source_messages,
+                        &source_ooda_packets,
                         llm_api_url,
                         llm_model,
                         llm_api_key,
                         system_prompt,
                     )
                     .await
-                    .unwrap_or_else(|| fallback_chat_summary_snapshot(&source_messages));
+                    .unwrap_or_else(|| {
+                        fallback_chat_summary_snapshot(&source_messages, &source_ooda_packets)
+                    });
 
                 if !refreshed.trim().is_empty() {
                     let db_lock = self.database.read().await;
@@ -2833,6 +2950,7 @@ impl Agent {
     async fn summarize_conversation_slice_with_llm(
         &self,
         messages: &[crate::database::ChatMessage],
+        ooda_packets: &[OodaTurnPacketRecord],
         llm_api_url: &str,
         llm_model: &str,
         llm_api_key: Option<&str>,
@@ -2846,15 +2964,27 @@ impl Agent {
         if transcript.trim().is_empty() {
             return None;
         }
+        let ooda_digest = format_ooda_digest_for_summary(
+            ooda_packets,
+            CHAT_COMPACTION_OODA_SUMMARY_LINES,
+            CHAT_COMPACTION_OODA_LINE_MAX_CHARS,
+        );
 
         let summarizer_system_prompt = format!(
-            "{}\n\nYou are summarizing private operator-agent chat history for internal context compaction.\nProduce concise markdown with these sections exactly: `### Objectives`, `### Decisions & Findings`, `### Open Threads`.\nStay factual, avoid roleplay, and keep the summary under 220 words.",
+            "{}\n\nYou are summarizing private operator-agent chat history for internal context compaction.\nProduce concise markdown with these sections exactly: `### Objectives`, `### Decisions & Findings`, `### Open Threads`, `### Recent Reasoning Digest`.\nStay factual, avoid roleplay, and keep the summary under 260 words.",
             system_prompt.trim()
         );
-        let summarizer_user_prompt = format!(
-            "Summarize this older conversation slice so future turns can retain continuity without replaying full history.\n\n{}",
-            transcript
-        );
+        let summarizer_user_prompt = if ooda_digest.is_empty() {
+            format!(
+                "Summarize this older conversation slice so future turns can retain continuity without replaying full history.\n\n{}",
+                transcript
+            )
+        } else {
+            format!(
+                "Summarize this older conversation slice so future turns can retain continuity without replaying full history.\nUse the structured reasoning digest to preserve prior Observe/Orient/Decide/Act continuity.\n\n{}\n\n{}",
+                transcript, ooda_digest
+            )
+        };
         let client = LlmClient::new(
             agentic_api_url(llm_api_url),
             llm_api_key.unwrap_or("").to_string(),
@@ -3113,6 +3243,8 @@ fn build_private_chat_agentic_prompt(
     summary_snapshot: Option<&str>,
     continuation_hint: Option<&str>,
     latest_orientation: Option<&Orientation>,
+    recent_action_digest: Option<&str>,
+    previous_ooda_packet: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
 
@@ -3141,6 +3273,24 @@ fn build_private_chat_agentic_prompt(
         prompt.push_str("\n\n---\n\n");
     }
 
+    if let Some(digest) = recent_action_digest
+        .map(str::trim)
+        .filter(|digest| !digest.is_empty())
+    {
+        prompt.push_str("## Recent Action Digest\n\n");
+        prompt.push_str(digest);
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    if let Some(packet) = previous_ooda_packet
+        .map(str::trim)
+        .filter(|packet| !packet.is_empty())
+    {
+        prompt.push_str("## Previous OODA Packet\n\n");
+        prompt.push_str(packet);
+        prompt.push_str("\n\n---\n\n");
+    }
+
     // Explicit OODA context so tool/response actions remain grounded in
     // current observed state, orientation synthesis, and prior decision state.
     prompt.push_str("## OODA Context\n\n");
@@ -3161,6 +3311,24 @@ fn build_private_chat_agentic_prompt(
         }
     } else {
         prompt.push_str("- latest_orientation: unavailable\n");
+    }
+    if let Some(digest) = recent_action_digest
+        .map(str::trim)
+        .filter(|digest| !digest.is_empty())
+    {
+        prompt.push_str(&format!(
+            "- recent_action_digest: {}\n",
+            truncate_for_event(digest, 200)
+        ));
+    }
+    if let Some(packet) = previous_ooda_packet
+        .map(str::trim)
+        .filter(|packet| !packet.is_empty())
+    {
+        prompt.push_str(&format!(
+            "- prior_turn_packet: {}\n",
+            truncate_for_event(packet, 200)
+        ));
     }
     prompt.push_str("\n### Orient\n");
     if let Some(orientation) = latest_orientation {
@@ -3292,7 +3460,45 @@ fn format_chat_summary_transcript(messages: &[crate::database::ChatMessage]) -> 
     transcript
 }
 
-fn fallback_chat_summary_snapshot(messages: &[crate::database::ChatMessage]) -> String {
+fn compact_ooda_stage_line(stage: &str, max_chars: usize) -> String {
+    let collapsed = stage
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(stage)
+        .replace('\n', " ");
+    truncate_for_event(collapsed.trim(), max_chars)
+}
+
+fn format_ooda_digest_for_summary(
+    ooda_packets: &[OodaTurnPacketRecord],
+    max_lines: usize,
+    line_max_chars: usize,
+) -> String {
+    if ooda_packets.is_empty() || max_lines == 0 {
+        return String::new();
+    }
+
+    let start_idx = ooda_packets.len().saturating_sub(max_lines);
+    let mut digest = String::from("## Structured OODA Digest\n\n");
+    for packet in &ooda_packets[start_idx..] {
+        let decide = compact_ooda_stage_line(&packet.decide, line_max_chars);
+        let act = compact_ooda_stage_line(&packet.act, line_max_chars);
+        let turn_tag = packet.turn_id.as_deref().unwrap_or("-");
+        digest.push_str(&format!(
+            "- [{}] turn={} decide: {} | act: {}\n",
+            packet.created_at.format("%Y-%m-%d %H:%M"),
+            truncate_for_event(turn_tag, 14),
+            decide,
+            act
+        ));
+    }
+    digest
+}
+
+fn fallback_chat_summary_snapshot(
+    messages: &[crate::database::ChatMessage],
+    ooda_packets: &[OodaTurnPacketRecord],
+) -> String {
     let mut operator_points = Vec::new();
     let mut agent_points = Vec::new();
 
@@ -3344,6 +3550,25 @@ fn fallback_chat_summary_snapshot(messages: &[crate::database::ChatMessage]) -> 
         ));
     } else {
         summary.push_str("- Validate whether additional operator input is needed.\n");
+    }
+
+    summary.push_str("\n### Recent Reasoning Digest\n");
+    if ooda_packets.is_empty() {
+        summary.push_str("- No structured OODA packets recorded in this compacted window.\n");
+    } else {
+        let start_idx = ooda_packets
+            .len()
+            .saturating_sub(CHAT_COMPACTION_OODA_SUMMARY_LINES);
+        for packet in &ooda_packets[start_idx..] {
+            let decide = compact_ooda_stage_line(&packet.decide, CHAT_COMPACTION_OODA_LINE_MAX_CHARS);
+            let act = compact_ooda_stage_line(&packet.act, CHAT_COMPACTION_OODA_LINE_MAX_CHARS);
+            summary.push_str(&format!(
+                "- [{}] decide: {} | act: {}\n",
+                packet.created_at.format("%m-%d %H:%M"),
+                decide,
+                act
+            ));
+        }
     }
 
     summary
@@ -3575,6 +3800,26 @@ async fn run_background_chat_subtask(
         let recent_chat_context = db
             .get_chat_context_for_conversation(&request.conversation_id, CHAT_CONTEXT_RECENT_LIMIT)
             .unwrap_or_default();
+        let recent_action_digest = db
+            .get_recent_action_digest_for_conversation(
+                &request.conversation_id,
+                ACTION_DIGEST_TURN_LIMIT,
+                ACTION_DIGEST_MAX_CHARS,
+            )
+            .ok()
+            .and_then(|digest| {
+                let trimmed = digest.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            });
+        let previous_ooda_packet_context = db
+            .get_latest_ooda_turn_packet_for_conversation(&request.conversation_id)
+            .ok()
+            .flatten()
+            .map(|packet| format_ooda_packet_for_context(&packet, OODA_PACKET_CONTEXT_MAX_CHARS));
         let user_message = build_private_chat_agentic_prompt(
             &[],
             &request.concerns_priority_context,
@@ -3583,7 +3828,22 @@ async fn run_background_chat_subtask(
             request.summary_snapshot.as_deref(),
             continuation_hint.as_deref(),
             request.latest_orientation.as_ref(),
+            recent_action_digest.as_deref(),
+            previous_ooda_packet_context.as_deref(),
         );
+        if let Some(turn_id) = turn_id.as_deref() {
+            if let Err(e) = db.set_chat_turn_prompt_bundle(
+                turn_id,
+                &user_message,
+                &request.chat_system_prompt,
+            ) {
+                tracing::warn!(
+                    "Failed to persist background turn prompt [{}]: {}",
+                    truncate_for_event(turn_id, 12),
+                    e
+                );
+            }
+        }
 
         let stream_tx = event_tx.clone();
         let stream_conversation_id = request.conversation_id.clone();
@@ -3697,6 +3957,26 @@ async fn run_background_chat_subtask(
             &result.tool_calls_made,
             &result.thinking_blocks,
         );
+        let observe_stage = build_observe_stage(
+            &[],
+            &recent_chat_context,
+            recent_action_digest.as_deref(),
+            previous_ooda_packet_context.as_deref(),
+            continuation_hint.as_deref(),
+        );
+        let orient_stage = build_orient_stage(
+            request.latest_orientation.as_ref(),
+            &request.concerns_priority_context,
+            &request.working_memory_context,
+        );
+        let decide_stage = build_decide_stage(
+            &turn_control,
+            &effective_status,
+            should_continue,
+            false,
+            &heat_update,
+        );
+        let act_stage = build_act_stage(&operator_visible_response, &result.tool_calls_made, false);
 
         let mut agent_message_id: Option<String> = None;
         if !should_continue {
@@ -3764,6 +4044,17 @@ async fn run_background_chat_subtask(
                 tool_count,
                 agent_message_id.as_deref(),
             );
+            let packet = OodaTurnPacketRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: request.conversation_id.clone(),
+                turn_id: Some(turn_id.to_string()),
+                observe: observe_stage.clone(),
+                orient: orient_stage.clone(),
+                decide: decide_stage.clone(),
+                act: act_stage.clone(),
+                created_at: Utc::now(),
+            };
+            let _ = db.save_ooda_turn_packet(&packet);
 
             let _ = db.append_daily_activity_log(&format!(
                 "background [{}] turn {}: decision={}, status={}, tools={}",
@@ -3895,6 +4186,164 @@ fn apply_background_concern_updates(
             });
         }
     }
+}
+
+fn format_ooda_packet_for_context(packet: &OodaTurnPacketRecord, max_chars: usize) -> String {
+    let max_chars = max_chars.max(220);
+    format!(
+        "turn_id={} at={}\n### Observe\n{}\n\n### Orient\n{}\n\n### Decide\n{}\n\n### Act\n{}",
+        packet.turn_id.as_deref().unwrap_or("-"),
+        packet.created_at.to_rfc3339(),
+        truncate_for_event(packet.observe.trim(), max_chars),
+        truncate_for_event(packet.orient.trim(), max_chars),
+        truncate_for_event(packet.decide.trim(), max_chars),
+        truncate_for_event(packet.act.trim(), max_chars),
+    )
+}
+
+fn build_observe_stage(
+    new_messages: &[crate::database::ChatMessage],
+    recent_chat_context: &str,
+    recent_action_digest: Option<&str>,
+    previous_ooda_packet: Option<&str>,
+    continuation_hint: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+    if !new_messages.is_empty() {
+        lines.push(format!("new_operator_messages={}", new_messages.len()));
+        for msg in new_messages.iter().take(4) {
+            lines.push(format!("- {}", truncate_for_event(msg.content.trim(), 180)));
+        }
+    } else {
+        lines.push("new_operator_messages=0".to_string());
+    }
+    if let Some(hint) = continuation_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!(
+            "continuation_hint={}",
+            truncate_for_event(hint, 180)
+        ));
+    }
+    if !recent_chat_context.trim().is_empty() {
+        lines.push(format!(
+            "recent_chat={}",
+            truncate_for_event(recent_chat_context.trim(), 260)
+        ));
+    }
+    if let Some(digest) = recent_action_digest
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!(
+            "recent_action_digest={}",
+            truncate_for_event(digest, 260)
+        ));
+    }
+    if let Some(packet) = previous_ooda_packet
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!(
+            "previous_ooda_packet={}",
+            truncate_for_event(packet, 260)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn build_orient_stage(
+    latest_orientation: Option<&Orientation>,
+    concerns_priority_context: &str,
+    working_memory_context: &str,
+) -> String {
+    let mut lines = Vec::new();
+    if let Some(orientation) = latest_orientation {
+        lines.push(format!(
+            "user_state={}",
+            summarize_user_state(&orientation.user_state)
+        ));
+        lines.push(format!(
+            "disposition={}",
+            summarize_disposition(orientation.disposition)
+        ));
+        lines.push(format!(
+            "mood=valence:{:.2},arousal:{:.2},confidence:{:.2}",
+            orientation.mood_estimate.valence,
+            orientation.mood_estimate.arousal,
+            orientation.mood_estimate.confidence
+        ));
+        lines.push(format!(
+            "synthesis={}",
+            truncate_for_event(orientation.raw_synthesis.trim(), 220)
+        ));
+    } else {
+        lines.push("orientation=unavailable".to_string());
+    }
+    if !concerns_priority_context.trim().is_empty() {
+        lines.push(format!(
+            "concerns_context={}",
+            truncate_for_event(concerns_priority_context.trim(), 180)
+        ));
+    }
+    if !working_memory_context.trim().is_empty() {
+        lines.push(format!(
+            "working_memory_context={}",
+            truncate_for_event(working_memory_context.trim(), 180)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn build_decide_stage(
+    turn_control: &ParsedTurnControl,
+    effective_status: &str,
+    should_continue: bool,
+    should_offload: bool,
+    heat_update: &LoopHeatUpdate,
+) -> String {
+    let decision = match turn_control.decision {
+        TurnDecision::Continue => "continue",
+        TurnDecision::Yield => "yield",
+    };
+    format!(
+        "decision={} status={} effective_status={} needs_user_input={} continue={} offload={} heat={}/{} similarity={:.2} reason={}",
+        decision,
+        turn_control.status,
+        effective_status,
+        turn_control.needs_user_input,
+        should_continue,
+        should_offload,
+        heat_update.heat,
+        heat_update.threshold,
+        heat_update.max_similarity,
+        truncate_for_event(turn_control.reason.as_deref().unwrap_or(""), 220)
+    )
+}
+
+fn build_act_stage(
+    operator_visible_response: &str,
+    tool_calls: &[ToolCallRecord],
+    background_handoff: bool,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "operator_message={}",
+        truncate_for_event(operator_visible_response.trim(), 260)
+    ));
+    lines.push(format!("tool_call_count={}", tool_calls.len()));
+    if background_handoff {
+        lines.push("background_handoff=true".to_string());
+    }
+    for call in tool_calls.iter().take(5) {
+        lines.push(format!(
+            "- {} => {}",
+            call.tool_name,
+            truncate_for_event(&call.output.to_llm_string().replace('\n', " "), 160)
+        ));
+    }
+    lines.join("\n")
 }
 
 fn build_loop_turn_signature(
@@ -4657,7 +5106,8 @@ not a checklist item
             created_at: now,
             processed: false,
         }];
-        let prompt = build_private_chat_agentic_prompt(&msgs, "", "", "", None, None, None);
+        let prompt =
+            build_private_chat_agentic_prompt(&msgs, "", "", "", None, None, None, None, None);
         assert!(prompt.contains("Please list files"));
         assert!(prompt.contains("Use tools"));
     }
@@ -4672,6 +5122,8 @@ not a checklist item
             None,
             Some("Previous autonomous turn: status=still_working, tools=1"),
             None,
+            None,
+            None,
         );
         assert!(prompt.contains("Autonomous Continuation Context"));
         assert!(!prompt.contains("New Operator Message(s)"));
@@ -4685,6 +5137,8 @@ not a checklist item
             "",
             "",
             Some("### Objectives\n- Ship session compaction"),
+            None,
+            None,
             None,
             None,
         );
@@ -4724,6 +5178,8 @@ not a checklist item
             None,
             Some("Previous autonomous turn: status=still_working, tools=1"),
             Some(&orientation),
+            None,
+            None,
         );
         assert!(prompt.contains("## OODA Context"));
         assert!(prompt.contains("### Observe"));
@@ -4970,9 +5426,69 @@ not a checklist item
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(prompt.contains("Concern Priority Context"));
         assert!(prompt.contains("Ship concerns manager"));
+    }
+
+    #[test]
+    fn fallback_summary_includes_recent_reasoning_digest() {
+        let now = Utc::now();
+        let messages = vec![
+            crate::database::ChatMessage {
+                id: "m1".to_string(),
+                conversation_id: "c1".to_string(),
+                role: "operator".to_string(),
+                content: "Please inspect the workspace and report findings.".to_string(),
+                created_at: now,
+                processed: true,
+            },
+            crate::database::ChatMessage {
+                id: "m2".to_string(),
+                conversation_id: "c1".to_string(),
+                role: "agent".to_string(),
+                content: "I inspected the workspace and found two pending TODO items."
+                    .to_string(),
+                created_at: now,
+                processed: true,
+            },
+        ];
+        let packets = vec![OodaTurnPacketRecord {
+            id: "p1".to_string(),
+            conversation_id: "c1".to_string(),
+            turn_id: Some("t1".to_string()),
+            observe: "operator asked for a workspace inspection".to_string(),
+            orient: "goal is status visibility".to_string(),
+            decide: "decision=yield status=done reason=inspection complete".to_string(),
+            act: "operator_message=reported TODO findings tool_call_count=1".to_string(),
+            created_at: now,
+        }];
+
+        let summary = fallback_chat_summary_snapshot(&messages, &packets);
+        assert!(summary.contains("### Recent Reasoning Digest"));
+        assert!(summary.contains("inspection complete"));
+    }
+
+    #[test]
+    fn ooda_summary_digest_is_generated_for_compaction_prompt() {
+        let now = Utc::now();
+        let packets = vec![OodaTurnPacketRecord {
+            id: "p1".to_string(),
+            conversation_id: "c1".to_string(),
+            turn_id: Some("t1".to_string()),
+            observe: "observe".to_string(),
+            orient: "orient".to_string(),
+            decide: "decision=continue status=still_working reason=need another read".to_string(),
+            act: "operator_message=checking one more file tool_call_count=1".to_string(),
+            created_at: now,
+        }];
+
+        let digest = format_ooda_digest_for_summary(&packets, 8, 120);
+        assert!(digest.contains("## Structured OODA Digest"));
+        assert!(digest.contains("turn=t1"));
+        assert!(digest.contains("need another read"));
     }
 
     #[test]

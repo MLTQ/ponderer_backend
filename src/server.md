@@ -14,7 +14,7 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - **Interacts with**: all route handlers and auth middleware.
 
 ### REST handlers (`/v1/...`)
-- **Does**: Provide CRUD-like operations for config/conversations/messages plus turn/tool-call inspection, plugin manifest discovery, and pause/status/stop controls.
+- **Does**: Provide CRUD-like operations for config/conversations/messages plus turn/tool-call/prompt inspection, plugin manifest discovery, and pause/status/stop controls.
 - **Interacts with**: `database.rs` chat lifecycle APIs, `plugin.rs` manifests, and `agent` runtime control methods.
 
 ### WS handlers (`/v1/ws/events`)
@@ -39,5 +39,6 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - `/v1/plugins` exposes loaded plugin manifests (`builtin.core` + extension plugins) for client-side capability discovery.
 - Message enqueue validates non-empty content and returns the created `message_id`.
 - Conversation-scoped handlers guard against missing conversation IDs with explicit `404` responses.
+- `GET /v1/turns/:id/prompt` returns the stored per-turn context prompt plus optional stored system prompt, enabling richer per-message context inspection in the frontend.
 - `PUT /v1/agent/pause` is preferred for explicit control; `POST /v1/agent/toggle-pause` remains for backward compatibility.
 - `POST /v1/agent/stop` requests immediate cancellation of in-flight agentic turns and aborts detached background subtasks.

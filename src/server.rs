@@ -103,6 +103,13 @@ struct StopResponse {
     stopped: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ChatTurnPromptResponse {
+    turn_id: String,
+    prompt_text: String,
+    system_prompt_text: Option<String>,
+}
+
 pub async fn serve_backend(
     runtime: BackendRuntime,
     event_rx: flume::Receiver<AgentEvent>,
@@ -148,6 +155,7 @@ pub async fn serve_backend(
         )
         .route("/conversations/:id/turns", get(list_turns))
         .route("/turns/:id/tool-calls", get(list_turn_tool_calls))
+        .route("/turns/:id/prompt", get(get_turn_prompt))
         .route("/agent/status", get(get_agent_status))
         .route("/agent/pause", put(set_pause))
         .route("/agent/toggle-pause", post(toggle_pause))
@@ -467,6 +475,28 @@ async fn list_turn_tool_calls(
         .list_chat_turn_tool_calls(&turn_id)
         .map(Json)
         .map_err(internal_error)
+}
+
+async fn get_turn_prompt(
+    State(state): State<Arc<ServerState>>,
+    Path(turn_id): Path<String>,
+) -> Result<Json<ChatTurnPromptResponse>, (StatusCode, String)> {
+    let (prompt_text, system_prompt_text) = state
+        .db
+        .get_chat_turn_prompt_bundle(&turn_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("turn {} not found", turn_id),
+            )
+        })?;
+
+    Ok(Json(ChatTurnPromptResponse {
+        turn_id,
+        prompt_text: prompt_text.unwrap_or_default(),
+        system_prompt_text,
+    }))
 }
 
 async fn get_agent_status(

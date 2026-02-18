@@ -106,6 +106,7 @@ pub struct ChatMessage {
     pub content: String,
     pub created_at: DateTime<Utc>,
     pub processed: bool, // Has the agent seen/responded to this?
+    pub turn_id: Option<String>,
 }
 
 pub const DEFAULT_CHAT_SESSION_ID: &str = "default_session";
@@ -189,6 +190,8 @@ pub struct ChatTurn {
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub agent_message_id: Option<String>,
+    pub prompt_text: Option<String>,
+    pub system_prompt_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +229,18 @@ pub struct PendingThoughtRecord {
     pub created_at: DateTime<Utc>,
     pub surfaced_at: Option<DateTime<Utc>>,
     pub dismissed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OodaTurnPacketRecord {
+    pub id: String,
+    pub conversation_id: String,
+    pub turn_id: Option<String>,
+    pub observe: String,
+    pub orient: String,
+    pub decide: String,
+    pub act: String,
+    pub created_at: DateTime<Utc>,
 }
 
 pub struct AgentDatabase {
@@ -323,6 +338,16 @@ impl AgentDatabase {
             [ChatTurnPhase::Idle.as_db_str()],
         )?;
 
+        Ok(())
+    }
+
+    fn ensure_chat_turns_prompt_columns(&self, conn: &Connection) -> Result<()> {
+        if !Self::table_has_column(conn, "chat_turns", "prompt_text")? {
+            conn.execute("ALTER TABLE chat_turns ADD COLUMN prompt_text TEXT", [])?;
+        }
+        if !Self::table_has_column(conn, "chat_turns", "system_prompt_text")? {
+            conn.execute("ALTER TABLE chat_turns ADD COLUMN system_prompt_text TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -571,7 +596,9 @@ impl AgentDatabase {
                 tool_call_count INTEGER NOT NULL DEFAULT 0,
                 started_at TEXT NOT NULL,
                 completed_at TEXT,
-                agent_message_id TEXT
+                agent_message_id TEXT,
+                prompt_text TEXT,
+                system_prompt_text TEXT
             )"#,
             [],
         )?;
@@ -658,8 +685,24 @@ impl AgentDatabase {
             [],
         )?;
 
+        // Persist compact Observe/Orient/Decide/Act packets per turn for baton-style context carryover.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS ooda_turn_packets (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                turn_id TEXT,
+                observe TEXT NOT NULL,
+                orient TEXT NOT NULL,
+                decide TEXT NOT NULL,
+                act TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"#,
+            [],
+        )?;
+
         self.ensure_chat_messages_conversation_column(&conn)?;
         self.ensure_chat_conversations_runtime_columns(&conn)?;
+        self.ensure_chat_turns_prompt_columns(&conn)?;
         self.ensure_default_chat_session(&conn)?;
 
         conn.execute(
@@ -720,6 +763,14 @@ impl AgentDatabase {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pending_unsurfaced ON pending_thoughts_queue(surfaced_at) WHERE surfaced_at IS NULL",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ooda_packets_conversation_created ON ooda_turn_packets(conversation_id, created_at DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ooda_packets_turn_id ON ooda_turn_packets(turn_id)",
             [],
         )?;
 
@@ -2508,8 +2559,8 @@ impl AgentDatabase {
             "INSERT INTO chat_turns (
                 id, session_id, conversation_id, iteration, phase_state, decision, status,
                 trigger_message_ids_json, operator_message, reason, error, tool_call_count,
-                started_at, completed_at, agent_message_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, NULL, NULL, 0, ?7, NULL, NULL)",
+                started_at, completed_at, agent_message_id, prompt_text, system_prompt_text
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, NULL, NULL, 0, ?7, NULL, NULL, NULL, NULL)",
             params![
                 turn_id,
                 session_id,
@@ -2534,6 +2585,64 @@ impl AgentDatabase {
         )?;
 
         Ok(turn_id)
+    }
+
+    /// Persist the full prompt payload used to generate a specific turn.
+    pub fn set_chat_turn_prompt(&self, turn_id: &str, prompt_text: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE chat_turns
+             SET prompt_text = ?2
+             WHERE id = ?1",
+            params![turn_id, prompt_text],
+        )?;
+        Ok(())
+    }
+
+    /// Persist user + system prompt payloads used to generate a specific turn.
+    pub fn set_chat_turn_prompt_bundle(
+        &self,
+        turn_id: &str,
+        prompt_text: &str,
+        system_prompt_text: &str,
+    ) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE chat_turns
+             SET prompt_text = ?2, system_prompt_text = ?3
+             WHERE id = ?1",
+            params![turn_id, prompt_text, system_prompt_text],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch the stored prompt payload for one turn.
+    pub fn get_chat_turn_prompt(&self, turn_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .get_chat_turn_prompt_bundle(turn_id)?
+            .and_then(|(prompt_text, _)| prompt_text))
+    }
+
+    /// Fetch stored user/system prompts for one turn.
+    pub fn get_chat_turn_prompt_bundle(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT prompt_text, system_prompt_text
+             FROM chat_turns
+             WHERE id = ?1
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query([turn_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+        )))
     }
 
     /// Record a single tool call made during a turn.
@@ -2652,7 +2761,7 @@ impl AgentDatabase {
             "SELECT
                 id, session_id, conversation_id, iteration, phase_state, decision, status,
                 trigger_message_ids_json, operator_message, reason, error, tool_call_count,
-                started_at, completed_at, agent_message_id
+                started_at, completed_at, agent_message_id, prompt_text, system_prompt_text
              FROM chat_turns
              WHERE conversation_id = ?1
              ORDER BY started_at DESC
@@ -2699,6 +2808,8 @@ impl AgentDatabase {
                         None => None,
                     },
                     agent_message_id: row.get(14)?,
+                    prompt_text: row.get(15)?,
+                    system_prompt_text: row.get(16)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2740,11 +2851,336 @@ impl AgentDatabase {
         Ok(calls)
     }
 
+    pub fn save_ooda_turn_packet(&self, packet: &OodaTurnPacketRecord) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO ooda_turn_packets
+             (id, conversation_id, turn_id, observe, orient, decide, act, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                packet.id,
+                packet.conversation_id,
+                packet.turn_id,
+                packet.observe,
+                packet.orient,
+                packet.decide,
+                packet.act,
+                packet.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_latest_ooda_turn_packet_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<OodaTurnPacketRecord>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, turn_id, observe, orient, decide, act, created_at
+             FROM ooda_turn_packets
+             WHERE conversation_id = ?1
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![conversation_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let created_at_raw: String = row.get(7)?;
+        Ok(Some(OodaTurnPacketRecord {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            turn_id: row.get(2)?,
+            observe: row.get(3)?,
+            orient: row.get(4)?,
+            decide: row.get(5)?,
+            act: row.get(6)?,
+            created_at: created_at_raw.parse().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+        }))
+    }
+
+    pub fn get_latest_ooda_turn_packet(&self) -> Result<Option<OodaTurnPacketRecord>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, turn_id, observe, orient, decide, act, created_at
+             FROM ooda_turn_packets
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let created_at_raw: String = row.get(7)?;
+        Ok(Some(OodaTurnPacketRecord {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            turn_id: row.get(2)?,
+            observe: row.get(3)?,
+            orient: row.get(4)?,
+            decide: row.get(5)?,
+            act: row.get(6)?,
+            created_at: created_at_raw.parse().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+        }))
+    }
+
+    pub fn get_recent_ooda_turn_packets_for_conversation_before(
+        &self,
+        conversation_id: &str,
+        before_inclusive: &DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<OodaTurnPacketRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, turn_id, observe, orient, decide, act, created_at
+             FROM ooda_turn_packets
+             WHERE conversation_id = ?1
+               AND created_at <= ?2
+             ORDER BY created_at DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![conversation_id, before_inclusive.to_rfc3339(), limit as i64],
+                |row| {
+                    let created_at_raw: String = row.get(7)?;
+                    Ok(OodaTurnPacketRecord {
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        turn_id: row.get(2)?,
+                        observe: row.get(3)?,
+                        orient: row.get(4)?,
+                        decide: row.get(5)?,
+                        act: row.get(6)?,
+                        created_at: created_at_raw.parse().map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows.into_iter().rev().collect())
+    }
+
+    pub fn get_recent_action_digest(
+        &self,
+        limit: usize,
+        max_chars: usize,
+    ) -> Result<String> {
+        self.get_recent_action_digest_inner(None, limit, max_chars)
+    }
+
+    pub fn get_recent_action_digest_for_conversation(
+        &self,
+        conversation_id: &str,
+        limit: usize,
+        max_chars: usize,
+    ) -> Result<String> {
+        self.get_recent_action_digest_inner(Some(conversation_id), limit, max_chars)
+    }
+
+    fn get_recent_action_digest_inner(
+        &self,
+        conversation_id: Option<&str>,
+        limit: usize,
+        max_chars: usize,
+    ) -> Result<String> {
+        let conn = self.lock_conn()?;
+        let limit = limit.max(1) as i64;
+        let mut lines: Vec<String> = Vec::new();
+
+        if let Some(conversation_id) = conversation_id {
+            let mut stmt = conn.prepare(
+                "SELECT
+                    conversation_id,
+                    started_at,
+                    decision,
+                    status,
+                    tool_call_count,
+                    reason,
+                    error,
+                    COALESCE(
+                      (
+                        SELECT GROUP_CONCAT(tool_name, ',')
+                        FROM (
+                          SELECT tool_name
+                          FROM chat_turn_tool_calls tc
+                          WHERE tc.turn_id = ct.id
+                          ORDER BY call_index ASC
+                          LIMIT 4
+                        )
+                      ),
+                      ''
+                    ) AS tool_preview
+                 FROM chat_turns ct
+                 WHERE conversation_id = ?1
+                 ORDER BY started_at DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![conversation_id, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)? as usize,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    convo,
+                    started_at,
+                    decision,
+                    status,
+                    tool_count,
+                    reason,
+                    error,
+                    tool_preview,
+                ) = row?;
+                lines.push(format!(
+                    "- [{}] conv={} decision={} status={} tools={}{}{}{}",
+                    started_at,
+                    convo,
+                    decision.unwrap_or_else(|| "-".to_string()),
+                    status.unwrap_or_else(|| "-".to_string()),
+                    tool_count,
+                    if tool_preview.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", tool_preview)
+                    },
+                    reason
+                        .as_deref()
+                        .map(|value| format!(" reason=\"{}\"", truncate_for_db_digest(value, 120)))
+                        .unwrap_or_default(),
+                    error
+                        .as_deref()
+                        .map(|value| format!(" error=\"{}\"", truncate_for_db_digest(value, 120)))
+                        .unwrap_or_default()
+                ));
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT
+                    conversation_id,
+                    started_at,
+                    decision,
+                    status,
+                    tool_call_count,
+                    reason,
+                    error,
+                    COALESCE(
+                      (
+                        SELECT GROUP_CONCAT(tool_name, ',')
+                        FROM (
+                          SELECT tool_name
+                          FROM chat_turn_tool_calls tc
+                          WHERE tc.turn_id = ct.id
+                          ORDER BY call_index ASC
+                          LIMIT 4
+                        )
+                      ),
+                      ''
+                    ) AS tool_preview
+                 FROM chat_turns ct
+                 ORDER BY started_at DESC
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)? as usize,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    convo,
+                    started_at,
+                    decision,
+                    status,
+                    tool_count,
+                    reason,
+                    error,
+                    tool_preview,
+                ) = row?;
+                lines.push(format!(
+                    "- [{}] conv={} decision={} status={} tools={}{}{}{}",
+                    started_at,
+                    convo,
+                    decision.unwrap_or_else(|| "-".to_string()),
+                    status.unwrap_or_else(|| "-".to_string()),
+                    tool_count,
+                    if tool_preview.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", tool_preview)
+                    },
+                    reason
+                        .as_deref()
+                        .map(|value| format!(" reason=\"{}\"", truncate_for_db_digest(value, 120)))
+                        .unwrap_or_default(),
+                    error
+                        .as_deref()
+                        .map(|value| format!(" error=\"{}\"", truncate_for_db_digest(value, 120)))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+
+        if lines.is_empty() {
+            return Ok("None".to_string());
+        }
+
+        let mut output = String::new();
+        for line in lines {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&line);
+            if output.chars().count() >= max_chars.max(120) {
+                output = truncate_for_db_digest(&output, max_chars.max(120));
+                break;
+            }
+        }
+        Ok(output)
+    }
+
     /// Get unprocessed messages from the operator
     pub fn get_unprocessed_operator_messages(&self) -> Result<Vec<ChatMessage>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, role, content, created_at, processed FROM chat_messages
+            "SELECT id, conversation_id, role, content, created_at, processed, turn_id FROM chat_messages
              WHERE role = 'operator' AND processed = 0
              ORDER BY created_at ASC",
         )?;
@@ -2764,6 +3200,7 @@ impl AgentDatabase {
                         )
                     })?,
                     processed: row.get::<_, i64>(5)? != 0,
+                    turn_id: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2782,7 +3219,7 @@ impl AgentDatabase {
     pub fn get_chat_history(&self, limit: usize) -> Result<Vec<ChatMessage>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, role, content, created_at, processed FROM chat_messages
+            "SELECT id, conversation_id, role, content, created_at, processed, turn_id FROM chat_messages
              ORDER BY created_at DESC
              LIMIT ?1",
         )?;
@@ -2802,6 +3239,7 @@ impl AgentDatabase {
                         )
                     })?,
                     processed: row.get::<_, i64>(5)? != 0,
+                    turn_id: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2818,7 +3256,7 @@ impl AgentDatabase {
     ) -> Result<Vec<ChatMessage>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, role, content, created_at, processed FROM chat_messages
+            "SELECT id, conversation_id, role, content, created_at, processed, turn_id FROM chat_messages
              WHERE conversation_id = ?1
              ORDER BY created_at DESC
              LIMIT ?2",
@@ -2839,6 +3277,7 @@ impl AgentDatabase {
                         )
                     })?,
                     processed: row.get::<_, i64>(5)? != 0,
+                    turn_id: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2864,7 +3303,7 @@ impl AgentDatabase {
 
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, role, content, created_at, processed FROM chat_messages
+            "SELECT id, conversation_id, role, content, created_at, processed, turn_id FROM chat_messages
              WHERE conversation_id = ?1
              ORDER BY created_at DESC
              LIMIT ?2 OFFSET ?3",
@@ -2885,6 +3324,7 @@ impl AgentDatabase {
                         )
                     })?,
                     processed: row.get::<_, i64>(5)? != 0,
+                    turn_id: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2991,6 +3431,18 @@ impl AgentDatabase {
     }
 }
 
+fn truncate_for_db_digest(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in input.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn outcome_to_db(outcome: &PromotionOutcome) -> &'static str {
     match outcome {
         PromotionOutcome::Promote => "promote",
@@ -3028,6 +3480,8 @@ mod tests {
                 1,
             )
             .expect("begin turn");
+        db.set_chat_turn_prompt_bundle(&turn_id, "USER PROMPT", "SYSTEM PROMPT")
+            .expect("persist prompt bundle");
 
         db.record_chat_turn_tool_call(
             &turn_id,
@@ -3072,6 +3526,18 @@ mod tests {
             turns[0].trigger_message_ids,
             vec![operator_message_id.clone()]
         );
+        assert_eq!(turns[0].prompt_text.as_deref(), Some("USER PROMPT"));
+        assert_eq!(
+            turns[0].system_prompt_text.as_deref(),
+            Some("SYSTEM PROMPT")
+        );
+
+        let prompt_bundle = db
+            .get_chat_turn_prompt_bundle(&turn_id)
+            .expect("load prompt bundle")
+            .expect("bundle exists");
+        assert_eq!(prompt_bundle.0.as_deref(), Some("USER PROMPT"));
+        assert_eq!(prompt_bundle.1.as_deref(), Some("SYSTEM PROMPT"));
 
         let tool_calls = db
             .list_chat_turn_tool_calls(&turn_id)
@@ -3375,6 +3841,96 @@ mod tests {
             .get_unsurfaced_thoughts()
             .expect("remaining unsurfaced thoughts");
         assert!(remaining.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ooda_turn_packet_roundtrip_and_action_digest() {
+        let path = temp_db_path("ooda_packet");
+        let db = AgentDatabase::new(&path).expect("db init");
+        let conversation = db
+            .create_chat_conversation(Some("OODA packet test"))
+            .expect("create conversation");
+
+        let turn_id = db
+            .begin_chat_turn(&conversation.id, &[], 1)
+            .expect("begin turn");
+        db.record_chat_turn_tool_call(
+            &turn_id,
+            0,
+            "list_directory",
+            "{\"path\":\".\"}",
+            "Cargo.toml",
+        )
+        .expect("record tool call");
+        db.complete_chat_turn(
+            &turn_id,
+            ChatTurnPhase::Completed,
+            "yield",
+            "done",
+            "Completed listing files",
+            Some("completed"),
+            1,
+            None,
+        )
+        .expect("complete turn");
+
+        let packet = OodaTurnPacketRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conversation.id.clone(),
+            turn_id: Some(turn_id.clone()),
+            observe: "Operator requested directory listing.".to_string(),
+            orient: "User likely validating workspace visibility.".to_string(),
+            decide: "Use list_directory then yield.".to_string(),
+            act: "Ran list_directory and summarized output.".to_string(),
+            created_at: Utc::now(),
+        };
+        db.save_ooda_turn_packet(&packet)
+            .expect("save ooda packet");
+
+        let loaded = db
+            .get_latest_ooda_turn_packet_for_conversation(&conversation.id)
+            .expect("load conversation packet")
+            .expect("packet exists");
+        assert_eq!(loaded.id, packet.id);
+        assert_eq!(loaded.turn_id, packet.turn_id);
+
+        let global = db
+            .get_latest_ooda_turn_packet()
+            .expect("load latest packet")
+            .expect("latest packet exists");
+        assert_eq!(global.id, packet.id);
+
+        let older_packet = OodaTurnPacketRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conversation.id.clone(),
+            turn_id: None,
+            observe: "Older observe".to_string(),
+            orient: "Older orient".to_string(),
+            decide: "Older decide".to_string(),
+            act: "Older act".to_string(),
+            created_at: packet.created_at - chrono::Duration::minutes(5),
+        };
+        db.save_ooda_turn_packet(&older_packet)
+            .expect("save older packet");
+
+        let packets_before_latest = db
+            .get_recent_ooda_turn_packets_for_conversation_before(
+                &conversation.id,
+                &packet.created_at,
+                8,
+            )
+            .expect("query packet window");
+        assert_eq!(packets_before_latest.len(), 2);
+        assert_eq!(packets_before_latest[0].id, older_packet.id);
+        assert_eq!(packets_before_latest[1].id, packet.id);
+
+        let digest = db
+            .get_recent_action_digest_for_conversation(&conversation.id, 8, 1000)
+            .expect("digest");
+        assert!(digest.contains("decision=yield"));
+        assert!(digest.contains("list_directory"));
 
         let _ = std::fs::remove_file(&path);
     }
