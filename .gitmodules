@@ -1,0 +1,3 @@
+[submodule "ponderer_backend"]
+	path = ponderer_backend
+	url = git@github.com:MLTQ/ponderer_backend.git
