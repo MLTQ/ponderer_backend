@@ -6,7 +6,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 ## Components
 
 ### `Agent`
-- **Does**: Owns runtime dependencies (skills, tools, config, database, reasoning engines) plus per-conversation background-subtask handles, and exposes lifecycle operations (`new`, `run_loop`, `reload_config`, `toggle_pause`)
+- **Does**: Owns runtime dependencies (skills, tools, config, database, reasoning engines) plus per-conversation background-subtask handles, and exposes lifecycle operations (`new`, `run_loop`, `reload_config`, `toggle_pause`, `set_paused`, `runtime_status`)
 - **Interacts with**: `config::AgentConfig`, `database::AgentDatabase`, `skills::*`, `tools::ToolRegistry`, `agent::reasoning`, `agent::trajectory`, `agent::orientation`, `agent::journal`, `agent::concerns`
 
 ### Living Loop foundation modules (`journal`, `concerns`)
@@ -100,6 +100,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 | `memory/eval.rs` | Replay evaluation functions remain deterministic and serializable | Breaking report schema or candidate IDs |
 | `ui/chat.rs` | Embedded chat-metadata delimiters remain stable (`[tool_calls]`, `[thinking]`, `[media]`, `[turn_control]`) | Changing envelope formats without parser update |
 | `tools/comfy.rs` | Tool JSON with `media` arrays is transformed into chat-visible media payloads | Changing media extraction shape in formatter |
+| `server.rs` | Explicit pause/status controls remain available (`set_paused`, `runtime_status`) for REST API control | Removing pause/status methods or changing returned status shape |
 
 ## Notes
 - Current behavior combines periodic skill polling with persona maintenance, optional heartbeat automation, and private chat handling.

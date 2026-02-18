@@ -1,62 +1,43 @@
 # app.rs
 
 ## Purpose
-Defines `AgentApp`, the top-level eframe application. It owns the agent handle, event receiver, all UI panels, chat state, and the tokio runtime used to dispatch async commands from the GUI thread. The private chat view is the primary interaction surface, with activity/event logs moved to a secondary side panel.
+Defines `AgentApp`, the top-level eframe application for the API-only frontend. It owns UI state, an `ApiClient`, websocket-driven event intake, and REST-driven chat/config control.
 
 ## Components
 
 ### `AgentApp`
-- **Does**: Central application state holding agent reference, event log, UI panels, avatar set, database handle, conversation list/selection, scoped chat history, chat media texture cache, structured live tool-progress buffer (with optional subtask tags), and live streaming preview state, plus activity panel visibility
-- **Interacts with**: `Agent` (via `Arc<Agent>`), `AgentEvent`/`AgentVisualState` from `crate::agent`, `AgentDatabase`/`ChatMessage`/`ChatConversation` from `crate::database`, all UI panel structs
-- **Rationale**: Single owner of all GUI state; bridges sync egui rendering with async agent operations
+- **Does**: Holds frontend UI state: event log, API client, runtime status, chat list/history, streaming preview, tool-progress drawer data, and settings/character/workflow panels.
+- **Interacts with**: `crate::api::{ApiClient, FrontendEvent, ChatConversation, ChatMessage, AgentVisualState}`, UI subpanels.
 
-### `AgentApp::new(event_rx, agent, config, database)`
-- **Does**: Constructs the app, initializes all panels from config, defers avatar loading to first frame
-- **Interacts with**: `SettingsPanel`, `CharacterPanel`, `ComfySettingsPanel`, `AgentConfig`
+### `AgentApp::new(api_client, fallback_config)`
+- **Does**: Creates a tokio runtime, starts WS event streaming, fetches config from backend (fallback on failure), initializes panels, then loads status/conversations/history.
+- **Interacts with**: `ApiClient::stream_events_forever`, `ApiClient::get_config`.
 
-### `AgentApp::refresh_conversations()`
-- **Does**: Refreshes available chat threads (including persisted runtime status) and keeps `active_conversation_id` valid when threads change
-- **Interacts with**: `AgentDatabase::list_chat_conversations`
+### REST refresh helpers (`refresh_status`, `refresh_conversations`, `refresh_chat_history`)
+- **Does**: Pulls current backend state into UI every refresh interval.
+- **Interacts with**: `/v1/agent/status`, `/v1/conversations`, `/v1/conversations/:id/messages`.
 
-### `AgentApp::refresh_chat_history()`
-- **Does**: Pulls chat messages for the currently active conversation into `self.chat_history`
-- **Interacts with**: `AgentDatabase::get_chat_history_for_conversation`
+### Chat actions (`send_chat_message`, `create_new_conversation`)
+- **Does**: Sends operator messages and creates new conversations via backend API.
+- **Interacts with**: `/v1/conversations/:id/messages`, `/v1/conversations`.
 
-### `AgentApp::send_chat_message(content)`
-- **Does**: Inserts an "operator" role message into the active conversation, then refreshes conversations/history
-- **Interacts with**: `AgentDatabase::add_chat_message_in_conversation`
-
-### `AgentApp::create_new_conversation()`
-- **Does**: Creates a fresh chat thread, switches selection to it, and clears composer text
-- **Interacts with**: `AgentDatabase::create_chat_conversation`
-
-### `AgentApp::load_avatars(ctx, config)`
-- **Does**: Reads avatar paths from config and delegates to `AvatarSet::load`
-- **Interacts with**: `AvatarSet`, `AgentConfig` fields `avatar_idle`, `avatar_thinking`, `avatar_active`
-
-### `conversation_display_label(conversation)` (private)
-- **Does**: Builds conversation picker labels from title/message count and appends a runtime-state suffix (`processing`, `done`, `awaiting input`, `failed`) when non-idle
-- **Interacts with**: `ChatConversation.runtime_state` from `database.rs`
+### `persist_config(config)`
+- **Does**: Saves settings/character/workflow config via backend API and syncs local panel state from backend response.
+- **Interacts with**: `/v1/config`.
 
 ### `impl eframe::App for AgentApp` -- `update()`
-- **Does**: Main render loop. Loads avatars on first frame, polls `event_rx` for `AgentEvent`s, maps `ChatStreaming` events into a live preview bubble, records `ToolCallProgress` updates into a per-conversation live buffer, refreshes chat on operator-related actions, renders header with sprite, toolbar buttons, primary private chat (including media rendering via shared cache), a live "Agent Turn" drawer with expandable per-subtask sections, secondary activity side panel, multiline chat input, and all modal panels (settings, character, comfy workflow). Persists config and hot-reloads the agent on save.
-- **Interacts with**: `sprite::render_agent_sprite`, `chat::render_event_log`, `chat::render_private_chat`, `SettingsPanel::render`, `CharacterPanel::render`, `ComfySettingsPanel::render`, `Agent::reload_config`, `Agent::toggle_pause`
+- **Does**: Main render loop. Processes WS events, updates status/chat on timer, renders chat + activity panels, and dispatches API actions for pause/config/message operations.
+- **Interacts with**: `chat::render_private_chat`, `chat::render_event_log`, `sprite::render_agent_sprite`.
 
 ## Contracts
 
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
-| Binary entry point | `AgentApp::new` signature with `Receiver<AgentEvent>`, `Arc<Agent>`, `AgentConfig`, `Option<Arc<AgentDatabase>>` | Changing constructor args breaks startup |
-| `SettingsPanel` | `config` field is public and mutated by `CharacterPanel` saves | Making `config` private breaks cross-panel sync |
-| `Agent` | `reload_config` and `toggle_pause` are async | Removing these methods breaks UI buttons |
-| `AgentDatabase` | Conversation APIs (`list_chat_conversations`, `create_chat_conversation`, `get_chat_history_for_conversation`, `add_chat_message_in_conversation`) plus `ChatConversation.runtime_state` semantics | Removing runtime-state field or changing chat API signatures breaks picker/status behavior |
-| `agent::AgentEvent` | Streaming updates include `conversation_id`, partial/full `content`, and `done` state; tool updates include `ToolCallProgress` with preview text | Changing event payload shape breaks preview/drawer rendering |
+| `main.rs` | `AgentApp::new(ApiClient, AgentConfig)` constructor | Changing constructor signature |
+| `api.rs` | Stable method surface for config/chat/status/pause/event-stream | Renaming/removing client methods |
+| UI panel modules | `settings_panel.config` remains mutable for cross-panel synchronization | Changing panel state ownership |
 
 ## Notes
-- A dedicated `tokio::runtime::Runtime` is created inside the app because eframe's render loop is synchronous. All async agent calls are dispatched through `self.runtime.spawn`.
-- Chat conversations and active-conversation history auto-refresh every 2 seconds via `last_chat_refresh` timer.
-- Conversation picker labels include DB-backed runtime state so users can see when a thread is still processing, waiting for input, or failed.
-- Avatar loading is deferred to the first `update()` call because `egui::Context` is not available at construction time.
-- Chat input is multiline; plain `Enter` sends while `Shift+Enter` inserts a newline.
-- Live provider tokens are shown inline in chat via `streaming_chat_preview` and replaced by persisted messages once the agent saves final output.
-- Tool execution progress is rendered in a dedicated drawer under chat, with expandable subtask groups when progress lines carry a `[subtask-id]` prefix (used by background chat subtasks).
+- The app is no longer wired to in-process `Agent`/`AgentDatabase`/`flume` backend channels.
+- WS event stream runs continuously with reconnect; polling refresh every 2s is retained for list/history/status consistency.
+- UI-level API failures are surfaced in the activity log as `FrontendEvent::Error` entries.

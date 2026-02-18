@@ -204,8 +204,8 @@ impl AvatarSet {
     }
 
     /// Get the appropriate avatar for the given state
-    pub fn get_for_state(&mut self, state: &crate::agent::AgentVisualState) -> Option<&mut Avatar> {
-        use crate::agent::AgentVisualState;
+    pub fn get_for_state(&mut self, state: &crate::api::AgentVisualState) -> Option<&mut Avatar> {
+        use crate::api::AgentVisualState;
 
         match state {
             AgentVisualState::Idle | AgentVisualState::Paused => self.idle.as_mut(),

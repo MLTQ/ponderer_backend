@@ -1,28 +1,21 @@
 # sprite.rs
 
 ## Purpose
-Renders the agent's visual indicator in the header bar. Uses avatar images when available, falling back to color-coded emoji for each agent state.
+Renders the header agent visual indicator (avatar when available, emoji fallback otherwise) using frontend runtime state from API events/status.
 
 ## Components
 
 ### `render_agent_sprite(ui, state, avatars)`
-- **Does**: If an `AvatarSet` is provided and contains an avatar for the current state, updates animation, renders it as a 64x64 image, and requests repaint for animated avatars. Otherwise delegates to `render_agent_emoji`.
-- **Interacts with**: `AvatarSet::get_for_state`, `Avatar::update`, `Avatar::current_texture`, `Avatar::is_animated`
+- **Does**: Renders animated avatar frames for the current `AgentVisualState` or falls back to emoji.
+- **Interacts with**: `AvatarSet::get_for_state`, `crate::api::AgentVisualState`.
 
-### `render_agent_emoji(ui, state)` (private)
-- **Does**: Maps each `AgentVisualState` variant to an emoji and color, then renders it at 48pt size:
-  - `Idle` -> gray sleeping face
-  - `Reading` -> light blue book
-  - `Thinking` -> yellow thinking face
-  - `Writing` -> light green writing hand
-  - `Happy` -> green smiling face
-  - `Confused` -> orange confused face
-  - `Paused` -> light red pause icon
+### `render_agent_emoji(ui, state)`
+- **Does**: Maps each visual state to a color-coded emoji.
 
 ## Contracts
 
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
-| `app.rs` | `render_agent_sprite(ui, state, Option<&mut AvatarSet>)` signature | Changing params breaks header rendering |
-| `AgentVisualState` | All 7 variants matched exhaustively | Adding a variant causes compiler error here |
-| `avatar.rs` | `AvatarSet` and `Avatar` public API | Changing avatar API breaks sprite rendering |
+| `app.rs` | `render_agent_sprite` signature stability | Signature change breaks header rendering |
+| `api.rs` | `AgentVisualState` variants used here remain available | Variant rename/removal breaks mapping |
+| `avatar.rs` | Avatar public methods used for rendering remain stable | API changes break animated avatar path |

@@ -1,7 +1,7 @@
 use eframe::egui::{self, RichText};
 
 use super::avatar::AvatarSet;
-use crate::agent::AgentVisualState;
+use crate::api::AgentVisualState;
 
 pub fn render_agent_sprite(
     ui: &mut egui::Ui,

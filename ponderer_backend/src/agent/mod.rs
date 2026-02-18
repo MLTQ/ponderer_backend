@@ -65,7 +65,7 @@ const CHAT_COMPACTION_RESUMMARY_DELTA: usize = 8;
 const CHAT_COMPACTION_SOURCE_MAX_MESSAGES: usize = 140;
 static ORIENTATION_SCREEN_CAPTURE_FAILURE_WARNED: AtomicBool = AtomicBool::new(false);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum AgentVisualState {
     Idle,
     Reading,
@@ -106,6 +106,14 @@ pub enum AgentEvent {
         summary: String,
     },
     Error(String),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentRuntimeStatus {
+    pub paused: bool,
+    pub visual_state: AgentVisualState,
+    pub actions_this_hour: u32,
+    pub last_action_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub struct AgentState {
@@ -334,6 +342,35 @@ impl Agent {
         drop(state);
 
         let _ = self.event_tx.send(AgentEvent::StateChanged(new_state));
+    }
+
+    pub async fn set_paused(&self, paused: bool) -> bool {
+        let mut state = self.state.write().await;
+        if state.paused == paused {
+            return state.paused;
+        }
+
+        state.paused = paused;
+        let new_state = if paused {
+            AgentVisualState::Paused
+        } else {
+            AgentVisualState::Idle
+        };
+        state.visual_state = new_state.clone();
+        drop(state);
+
+        let _ = self.event_tx.send(AgentEvent::StateChanged(new_state));
+        paused
+    }
+
+    pub async fn runtime_status(&self) -> AgentRuntimeStatus {
+        let state = self.state.read().await;
+        AgentRuntimeStatus {
+            paused: state.paused,
+            visual_state: state.visual_state.clone(),
+            actions_this_hour: state.actions_this_hour,
+            last_action_time: state.last_action_time,
+        }
     }
 
     async fn emit(&self, event: AgentEvent) {

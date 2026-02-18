@@ -77,8 +77,8 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - **Does**: Implements persisted turn state transitions and tool-call lineage for each conversation thread
 - **Interacts with**: `agent::process_chat_messages` autonomous turn loop, diagnostics/recovery tooling
 
-### Chat conversation methods (`create_chat_conversation`, `list_chat_conversations`, `add_chat_message_in_conversation`, `add_chat_message_in_turn`, `get_chat_history_for_conversation`, `get_chat_context_for_conversation`)
-- **Does**: Creates/lists conversation threads, writes messages (optionally bound to a turn), and returns thread-scoped history/context
+### Chat conversation methods (`create_chat_conversation`, `list_chat_conversations`, `get_chat_conversation`, `add_chat_message_in_conversation`, `add_chat_message_in_turn`, `get_chat_history_for_conversation`, `get_chat_context_for_conversation`)
+- **Does**: Creates/lists/fetches conversation threads, writes messages (optionally bound to a turn), and returns thread-scoped history/context
 - **Interacts with**: `ui::app::AgentApp` new-chat/switch-chat actions, `agent::process_chat_messages` per-conversation prompt building
 
 ### Chat compaction methods (`count_chat_messages_for_conversation`, `get_chat_history_slice_for_conversation`, `upsert_chat_conversation_summary`, `get_chat_conversation_summary`)
@@ -104,6 +104,7 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 | `main.rs` | `AgentDatabase::new(path)` creates/opens DB, ensures schema, and initializes memory design metadata | Changing startup initialization or metadata keys |
 | `agent::Agent` | Chat APIs include turn lifecycle methods plus conversation-scoped message/context methods (`begin_chat_turn`, `record_chat_turn_tool_call`, `complete_chat_turn`, `fail_chat_turn`, `add_chat_message_in_turn`) | Removing/renaming lifecycle methods or changing state semantics |
 | `ui::app` | `ChatConversation` includes `runtime_state`; conversation APIs remain (`list_chat_conversations`, `create_chat_conversation`, `get_chat_history_for_conversation`, `add_chat_message_in_conversation`) | Removing runtime state fields or changing chat query/write signatures |
+| `server.rs` | Conversation fetch + diagnostics APIs (`get_chat_conversation`, `get_chat_conversation_summary`, `list_chat_turns_for_conversation`, `list_chat_turn_tool_calls`) remain available for REST routes | Renaming/removing these query methods or changing return semantics |
 | `memory::mod` | `MemoryBackend` trait and `MemoryDesignVersion` metadata keys remain stable | Changing backend trait signatures or metadata semantics |
 | `memory::archive` | Archive methods serialize/deserialize policy + metrics snapshots without loss | Changing JSON field contracts for policy/snapshot structs |
 | `agent::{journal, concerns}` | DB CRUD accepts/returns these typed records | Breaking type-field compatibility or db string mappings |

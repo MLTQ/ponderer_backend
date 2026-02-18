@@ -1,28 +1,23 @@
 # main.rs
 
 ## Purpose
-Application entry point for Ponderer. Initializes logging, loads configuration, builds skills, creates the agent, spawns its background loop, and launches the egui desktop UI.
+Desktop entry point for the API-only frontend. Initializes logging, resolves backend API connection settings, and launches the egui UI without bootstrapping an in-process backend runtime.
 
 ## Components
 
 ### `main()`
-- **Does**: Orchestrates startup: logging -> config -> skills -> database -> agent -> UI
-- **Interacts with**: `config::AgentConfig`, `database::AgentDatabase`, `memory` module (compiled for backend abstractions), `presence` module (compiled Living Loop foundation types), `agent::Agent`, `skills::Skill`, `skills::graphchan::GraphchanSkill`, `tools::{shell, files, http, memory, skill_bridge, comfy, vision}`, `ui::app::AgentApp`
-- **Rationale**: Single-threaded main launches the agent loop on a separate thread with its own Tokio runtime, keeping the UI on the main thread (required by eframe/egui)
+- **Does**: Orchestrates startup: logging -> fallback config load -> API client creation -> UI launch.
+- **Interacts with**: `api::ApiClient`, `ponderer_backend::config::AgentConfig`, `ui::app::AgentApp`.
+- **Rationale**: Frontend and backend are now hard-separated; this binary is a pure client.
 
 ## Contracts
 
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
-| `agent::Agent` | `Vec<Box<dyn Skill>>`, `AgentConfig`, `flume::Sender` | Changing `Agent::new` signature |
-| `ui::app::AgentApp` | `flume::Receiver`, `Arc<Agent>`, `AgentConfig`, `Option<Arc<AgentDatabase>>` | Changing `AgentApp::new` signature |
-| `skills::graphchan::GraphchanSkill` | Non-empty `config.graphchan_api_url` to be instantiated | Removing the `graphchan_api_url` config field |
-| `database::AgentDatabase` | Valid `config.database_path` (SQLite file) | Changing `AgentDatabase::new` return type |
+| `ui::app::AgentApp` | `AgentApp::new(api_client, fallback_config)` signature | Changing constructor args breaks startup wiring |
+| Backend service | URL/token come from `PONDERER_BACKEND_URL` / `PONDERER_BACKEND_TOKEN` | Changing env names without updating `ApiClient::from_env` |
+| Shared config model | `AgentConfig::load()` remains available for local fallback panel state | Removing config load API |
 
 ## Notes
-- The agent runs on a dedicated OS thread with its own Tokio runtime; the main thread is reserved for the eframe event loop.
-- `flume::unbounded()` channel bridges async agent events to the synchronous UI.
-- The UI database and agent database share the same SQLite file via WAL mode for concurrent access.
-- Memory backend logic is initialized through `AgentDatabase` (currently `kv_v1` default behavior).
-- If the database fails to open, the UI still launches (with `ui_database = None`).
-- Tool registry includes shell/files/http/memory plus skill-bridge + media-capable tools (`graphchan_skill`, `generate_comfy_media`, `post_to_graphchan`, `evaluate_local_image`, `publish_media_to_chat`, `capture_screen`, `capture_camera_snapshot`) for unified agentic runs.
+- Default backend URL is `http://127.0.0.1:8787` when env var is unset.
+- If token env var is missing, frontend still launches but authenticated API calls will fail unless backend auth mode is disabled.

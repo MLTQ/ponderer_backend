@@ -3,8 +3,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::agent::AgentEvent;
-use crate::database::ChatMessage;
+use crate::api::{ChatMessage, FrontendEvent};
 
 const CHAT_TOOL_BLOCK_START: &str = "[tool_calls]";
 const CHAT_TOOL_BLOCK_END: &str = "[/tool_calls]";
@@ -98,7 +97,7 @@ impl ChatMediaCache {
     }
 }
 
-pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
+pub fn render_event_log(ui: &mut egui::Ui, events: &[FrontendEvent]) {
     ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
         if events.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -113,11 +112,11 @@ pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
 
         for event in events {
             match event {
-                AgentEvent::Observation(text) => {
+                FrontendEvent::Observation(text) => {
                     ui.label(RichText::new(text).color(Color32::LIGHT_BLUE));
                     ui.add_space(4.0);
                 }
-                AgentEvent::ReasoningTrace(steps) => {
+                FrontendEvent::ReasoningTrace(steps) => {
                     ui.group(|ui| {
                         ui.label(RichText::new("💭 Reasoning:").strong());
                         for step in steps {
@@ -126,7 +125,7 @@ pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
                     });
                     ui.add_space(6.0);
                 }
-                AgentEvent::ToolCallProgress {
+                FrontendEvent::ToolCallProgress {
                     conversation_id,
                     tool_name,
                     output_preview,
@@ -140,32 +139,32 @@ pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
                     );
                     ui.add_space(4.0);
                 }
-                AgentEvent::ActionTaken { action, result } => {
+                FrontendEvent::ActionTaken { action, result } => {
                     ui.label(
                         RichText::new(format!("✅ {}: {}", action, result)).color(Color32::GREEN),
                     );
                     ui.add_space(4.0);
                 }
-                AgentEvent::OrientationUpdate(orientation) => {
+                FrontendEvent::OrientationUpdate(orientation) => {
                     ui.label(
                         RichText::new(format!(
-                            "🧭 Orientation: disposition={:?}, anomalies={}, salient={}",
+                            "🧭 Orientation: disposition={}, anomalies={}, salient={}",
                             orientation.disposition,
-                            orientation.anomalies.len(),
-                            orientation.salience_map.len()
+                            orientation.anomaly_count,
+                            orientation.salience_count
                         ))
                         .color(Color32::LIGHT_YELLOW),
                     );
                     ui.add_space(4.0);
                 }
-                AgentEvent::JournalWritten(summary) => {
+                FrontendEvent::JournalWritten(summary) => {
                     ui.label(
                         RichText::new(format!("📓 Journal: {}", summary))
                             .color(Color32::LIGHT_GREEN),
                     );
                     ui.add_space(4.0);
                 }
-                AgentEvent::ConcernCreated { id, summary } => {
+                FrontendEvent::ConcernCreated { id, summary } => {
                     ui.label(
                         RichText::new(format!(
                             "🧷 Concern created [{}]: {}",
@@ -176,7 +175,7 @@ pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
                     );
                     ui.add_space(4.0);
                 }
-                AgentEvent::ConcernTouched { id, summary } => {
+                FrontendEvent::ConcernTouched { id, summary } => {
                     ui.label(
                         RichText::new(format!(
                             "🔁 Concern touched [{}]: {}",
@@ -187,14 +186,14 @@ pub fn render_event_log(ui: &mut egui::Ui, events: &[AgentEvent]) {
                     );
                     ui.add_space(4.0);
                 }
-                AgentEvent::Error(e) => {
+                FrontendEvent::Error(e) => {
                     ui.label(RichText::new(format!("❌ Error: {}", e)).color(Color32::RED));
                     ui.add_space(4.0);
                 }
-                AgentEvent::StateChanged(_) => {
+                FrontendEvent::StateChanged(_) => {
                     // State changes are shown in header, not in log
                 }
-                AgentEvent::ChatStreaming { .. } => {
+                FrontendEvent::ChatStreaming { .. } => {
                     // Streaming text is rendered in the chat pane, not activity log.
                 }
             }

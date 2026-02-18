@@ -12,6 +12,13 @@ The "Living Loop" is a fundamental redesign of Ponderer's core loop to transform
 | [LIVING_LOOP_SPEC.md](./LIVING_LOOP_SPEC.md) | Technical specification with code structures |
 | [LIVING_LOOP_STATUS.md](./LIVING_LOOP_STATUS.md) | Implementation status and transition plan |
 
+### Backend Split / API-First
+
+| Document | Purpose |
+|----------|---------|
+| [BACKEND_API_SPEC.md](./BACKEND_API_SPEC.md) | REST/WS/auth/plugin contract for decoupled frontend/backend |
+| [BACKEND_PARITY_VALIDATION.md](./BACKEND_PARITY_VALIDATION.md) | Standalone backend validation matrix and smoke test guidance |
+
 **Key Concepts:**
 - **Three-loop architecture:** Ambient (background), Engaged (foreground), Dream (consolidation)
 - **Orientation engine:** OODA-style situational synthesis

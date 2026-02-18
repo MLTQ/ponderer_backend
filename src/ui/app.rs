@@ -1,21 +1,22 @@
 use eframe::egui;
 use flume::Receiver;
-use std::sync::Arc;
 
 use super::avatar::AvatarSet;
 use super::character::CharacterPanel;
 use super::comfy_settings::ComfySettingsPanel;
 use super::settings::SettingsPanel;
-use crate::agent::{Agent, AgentEvent, AgentVisualState};
+use crate::api::{
+    AgentVisualState, ApiClient, ChatConversation, ChatMessage, ChatTurnPhase, FrontendEvent,
+    DEFAULT_CHAT_CONVERSATION_ID,
+};
 use crate::config::AgentConfig;
-use crate::database::{AgentDatabase, ChatConversation, ChatMessage, DEFAULT_CHAT_CONVERSATION_ID};
 
 const MAX_LIVE_TOOL_PROGRESS_LINES: usize = 200;
 
 pub struct AgentApp {
-    events: Vec<AgentEvent>,
-    event_rx: Receiver<AgentEvent>,
-    agent: Arc<Agent>,
+    events: Vec<FrontendEvent>,
+    event_rx: Receiver<FrontendEvent>,
+    api_client: ApiClient,
     current_state: AgentVisualState,
     user_input: String,
     runtime: tokio::runtime::Runtime,
@@ -24,7 +25,6 @@ pub struct AgentApp {
     comfy_settings_panel: ComfySettingsPanel,
     avatars: Option<AvatarSet>,
     avatars_loaded: bool,
-    database: Option<Arc<AgentDatabase>>,
     conversations: Vec<ChatConversation>,
     active_conversation_id: String,
     chat_history: Vec<ChatMessage>,
@@ -49,28 +49,41 @@ struct LiveToolProgress {
 }
 
 impl AgentApp {
-    pub fn new(
-        event_rx: Receiver<AgentEvent>,
-        agent: Arc<Agent>,
-        config: AgentConfig,
-        database: Option<Arc<AgentDatabase>>,
-    ) -> Self {
+    pub fn new(api_client: ApiClient, fallback_config: AgentConfig) -> Self {
+        let runtime = tokio::runtime::Runtime::new().expect("UI tokio runtime");
+        let (event_tx, event_rx) = flume::unbounded();
+
+        let event_client = api_client.clone();
+        runtime.spawn(async move {
+            event_client.stream_events_forever(event_tx).await;
+        });
+
+        let startup_config = match runtime.block_on(api_client.get_config()) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to load config from backend ({}); using local fallback",
+                    error
+                );
+                fallback_config
+            }
+        };
+
         let mut comfy_settings_panel = ComfySettingsPanel::new();
-        comfy_settings_panel.load_workflow_from_config(&config);
+        comfy_settings_panel.load_workflow_from_config(&startup_config);
 
         let mut app = Self {
             events: Vec::new(),
             event_rx,
-            agent,
+            api_client,
             current_state: AgentVisualState::Idle,
             user_input: String::new(),
-            runtime: tokio::runtime::Runtime::new().unwrap(),
-            settings_panel: SettingsPanel::new(config.clone()),
-            character_panel: CharacterPanel::new(config),
+            runtime,
+            settings_panel: SettingsPanel::new(startup_config.clone()),
+            character_panel: CharacterPanel::new(startup_config),
             comfy_settings_panel,
-            avatars: None, // Will be loaded on first frame when egui context is available
+            avatars: None,
             avatars_loaded: false,
-            database,
             conversations: Vec::new(),
             active_conversation_id: DEFAULT_CHAT_CONVERSATION_ID.to_string(),
             chat_history: Vec::new(),
@@ -80,44 +93,70 @@ impl AgentApp {
             last_chat_refresh: std::time::Instant::now(),
             show_activity_panel: false,
         };
+
+        app.refresh_status();
         app.refresh_conversations();
         app.refresh_chat_history();
         app
     }
 
+    fn push_ui_error(&mut self, message: impl Into<String>) {
+        self.events.push(FrontendEvent::Error(message.into()));
+    }
+
+    fn refresh_status(&mut self) {
+        match self.runtime.block_on(self.api_client.get_agent_status()) {
+            Ok(status) => {
+                self.current_state = status.visual_state;
+            }
+            Err(error) => {
+                tracing::warn!("Failed to refresh backend status: {}", error);
+            }
+        }
+    }
+
     fn refresh_conversations(&mut self) {
-        if let Some(ref db) = self.database {
-            match db.list_chat_conversations(100) {
-                Ok(conversations) => {
-                    self.conversations = conversations;
-                    if self
+        match self
+            .runtime
+            .block_on(self.api_client.list_conversations(100))
+        {
+            Ok(conversations) => {
+                self.conversations = conversations;
+                if self
+                    .conversations
+                    .iter()
+                    .all(|c| c.id != self.active_conversation_id)
+                {
+                    self.active_conversation_id = self
                         .conversations
-                        .iter()
-                        .all(|c| c.id != self.active_conversation_id)
-                    {
-                        self.active_conversation_id = self
-                            .conversations
-                            .first()
-                            .map(|c| c.id.clone())
-                            .unwrap_or_else(|| DEFAULT_CHAT_CONVERSATION_ID.to_string());
-                    }
+                        .first()
+                        .map(|c| c.id.clone())
+                        .unwrap_or_else(|| DEFAULT_CHAT_CONVERSATION_ID.to_string());
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to refresh chat conversations: {}", e);
-                }
+            }
+            Err(error) => {
+                tracing::warn!("Failed to refresh chat conversations: {}", error);
+                self.push_ui_error(format!("Failed to load conversations: {}", error));
             }
         }
     }
 
     fn refresh_chat_history(&mut self) {
-        if let Some(ref db) = self.database {
-            match db.get_chat_history_for_conversation(&self.active_conversation_id, 200) {
-                Ok(history) => {
-                    self.chat_history = history;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to refresh chat history: {}", e);
-                }
+        let conversation_id = self.active_conversation_id.clone();
+        match self
+            .runtime
+            .block_on(self.api_client.list_messages(&conversation_id, 200))
+        {
+            Ok(history) => {
+                self.chat_history = history;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to refresh chat history for {}: {}",
+                    conversation_id,
+                    error
+                );
+                self.push_ui_error(format!("Failed to load chat history: {}", error));
             }
         }
     }
@@ -125,37 +164,56 @@ impl AgentApp {
     fn send_chat_message(&mut self, content: &str) {
         let active_conversation = self.active_conversation_id.clone();
         self.clear_live_tool_progress(&active_conversation);
-        if let Some(ref db) = self.database {
-            match db.add_chat_message_in_conversation(
-                &self.active_conversation_id,
-                "operator",
-                content,
-            ) {
-                Ok(_) => {
-                    tracing::info!("Sent chat message to agent: {}", content);
-                    self.refresh_conversations();
-                    self.refresh_chat_history();
-                }
-                Err(e) => {
-                    tracing::error!("Failed to send chat message: {}", e);
-                }
+
+        match self
+            .runtime
+            .block_on(self.api_client.send_message(&active_conversation, content))
+        {
+            Ok(_message_id) => {
+                tracing::info!("Sent chat message to backend: {}", content);
+                self.refresh_conversations();
+                self.refresh_chat_history();
+            }
+            Err(error) => {
+                tracing::error!("Failed to send chat message: {}", error);
+                self.push_ui_error(format!("Failed to send message: {}", error));
             }
         }
     }
 
     fn create_new_conversation(&mut self) {
-        if let Some(ref db) = self.database {
-            match db.create_chat_conversation(None) {
-                Ok(conversation) => {
-                    self.active_conversation_id = conversation.id;
-                    self.user_input.clear();
-                    self.streaming_chat_preview = None;
-                    self.refresh_conversations();
-                    self.refresh_chat_history();
-                }
-                Err(e) => {
-                    tracing::error!("Failed to create conversation: {}", e);
-                }
+        match self
+            .runtime
+            .block_on(self.api_client.create_conversation(None))
+        {
+            Ok(conversation) => {
+                self.active_conversation_id = conversation.id;
+                self.user_input.clear();
+                self.streaming_chat_preview = None;
+                self.refresh_conversations();
+                self.refresh_chat_history();
+            }
+            Err(error) => {
+                tracing::error!("Failed to create conversation: {}", error);
+                self.push_ui_error(format!("Failed to create conversation: {}", error));
+            }
+        }
+    }
+
+    fn persist_config(&mut self, config: AgentConfig) {
+        match self
+            .runtime
+            .block_on(self.api_client.update_config(&config))
+        {
+            Ok(saved) => {
+                self.settings_panel.config = saved.clone();
+                self.character_panel.config = saved.clone();
+                self.comfy_settings_panel.load_workflow_from_config(&saved);
+                tracing::info!("Config saved through backend API");
+            }
+            Err(error) => {
+                tracing::error!("Failed to persist config via backend API: {}", error);
+                self.push_ui_error(format!("Failed to save settings: {}", error));
             }
         }
     }
@@ -203,11 +261,11 @@ fn conversation_display_label(conversation: &ChatConversation) -> String {
     };
 
     let status_suffix = match conversation.runtime_state {
-        crate::database::ChatTurnPhase::Idle => "",
-        crate::database::ChatTurnPhase::Processing => " · processing",
-        crate::database::ChatTurnPhase::Completed => " · done",
-        crate::database::ChatTurnPhase::AwaitingApproval => " · awaiting input",
-        crate::database::ChatTurnPhase::Failed => " · failed",
+        ChatTurnPhase::Idle => "",
+        ChatTurnPhase::Processing => " · processing",
+        ChatTurnPhase::Completed => " · done",
+        ChatTurnPhase::AwaitingApproval => " · awaiting input",
+        ChatTurnPhase::Failed => " · failed",
     };
 
     if status_suffix.is_empty() {
@@ -219,27 +277,25 @@ fn conversation_display_label(conversation: &ChatConversation) -> String {
 
 impl eframe::App for AgentApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Load avatars on first frame when context is available
         if !self.avatars_loaded {
             let config = self.settings_panel.config.clone();
             self.load_avatars(ctx, &config);
             self.avatars_loaded = true;
         }
 
-        // Periodically refresh chat history
         if self.last_chat_refresh.elapsed() > std::time::Duration::from_secs(2) {
+            self.refresh_status();
             self.refresh_conversations();
             self.refresh_chat_history();
             self.last_chat_refresh = std::time::Instant::now();
         }
 
-        // Poll for new events from agent (non-blocking)
         while let Ok(event) = self.event_rx.try_recv() {
             match &event {
-                AgentEvent::StateChanged(state) => {
+                FrontendEvent::StateChanged(state) => {
                     self.current_state = state.clone();
                 }
-                AgentEvent::ChatStreaming {
+                FrontendEvent::ChatStreaming {
                     conversation_id,
                     content,
                     done,
@@ -260,14 +316,14 @@ impl eframe::App for AgentApp {
                     }
                     continue;
                 }
-                AgentEvent::ToolCallProgress {
+                FrontendEvent::ToolCallProgress {
                     conversation_id,
                     tool_name,
                     output_preview,
                 } => {
                     self.push_live_tool_progress(conversation_id, tool_name, output_preview);
                 }
-                AgentEvent::ActionTaken { action, .. } if action.contains("operator") => {
+                FrontendEvent::ActionTaken { action, .. } if action.contains("operator") => {
                     self.refresh_conversations();
                     self.refresh_chat_history();
                     self.streaming_chat_preview = None;
@@ -293,7 +349,6 @@ impl eframe::App for AgentApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Header with agent sprite
             ui.horizontal(|ui| {
                 super::sprite::render_agent_sprite(ui, &self.current_state, self.avatars.as_mut());
                 ui.vertical(|ui| {
@@ -304,10 +359,19 @@ impl eframe::App for AgentApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let pause_text = "⏸ Pause";
                     if ui.button(pause_text).clicked() {
-                        let agent = self.agent.clone();
-                        self.runtime.spawn(async move {
-                            agent.toggle_pause().await;
-                        });
+                        match self.runtime.block_on(self.api_client.toggle_pause()) {
+                            Ok(paused) => {
+                                self.current_state = if paused {
+                                    AgentVisualState::Paused
+                                } else {
+                                    AgentVisualState::Idle
+                                };
+                            }
+                            Err(error) => {
+                                tracing::error!("Failed to toggle pause: {}", error);
+                                self.push_ui_error(format!("Failed to toggle pause: {}", error));
+                            }
+                        }
                     }
 
                     if ui.button("⚙ Settings").clicked() {
@@ -322,7 +386,6 @@ impl eframe::App for AgentApp {
                         self.comfy_settings_panel.show = true;
                     }
 
-                    // Toggle secondary activity panel
                     let activity_btn_text = if self.show_activity_panel {
                         "📋 Hide Activity"
                     } else {
@@ -369,7 +432,6 @@ impl eframe::App for AgentApp {
             });
             ui.add_space(6.0);
 
-            // Chat is now the primary interaction surface.
             let active_streaming_preview = self
                 .streaming_chat_preview
                 .as_ref()
@@ -471,7 +533,6 @@ impl eframe::App for AgentApp {
             );
             ui.add_space(4.0);
 
-            // Multi-line chat input
             ui.horizontal(|ui| {
                 ui.label("💬");
                 let response = ui.add_sized(
@@ -500,60 +561,22 @@ impl eframe::App for AgentApp {
             });
         });
 
-        // Render settings panel
         if let Some(new_config) = self.settings_panel.render(ctx) {
-            // User saved new config - persist it to disk
-            if let Err(e) = new_config.save() {
-                tracing::error!("Failed to save config: {}", e);
-            } else {
-                tracing::info!("Config saved successfully");
-                // Reload agent with new config immediately
-                let agent = self.agent.clone();
-                let config_clone = new_config.clone();
-                self.runtime.spawn(async move {
-                    agent.reload_config(config_clone).await;
-                });
-            }
+            self.persist_config(new_config);
         }
 
-        // Render character panel
         if let Some(new_config) = self.character_panel.render(ctx) {
-            // User saved new character - persist it to disk
-            if let Err(e) = new_config.save() {
-                tracing::error!("Failed to save config: {}", e);
-            } else {
-                tracing::info!("Character saved successfully");
-                // Update the settings panel with the new config too
-                self.settings_panel.config = new_config.clone();
-                // Reload agent with new config immediately
-                let agent = self.agent.clone();
-                let config_clone = new_config;
-                self.runtime.spawn(async move {
-                    agent.reload_config(config_clone).await;
-                });
-            }
+            self.persist_config(new_config);
         }
 
-        // Render ComfyUI workflow panel
         if self
             .comfy_settings_panel
             .render(ctx, &mut self.settings_panel.config)
         {
-            // User saved workflow settings
-            if let Err(e) = self.settings_panel.config.save() {
-                tracing::error!("Failed to save config: {}", e);
-            } else {
-                tracing::info!("Workflow settings saved successfully");
-                // Reload agent with new config immediately
-                let agent = self.agent.clone();
-                let config_clone = self.settings_panel.config.clone();
-                self.runtime.spawn(async move {
-                    agent.reload_config(config_clone).await;
-                });
-            }
+            let updated = self.settings_panel.config.clone();
+            self.persist_config(updated);
         }
 
-        // Request repaint for smooth updates
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }

@@ -399,10 +399,21 @@ impl Default for AgentConfig {
 impl AgentConfig {
     /// Get the directory containing the running executable.
     fn get_base_dir() -> PathBuf {
-        std::env::current_exe()
+        let exe_dir = std::env::current_exe()
             .ok()
-            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
+        if let Some(dir) = exe_dir {
+            if dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.eq_ignore_ascii_case("deps"))
+                .unwrap_or(false)
+            {
+                return dir.parent().map(|p| p.to_path_buf()).unwrap_or(dir);
+            }
+            return dir;
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 
     /// Get the path to the primary config file (relative to executable directory).

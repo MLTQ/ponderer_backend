@@ -2395,6 +2395,73 @@ impl AgentDatabase {
         Ok(conversations)
     }
 
+    /// Fetch one conversation by ID.
+    pub fn get_chat_conversation(&self, conversation_id: &str) -> Result<Option<ChatConversation>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            r#"SELECT
+                   c.id,
+                   c.session_id,
+                   c.title,
+                   c.created_at,
+                   c.updated_at,
+                   c.runtime_state,
+                   c.active_turn_id,
+                   COUNT(m.id) as message_count,
+                   MAX(m.created_at) as last_message_at
+               FROM chat_conversations c
+               LEFT JOIN chat_messages m ON m.conversation_id = c.id
+               WHERE c.id = ?1
+               GROUP BY c.id
+               LIMIT 1"#,
+        )?;
+
+        let mut rows = stmt.query([conversation_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+
+        let created_at_str: String = row.get(3)?;
+        let updated_at_str: String = row.get(4)?;
+        let runtime_state_raw: String = row.get(5)?;
+        let active_turn_id: Option<String> = row.get(6)?;
+        let message_count = row.get::<_, i64>(7)? as usize;
+        let last_message_at_str: Option<String> = row.get(8)?;
+
+        Ok(Some(ChatConversation {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            title: row.get(2)?,
+            created_at: created_at_str.parse().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+            updated_at: updated_at_str.parse().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+            runtime_state: ChatTurnPhase::from_db(&runtime_state_raw),
+            active_turn_id,
+            message_count,
+            last_message_at: match last_message_at_str {
+                Some(v) => Some(v.parse().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                None => None,
+            },
+        }))
+    }
+
     /// Start a new persisted turn for a conversation.
     pub fn begin_chat_turn(
         &self,

@@ -44,7 +44,8 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 | TOML file | Serde field names and aliases (`agent_name` -> `username`, `check_interval_seconds` -> `poll_interval_secs`) | Removing serde aliases breaks existing config files |
 
 ## Notes
-- Config save path targets the executable directory (`current_exe().parent()`); load discovery scans executable dir, its parent (for Cargo `target/*/deps` runs), and the working directory, then picks the newest valid file.
+- Config save path targets an executable-root directory; for Cargo `target/*/deps` runs, the `deps` parent is used so state lives in `target/{debug|release}` instead of hash subfolders.
+- Load discovery scans that executable-root directory plus working directory candidates and picks the newest valid file.
 - When both `ponderer_config.toml` and `agent_config.toml` exist, the newest file wins to avoid stale-file precedence surprises.
 - `database_path` is normalized to an executable-directory absolute runtime path on load, and converted back to a portable relative path when saving TOML.
 - Default LLM is `llama3.2` at `localhost:11434` (Ollama).
