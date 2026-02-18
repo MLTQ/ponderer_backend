@@ -1,8 +1,11 @@
-use chrono::{Datelike, Local, Timelike, Weekday};
+use chrono::{Datelike, Local, Timelike, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+static LOCAL_TIME_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Foundation-only presence monitor.
 ///
@@ -283,12 +286,28 @@ pub struct TimeContext {
 
 impl TimeContext {
     pub fn now() -> Self {
-        let now = Local::now();
-        let hour = now.hour() as u8;
-        let minute = now.minute() as u8;
-        let weekday = now.weekday();
-        let is_weekend = matches!(weekday, Weekday::Sat | Weekday::Sun);
+        let components = std::panic::catch_unwind(|| {
+            let now = Local::now();
+            (now.hour() as u8, now.minute() as u8, now.weekday())
+        });
 
+        let (hour, minute, weekday) = match components {
+            Ok(values) => values,
+            Err(_) => {
+                if !LOCAL_TIME_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "Local clock sampling panicked; falling back to UTC time context"
+                    );
+                }
+                let now = Utc::now();
+                (now.hour() as u8, now.minute() as u8, now.weekday())
+            }
+        };
+        Self::from_components(hour, minute, weekday)
+    }
+
+    fn from_components(hour: u8, minute: u8, weekday: Weekday) -> Self {
+        let is_weekend = matches!(weekday, Weekday::Sat | Weekday::Sun);
         Self {
             local_hour: hour,
             local_minute: minute,

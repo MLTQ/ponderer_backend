@@ -29,3 +29,4 @@ Provides media-oriented tools for agentic chat workflows: generating assets thro
 - `generate_comfy_media` loads current config on each execution, so saved settings updates apply without re-registering tools.
 - Graphchan media handling is additive: body text is always posted; media can be appended as local references or data URIs.
 - Data URI embeds are capped to avoid oversized posts.
+- Graphchan-posting HTTP client construction now uses shared panic-safe client setup (`http_client::build_http_client`).

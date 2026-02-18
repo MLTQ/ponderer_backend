@@ -162,6 +162,14 @@ pub struct AgentConfig {
     pub disable_chat_turn_limit: bool,
     #[serde(default)]
     pub disable_background_subtask_turn_limit: bool,
+    #[serde(default = "default_loop_heat_threshold")]
+    pub loop_heat_threshold: u32,
+    #[serde(default = "default_loop_similarity_threshold")]
+    pub loop_similarity_threshold: f32,
+    #[serde(default = "default_loop_signature_window")]
+    pub loop_signature_window: u32,
+    #[serde(default = "default_loop_heat_cooldown")]
+    pub loop_heat_cooldown: u32,
     #[serde(default)]
     pub enable_ambient_loop: bool,
     #[serde(default = "default_ambient_min_interval_secs")]
@@ -299,6 +307,22 @@ fn default_max_background_subtask_turns() -> u32 {
     8
 }
 
+fn default_loop_heat_threshold() -> u32 {
+    20
+}
+
+fn default_loop_similarity_threshold() -> f32 {
+    0.92
+}
+
+fn default_loop_signature_window() -> u32 {
+    24
+}
+
+fn default_loop_heat_cooldown() -> u32 {
+    1
+}
+
 fn default_ambient_min_interval_secs() -> u64 {
     30
 }
@@ -351,6 +375,10 @@ impl Default for AgentConfig {
             max_background_subtask_turns: default_max_background_subtask_turns(),
             disable_chat_turn_limit: true,
             disable_background_subtask_turn_limit: true,
+            loop_heat_threshold: default_loop_heat_threshold(),
+            loop_similarity_threshold: default_loop_similarity_threshold(),
+            loop_signature_window: default_loop_signature_window(),
+            loop_heat_cooldown: default_loop_heat_cooldown(),
             enable_ambient_loop: false,
             ambient_min_interval_secs: default_ambient_min_interval_secs(),
             enable_journal: true,
@@ -521,6 +549,32 @@ impl AgentConfig {
                 || disabled.eq_ignore_ascii_case("true")
                 || disabled.eq_ignore_ascii_case("yes");
             config.disable_background_subtask_turn_limit = disabled;
+        }
+
+        if let Ok(raw) = env::var("AGENT_LOOP_HEAT_THRESHOLD") {
+            if let Ok(v) = raw.parse::<u32>() {
+                config.loop_heat_threshold = v.max(1);
+            }
+        }
+
+        if let Ok(raw) = env::var("AGENT_LOOP_SIMILARITY_THRESHOLD") {
+            if let Ok(v) = raw.parse::<f32>() {
+                if v.is_finite() {
+                    config.loop_similarity_threshold = v.clamp(0.5, 0.9999);
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("AGENT_LOOP_SIGNATURE_WINDOW") {
+            if let Ok(v) = raw.parse::<u32>() {
+                config.loop_signature_window = v.max(2);
+            }
+        }
+
+        if let Ok(raw) = env::var("AGENT_LOOP_HEAT_COOLDOWN") {
+            if let Ok(v) = raw.parse::<u32>() {
+                config.loop_heat_cooldown = v.max(1);
+            }
         }
 
         if let Ok(enabled) = env::var("AGENT_ENABLE_AMBIENT_LOOP") {

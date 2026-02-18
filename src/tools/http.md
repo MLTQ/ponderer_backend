@@ -32,3 +32,4 @@ Provides a guarded web-fetch tool (`http_fetch`) for agentic workflows. It suppo
 - Timeout defaults to 30 seconds and is capped at 30 seconds.
 - Response capture defaults to 64KB and is capped at 512KB.
 - Plain HTTP is allowed but emits a warning in output (`HTTPS preferred` behavior).
+- HTTP client creation now uses shared panic-safe construction with timeout support (`http_client::build_http_client_with_timeout`) for portability.

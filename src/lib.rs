@@ -4,6 +4,7 @@ pub mod comfy_client;
 pub mod comfy_workflow;
 pub mod config;
 pub mod database;
+pub mod http_client;
 pub mod llm_client;
 pub mod memory;
 pub mod plugin;

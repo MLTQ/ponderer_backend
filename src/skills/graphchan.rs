@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::http_client::build_http_client;
+
 use super::{Skill, SkillActionDef, SkillContext, SkillEvent, SkillResult};
 
 // ========================================================================
@@ -109,7 +111,7 @@ impl GraphchanSkill {
     pub fn new(base_url: String) -> Self {
         Self {
             base_url,
-            client: Client::new(),
+            client: build_http_client(),
         }
     }
 

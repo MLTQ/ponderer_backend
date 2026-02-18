@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use crate::http_client::build_http_client_with_timeout;
+
 use super::safety::{detect_leaks, SafetyVerdict};
 use super::{Tool, ToolCategory, ToolContext, ToolOutput};
 
@@ -174,10 +176,7 @@ impl Tool for HttpFetchTool {
             return Ok(ToolOutput::Error(reason));
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()
-            .context("Failed to create HTTP client")?;
+        let client = build_http_client_with_timeout(Some(Duration::from_secs(timeout_secs)));
 
         let mut req = client.request(method.clone(), url.clone());
         for (key, value) in &headers {

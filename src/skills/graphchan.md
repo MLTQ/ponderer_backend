@@ -26,3 +26,4 @@ Implements the Graphchan integration: polling recent posts into `SkillEvent`s an
 ## Notes
 - `reply` now resolves `thread_id` from recent posts when omitted, using `post_id`/`event_id`.
 - Graphchan post metadata includes agent attribution (`name` + `client=ponderer`).
+- HTTP client creation now uses shared panic-safe construction (`http_client::build_http_client`) for better portability in headless/macOS contexts.

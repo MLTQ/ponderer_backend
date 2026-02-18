@@ -98,6 +98,11 @@ struct PauseStateResponse {
     paused: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct StopResponse {
+    stopped: bool,
+}
+
 pub async fn serve_backend(
     runtime: BackendRuntime,
     event_rx: flume::Receiver<AgentEvent>,
@@ -131,7 +136,10 @@ pub async fn serve_backend(
         .route("/health", get(health))
         .route("/config", get(get_config).put(update_config))
         .route("/plugins", get(list_plugins))
-        .route("/conversations", get(list_conversations).post(create_conversation))
+        .route(
+            "/conversations",
+            get(list_conversations).post(create_conversation),
+        )
         .route("/conversations/:id", get(get_conversation))
         .route("/conversations/:id/summary", get(get_conversation_summary))
         .route(
@@ -143,9 +151,13 @@ pub async fn serve_backend(
         .route("/agent/status", get(get_agent_status))
         .route("/agent/pause", put(set_pause))
         .route("/agent/toggle-pause", post(toggle_pause))
+        .route("/agent/stop", post(stop_agent_turn))
         .route("/ws/events", get(ws_events_route))
         .with_state(state.clone())
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     let app = Router::new().nest("/v1", protected);
 
@@ -173,8 +185,12 @@ fn spawn_event_bridge(
 
 fn map_agent_event(event: AgentEvent) -> ApiEventEnvelope {
     match event {
-        AgentEvent::StateChanged(state) => envelope("state_changed", serde_json::json!({ "state": state })),
-        AgentEvent::Observation(text) => envelope("observation", serde_json::json!({ "text": text })),
+        AgentEvent::StateChanged(state) => {
+            envelope("state_changed", serde_json::json!({ "state": state }))
+        }
+        AgentEvent::Observation(text) => {
+            envelope("observation", serde_json::json!({ "text": text }))
+        }
         AgentEvent::ReasoningTrace(steps) => {
             envelope("reasoning_trace", serde_json::json!({ "steps": steps }))
         }
@@ -358,7 +374,10 @@ async fn get_conversation(
         .map_err(internal_error)?
     {
         Some(conversation) => Ok(Json(conversation)),
-        None => Err(not_found(format!("conversation '{}' not found", conversation_id))),
+        None => Err(not_found(format!(
+            "conversation '{}' not found",
+            conversation_id
+        ))),
     }
 }
 
@@ -408,7 +427,10 @@ async fn send_operator_message(
 
     let content = body.content.trim();
     if content.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "content cannot be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "content cannot be empty".to_string(),
+        ));
     }
 
     let message_id = state
@@ -469,6 +491,13 @@ async fn toggle_pause(
     Ok(Json(PauseStateResponse {
         paused: status.paused,
     }))
+}
+
+async fn stop_agent_turn(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<StopResponse>, (StatusCode, String)> {
+    state.agent.request_stop().await;
+    Ok(Json(StopResponse { stopped: true }))
 }
 
 async fn ws_events_route(

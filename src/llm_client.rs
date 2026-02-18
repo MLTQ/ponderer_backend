@@ -5,6 +5,8 @@ use image::imageops::FilterType;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::http_client::build_http_client;
+
 const VISION_MAX_DIMENSION: u32 = 1280;
 const VISION_MAX_BYTES_MULTIMODAL: usize = 512 * 1024;
 const VISION_MAX_BYTES_INLINE_FALLBACK: usize = 64 * 1024;
@@ -55,7 +57,7 @@ impl LlmClient {
             api_url,
             api_key,
             model,
-            client: reqwest::Client::new(),
+            client: build_http_client(),
         }
     }
 

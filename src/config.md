@@ -1,7 +1,7 @@
 # config.rs
 
 ## Purpose
-Defines all configuration for the Ponderer agent, including LLM connection, identity, polling behavior, agentic loop iteration controls, private-chat autonomous turn budgets (foreground + background) with optional unbounded mode, three-loop living-loop toggles (ambient/journal/concerns/dream), autonomous heartbeat scheduling, explicit per-loop tool capability profiles, image generation (ComfyUI), screen/camera capture privacy gating, character card fields, and self-reflection settings. Supports loading from TOML files with environment variable fallback.
+Defines all configuration for the Ponderer agent, including LLM connection, identity, polling behavior, agentic loop iteration controls, private-chat autonomous turn budgets (foreground + background) with optional unbounded mode, deterministic loop-breaker heat controls (similarity/threshold/window/cooldown), three-loop living-loop toggles (ambient/journal/concerns/dream), autonomous heartbeat scheduling, explicit per-loop tool capability profiles, image generation (ComfyUI), screen/camera capture privacy gating, character card fields, and self-reflection settings. Supports loading from TOML files with environment variable fallback.
 
 ## Components
 
@@ -18,7 +18,7 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - **Interacts with**: UI settings panel for persisting changes
 
 ### `AgentConfig::from_env()`
-- **Does**: Populates config from environment variables (`GRAPHCHAN_API_URL`, `LLM_API_URL`, `LLM_MODEL`, `LLM_API_KEY`, `AGENT_CHECK_INTERVAL`, `AGENT_MAX_TOOL_ITERATIONS`, `AGENT_DISABLE_TOOL_ITERATION_LIMIT`, `AGENT_MAX_CHAT_AUTONOMOUS_TURNS`, `AGENT_MAX_BACKGROUND_SUBTASK_TURNS`, `AGENT_DISABLE_CHAT_TURN_LIMIT`, `AGENT_DISABLE_BACKGROUND_SUBTASK_TURN_LIMIT`, `AGENT_ENABLE_AMBIENT_LOOP`, `AGENT_AMBIENT_MIN_INTERVAL_SECS`, `AGENT_ENABLE_JOURNAL`, `AGENT_JOURNAL_MIN_INTERVAL_SECS`, `AGENT_ENABLE_CONCERNS`, `AGENT_ENABLE_DREAM_CYCLE`, `AGENT_DREAM_MIN_INTERVAL_SECS`, `AGENT_ENABLE_HEARTBEAT`, `AGENT_HEARTBEAT_INTERVAL_MINS`, `AGENT_HEARTBEAT_CHECKLIST_PATH`, `AGENT_ENABLE_MEMORY_EVOLUTION`, `AGENT_MEMORY_EVOLUTION_INTERVAL_HOURS`, `AGENT_MEMORY_TRACE_SET_PATH`, `AGENT_ENABLE_SCREEN_CAPTURE`, `AGENT_ENABLE_CAMERA_CAPTURE`, `AGENT_NAME`)
+- **Does**: Populates config from environment variables (`GRAPHCHAN_API_URL`, `LLM_API_URL`, `LLM_MODEL`, `LLM_API_KEY`, `AGENT_CHECK_INTERVAL`, `AGENT_MAX_TOOL_ITERATIONS`, `AGENT_DISABLE_TOOL_ITERATION_LIMIT`, `AGENT_MAX_CHAT_AUTONOMOUS_TURNS`, `AGENT_MAX_BACKGROUND_SUBTASK_TURNS`, `AGENT_DISABLE_CHAT_TURN_LIMIT`, `AGENT_DISABLE_BACKGROUND_SUBTASK_TURN_LIMIT`, `AGENT_LOOP_HEAT_THRESHOLD`, `AGENT_LOOP_SIMILARITY_THRESHOLD`, `AGENT_LOOP_SIGNATURE_WINDOW`, `AGENT_LOOP_HEAT_COOLDOWN`, `AGENT_ENABLE_AMBIENT_LOOP`, `AGENT_AMBIENT_MIN_INTERVAL_SECS`, `AGENT_ENABLE_JOURNAL`, `AGENT_JOURNAL_MIN_INTERVAL_SECS`, `AGENT_ENABLE_CONCERNS`, `AGENT_ENABLE_DREAM_CYCLE`, `AGENT_DREAM_MIN_INTERVAL_SECS`, `AGENT_ENABLE_HEARTBEAT`, `AGENT_HEARTBEAT_INTERVAL_MINS`, `AGENT_HEARTBEAT_CHECKLIST_PATH`, `AGENT_ENABLE_MEMORY_EVOLUTION`, `AGENT_MEMORY_EVOLUTION_INTERVAL_HOURS`, `AGENT_MEMORY_TRACE_SET_PATH`, `AGENT_ENABLE_SCREEN_CAPTURE`, `AGENT_ENABLE_CAMERA_CAPTURE`, `AGENT_NAME`)
 - **Rationale**: Legacy support for env-var-only configuration
 
 ### `ComfyUIConfig`
@@ -38,7 +38,7 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
 | `main.rs` | `AgentConfig::load()` returns valid config | Changing `load()` return type |
-| `agent::Agent` | Fields: `llm_api_url`, `llm_model`, `llm_api_key`, `system_prompt`, `poll_interval_secs`, `max_tool_iterations`, `disable_tool_iteration_limit`, `max_chat_autonomous_turns`, `max_background_subtask_turns`, `disable_chat_turn_limit`, `disable_background_subtask_turn_limit`, `enable_ambient_loop`, `ambient_min_interval_secs`, `enable_journal`, `journal_min_interval_secs`, `enable_concerns`, `enable_dream_cycle`, `dream_min_interval_secs`, `enable_heartbeat`, `heartbeat_interval_mins`, `heartbeat_checklist_path`, `enable_memory_evolution`, `memory_evolution_interval_hours`, `memory_eval_trace_set_path`, `capability_profiles`, `enable_self_reflection`, `enable_image_generation`, `enable_screen_capture_in_loop`, `enable_camera_capture_tool`, `guiding_principles` | Renaming/removing any of these fields |
+| `agent::Agent` | Fields: `llm_api_url`, `llm_model`, `llm_api_key`, `system_prompt`, `poll_interval_secs`, `max_tool_iterations`, `disable_tool_iteration_limit`, `max_chat_autonomous_turns`, `max_background_subtask_turns`, `disable_chat_turn_limit`, `disable_background_subtask_turn_limit`, `loop_heat_threshold`, `loop_similarity_threshold`, `loop_signature_window`, `loop_heat_cooldown`, `enable_ambient_loop`, `ambient_min_interval_secs`, `enable_journal`, `journal_min_interval_secs`, `enable_concerns`, `enable_dream_cycle`, `dream_min_interval_secs`, `enable_heartbeat`, `heartbeat_interval_mins`, `heartbeat_checklist_path`, `enable_memory_evolution`, `memory_evolution_interval_hours`, `memory_eval_trace_set_path`, `capability_profiles`, `enable_self_reflection`, `enable_image_generation`, `enable_screen_capture_in_loop`, `enable_camera_capture_tool`, `guiding_principles` | Renaming/removing any of these fields |
 | `tools/vision.rs` | `enable_screen_capture_in_loop` and `enable_camera_capture_tool` must be present and default false | Removing/renaming these privacy gate fields |
 | `comfy_client.rs` | `comfyui.api_url` is a valid HTTP URL | Changing `ComfyUIConfig` structure |
 | TOML file | Serde field names and aliases (`agent_name` -> `username`, `check_interval_seconds` -> `poll_interval_secs`) | Removing serde aliases breaks existing config files |
@@ -53,6 +53,7 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - Heartbeat defaults: disabled, 30-minute interval, checklist path `HEARTBEAT.md`.
 - Agentic loop defaults: max 10 tool-calling iterations per turn, with optional config to disable the limit entirely.
 - Private-chat turn defaults: model-decided continuation (`disable_chat_turn_limit=true`, `disable_background_subtask_turn_limit=true`). Optional safety caps remain configurable at 4 foreground turns and 8 background turns when re-enabled.
+- Loop-breaker defaults: `loop_heat_threshold=20`, `loop_similarity_threshold=0.92`, `loop_signature_window=24`, `loop_heat_cooldown=1`.
 - Memory evolution defaults: disabled, 24-hour interval, built-in replay trace set.
 - Capability profile overrides default to empty, so loop policies fall back to code-defined defaults.
 - Screen and camera capture tools default to disabled and must be explicitly enabled in settings.

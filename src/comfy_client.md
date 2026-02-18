@@ -52,3 +52,4 @@ HTTP client for the ComfyUI REST API. Queues workflows, polls for completion, an
 - Downloaded assets are saved to the current working directory as unique `generated_*` files -- not a configurable output path.
 - Polling interval is hardcoded at 1 second.
 - No retry logic on transient failures; a single HTTP error aborts the operation.
+- HTTP client construction now goes through `http_client::build_http_client` to avoid host-OS proxy-discovery panics during startup/runtime.

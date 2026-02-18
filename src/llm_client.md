@@ -52,3 +52,4 @@ HTTP client for OpenAI-compatible chat completion APIs (Ollama, LM Studio, vLLM,
 - API key is sent as `Bearer` token only when non-empty (local models like Ollama need no key).
 - Chat endpoint normalization accepts base URL forms like `http://host:port`, `http://host:port/v1`, or full `.../v1/chat/completions`.
 - JSON extraction now tolerates markdown-wrapped ` ```json ... ``` ` payloads and quoted JSON payloads that some providers emit.
+- HTTP client initialization now uses shared panic-safe construction from `http_client.rs`; default mode avoids system proxy discovery (`no_proxy`) for portability, with optional `PONDERER_ENABLE_SYSTEM_PROXY=1` override.

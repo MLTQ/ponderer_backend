@@ -14,7 +14,7 @@ Defines the Living Loop presence sampler. `PresenceMonitor` gathers low-level sy
 - **Interacts with**: Future orientation synthesis inputs
 
 ### `TimeContext::now`
-- **Does**: Derives coarse temporal flags (weekend, late-night, deep-night, work-hours) from local clock
+- **Does**: Derives coarse temporal flags (weekend, late-night, deep-night, work-hours) from local clock, with panic-safe fallback to UTC components when local clock APIs fail on host OS
 - **Interacts with**: Future rhythm/disposition logic
 
 ### `SystemLoad` / `InterestingProcess` / `ProcessCategory`
@@ -37,3 +37,4 @@ Defines the Living Loop presence sampler. `PresenceMonitor` gathers low-level sy
 - Process and load sampling use shell probes (`ps`, `sysctl`/`nproc`) so phase-2 works without adding non-cached runtime dependencies.
 - GPU metrics are opportunistic via `nvidia-smi`; missing command or unsupported hardware yields `None` values.
 - Process categorization uses keyword heuristics and can be refined in later phases.
+- Local time sampling now guards against platform panic edge-cases (observed in some macOS/headless contexts) and degrades to UTC-based time flags rather than crashing the backend.

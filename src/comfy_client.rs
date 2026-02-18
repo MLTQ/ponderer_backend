@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::sleep;
 
+use crate::http_client::build_http_client;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct QueuePromptRequest {
     pub prompt: serde_json::Value,
@@ -71,7 +73,7 @@ impl ComfyUIClient {
     pub fn new(api_url: String) -> Self {
         Self {
             api_url,
-            client: Client::new(),
+            client: build_http_client(),
         }
     }
 

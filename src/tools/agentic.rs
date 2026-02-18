@@ -9,7 +9,10 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use crate::http_client::build_http_client;
 
 use super::safety;
 use super::{ToolCall, ToolContext, ToolDef, ToolOutput, ToolRegistry};
@@ -29,6 +32,11 @@ pub struct AgenticConfig {
     pub temperature: f32,
     /// Max tokens per LLM response
     pub max_tokens: u32,
+    /// Shared generation counter used to cancel in-flight loops.
+    /// If current value differs from `start_generation`, loop exits early.
+    pub cancel_generation: Option<Arc<AtomicU64>>,
+    /// Generation snapshot captured at loop start.
+    pub start_generation: u64,
 }
 
 impl Default for AgenticConfig {
@@ -40,6 +48,8 @@ impl Default for AgenticConfig {
             api_key: None,
             temperature: 0.7,
             max_tokens: 4096,
+            cancel_generation: None,
+            start_generation: 0,
         }
     }
 }
@@ -106,7 +116,34 @@ impl AgenticLoop {
         Self {
             config,
             registry,
-            client: reqwest::Client::new(),
+            client: build_http_client(),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.config
+            .cancel_generation
+            .as_ref()
+            .map(|generation| generation.load(Ordering::SeqCst) != self.config.start_generation)
+            .unwrap_or(false)
+    }
+
+    fn cancelled_result(&self, iterations: usize, tool_calls_made: Vec<ToolCallRecord>) -> AgenticResult {
+        AgenticResult {
+            response: Some("Stopped current turn at operator request.".to_string()),
+            thinking_blocks: Vec::new(),
+            tool_calls_made,
+            iterations,
+            hit_limit: false,
+        }
+    }
+
+    fn cancelled_message(&self) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Some("Stopped current turn at operator request.".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -212,6 +249,10 @@ impl AgenticLoop {
         let mut iterations = 0;
 
         loop {
+            if self.is_cancelled() {
+                tracing::info!("Agentic loop cancelled by operator request");
+                return Ok(self.cancelled_result(iterations, tool_calls_made));
+            }
             iterations += 1;
 
             if let Some(max_iterations) = self.config.max_iterations {
@@ -250,6 +291,10 @@ impl AgenticLoop {
 
                     // Execute each tool call
                     for tc in tool_calls {
+                        if self.is_cancelled() {
+                            tracing::info!("Agentic loop cancelled before tool execution");
+                            return Ok(self.cancelled_result(iterations, tool_calls_made));
+                        }
                         let arguments: serde_json::Value =
                             serde_json::from_str(&tc.function.arguments).unwrap_or_else(|e| {
                                 tracing::warn!("Failed to parse tool arguments as JSON: {}", e);
@@ -399,6 +444,9 @@ impl AgenticLoop {
         messages: &[Message],
         tool_defs: &[ToolDef],
     ) -> Result<Message> {
+        if self.is_cancelled() {
+            return Ok(self.cancelled_message());
+        }
         let url = format!("{}/chat/completions", self.config.api_url);
 
         let mut body = serde_json::json!({
@@ -420,6 +468,9 @@ impl AgenticLoop {
         }
 
         let response = req.send().await.context("Failed to send LLM request")?;
+        if self.is_cancelled() {
+            return Ok(self.cancelled_message());
+        }
 
         if !response.status().is_success() {
             let status = response.status();
@@ -469,6 +520,9 @@ impl AgenticLoop {
             arguments: String,
         }
 
+        if self.is_cancelled() {
+            return Ok(self.cancelled_message());
+        }
         let url = format!("{}/chat/completions", self.config.api_url);
 
         let mut body = serde_json::json!({
@@ -492,6 +546,9 @@ impl AgenticLoop {
             .send()
             .await
             .context("Failed to send streaming LLM request")?;
+        if self.is_cancelled() {
+            return Ok(self.cancelled_message());
+        }
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -508,6 +565,12 @@ impl AgenticLoop {
             .await
             .context("Failed reading streaming chunk")?
         {
+            if self.is_cancelled() {
+                if let Some(callback) = on_text_stream {
+                    callback("", true);
+                }
+                return Ok(self.cancelled_message());
+            }
             line_buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(newline_idx) = line_buffer.find('\n') {

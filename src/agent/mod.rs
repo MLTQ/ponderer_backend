@@ -11,10 +11,10 @@ use anyhow::Result;
 use chrono::{Duration as ChronoDuration, Utc};
 use flume::Sender;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
@@ -151,6 +151,7 @@ pub struct Agent {
     presence_monitor: Arc<Mutex<PresenceMonitor>>,
     last_orientation_signature: Arc<RwLock<Option<String>>>,
     last_orientation: Arc<RwLock<Option<Orientation>>>,
+    stop_generation: Arc<AtomicU64>,
     background_subtasks:
         Arc<Mutex<HashMap<String, tokio::task::JoinHandle<BackgroundSubtaskResult>>>>,
 }
@@ -249,6 +250,7 @@ impl Agent {
             presence_monitor: Arc::new(Mutex::new(PresenceMonitor::new())),
             last_orientation_signature: Arc::new(RwLock::new(None)),
             last_orientation: Arc::new(RwLock::new(None)),
+            stop_generation: Arc::new(AtomicU64::new(0)),
             background_subtasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -371,6 +373,39 @@ impl Agent {
             actions_this_hour: state.actions_this_hour,
             last_action_time: state.last_action_time,
         }
+    }
+
+    pub async fn request_stop(&self) {
+        let generation = self.stop_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let aborted_conversations: Vec<String> = {
+            let mut tasks = self.background_subtasks.lock().await;
+            let ids = tasks.keys().cloned().collect::<Vec<_>>();
+            for handle in tasks.values() {
+                handle.abort();
+            }
+            tasks.clear();
+            ids
+        };
+
+        for conversation_id in &aborted_conversations {
+            let _ = self.event_tx.send(AgentEvent::ChatStreaming {
+                conversation_id: conversation_id.clone(),
+                content: String::new(),
+                done: true,
+            });
+        }
+
+        self.emit(AgentEvent::ActionTaken {
+            action: "Stop requested by operator".to_string(),
+            result: format!(
+                "Canceled loop generation {} and aborted {} background subtask(s).",
+                generation,
+                aborted_conversations.len()
+            ),
+        })
+        .await;
+        self.set_state(AgentVisualState::Idle).await;
     }
 
     async fn emit(&self, event: AgentEvent) {
@@ -665,6 +700,8 @@ impl Agent {
             api_key: llm_api_key,
             temperature: 0.2,
             max_tokens: 2048,
+            cancel_generation: Some(self.stop_generation.clone()),
+            start_generation: self.stop_generation.load(Ordering::SeqCst),
         };
         let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
 
@@ -1622,6 +1659,8 @@ impl Agent {
             api_key: llm_api_key,
             temperature: 0.35,
             max_tokens: 1536,
+            cancel_generation: Some(self.stop_generation.clone()),
+            start_generation: self.stop_generation.load(Ordering::SeqCst),
         };
         let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
         let tool_ctx = build_tool_context_for_profile(
@@ -2035,6 +2074,8 @@ impl Agent {
             api_key: llm_api_key,
             temperature: 0.35,
             max_tokens: 1536,
+            cancel_generation: Some(self.stop_generation.clone()),
+            start_generation: self.stop_generation.load(Ordering::SeqCst),
         };
         let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
         let tool_ctx = build_tool_context_for_profile(
@@ -2197,6 +2238,7 @@ impl Agent {
             let config = self.config.read().await;
             (wm, concerns_ctx, config.clone())
         };
+        let latest_orientation = self.last_orientation.read().await.clone();
         let llm_api_url = config_snapshot.llm_api_url.clone();
         let llm_model = config_snapshot.llm_model.clone();
         let llm_api_key = config_snapshot.llm_api_key.clone();
@@ -2211,6 +2253,8 @@ impl Agent {
             api_key: llm_api_key.clone(),
             temperature: 0.35,
             max_tokens: 2048,
+            cancel_generation: Some(self.stop_generation.clone()),
+            start_generation: self.stop_generation.load(Ordering::SeqCst),
         };
         let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
         let tool_ctx = build_tool_context_for_profile(
@@ -2232,10 +2276,11 @@ impl Agent {
         );
 
         for (conversation_id, conversation_messages) in messages_by_conversation {
+            let conversation_tag = truncate_for_event(&conversation_id, 12);
             if self.is_background_subtask_active(&conversation_id).await {
                 self.emit(AgentEvent::Observation(format!(
                     "Conversation [{}] already has a background task running; deferring new operator message(s) until it finishes.",
-                    truncate_for_event(&conversation_id, 12)
+                    conversation_tag
                 )))
                 .await;
                 continue;
@@ -2244,6 +2289,7 @@ impl Agent {
             let mut pending_messages = conversation_messages.clone();
             let mut continuation_hint: Option<String> = None;
             let mut marked_initial_messages = false;
+            let mut loop_heat_tracker = LoopHeatTracker::from_config(&config_snapshot);
             let conversation_summary_context = self
                 .maybe_refresh_conversation_compaction_summary(
                     &conversation_id,
@@ -2275,7 +2321,7 @@ impl Agent {
                             Err(e) => {
                                 tracing::warn!(
                                     "Failed to persist start of chat turn [{}]: {}",
-                                    truncate_for_event(&conversation_id, 12),
+                                    conversation_tag,
                                     e
                                 );
                                 None
@@ -2288,7 +2334,7 @@ impl Agent {
 
                 self.emit(AgentEvent::Observation(format!(
                     "Operator task [{}] turn {}",
-                    truncate_for_event(&conversation_id, 12),
+                    conversation_tag,
                     format_turn_progress(turn, chat_turn_limit)
                 )))
                 .await;
@@ -2313,6 +2359,7 @@ impl Agent {
                     &recent_chat_context,
                     conversation_summary_context.as_deref(),
                     continuation_hint.as_deref(),
+                    latest_orientation.as_ref(),
                 );
                 let event_tx = self.event_tx.clone();
                 let stream_conversation_id = conversation_id.clone();
@@ -2359,7 +2406,7 @@ impl Agent {
                                 }
                                 if let Err(db_err) = db.append_daily_activity_log(&format!(
                                     "chat [{}] turn {} failed: {}",
-                                    truncate_for_event(&conversation_id, 12),
+                                    conversation_tag,
                                     turn,
                                     truncate_for_event(&e.to_string(), 180)
                                 )) {
@@ -2372,7 +2419,7 @@ impl Agent {
                         }
                         self.emit(AgentEvent::Error(format!(
                             "Private chat turn failed [{}]: {}",
-                            truncate_for_event(&conversation_id, 12),
+                            conversation_tag,
                             e
                         )))
                         .await;
@@ -2391,27 +2438,17 @@ impl Agent {
                 let (response_without_concerns, concern_signals) =
                     parse_concern_signals(&base_response);
                 let turn_control = parse_turn_control(&response_without_concerns, tool_count);
-                let should_continue = should_continue_autonomous_turn(
+                let mut should_continue = should_continue_autonomous_turn(
                     &turn_control,
                     tool_count,
                     turn,
                     chat_turn_limit,
                 );
-                let should_offload_to_background = should_offload_to_background_subtask(
+                let mut should_offload_to_background = should_offload_to_background_subtask(
                     &turn_control,
                     tool_count,
                     turn,
                     chat_turn_limit,
-                );
-                let continuation_hint_text = format!(
-                    "Previous autonomous turn: status={}, tools={}, summary=\"{}\", reason=\"{}\". Continue only if meaningful progress is still possible without operator input.",
-                    turn_control.status,
-                    tool_count,
-                    truncate_for_event(
-                        &response_without_concerns.replace('\n', " "),
-                        220
-                    ),
-                    truncate_for_event(turn_control.reason.as_deref().unwrap_or(""), 180)
                 );
 
                 let mut background_subtask_spawned = false;
@@ -2426,6 +2463,31 @@ impl Agent {
                     } else {
                         response_without_concerns.clone()
                     };
+                let mut effective_status = turn_control.status.clone();
+                let heat_update = loop_heat_tracker.observe_turn(build_loop_turn_signature(
+                    &turn_control,
+                    &operator_visible_response,
+                    &result.tool_calls_made,
+                ));
+                if heat_update.tripped {
+                    should_continue = false;
+                    should_offload_to_background = false;
+                    effective_status = "loop_break".to_string();
+                    operator_visible_response = build_loop_heat_shock_message(&heat_update);
+                }
+                let continuation_hint_text = format!(
+                    "Previous autonomous turn: status={}, tools={}, heat={}/{}, similarity={:.2}, summary=\"{}\", reason=\"{}\". Continue only if meaningful progress is still possible without operator input.",
+                    effective_status,
+                    tool_count,
+                    heat_update.heat,
+                    heat_update.threshold,
+                    heat_update.max_similarity,
+                    truncate_for_event(
+                        &operator_visible_response.replace('\n', " "),
+                        220
+                    ),
+                    truncate_for_event(turn_control.reason.as_deref().unwrap_or(""), 180)
+                );
 
                 if should_offload_to_background {
                     background_subtask_spawned = self
@@ -2437,6 +2499,8 @@ impl Agent {
                             summary_snapshot: conversation_summary_context.clone(),
                             chat_system_prompt: chat_system_prompt.clone(),
                             config_snapshot: config_snapshot.clone(),
+                            latest_orientation: latest_orientation.clone(),
+                            stop_generation: self.stop_generation.clone(),
                         })
                         .await;
 
@@ -2552,7 +2616,7 @@ impl Agent {
                         }
                     } else if turn_control.needs_user_input {
                         ChatTurnPhase::AwaitingApproval
-                    } else if turn_control.status == "blocked" {
+                    } else if effective_status == "blocked" {
                         ChatTurnPhase::Failed
                     } else {
                         ChatTurnPhase::Completed
@@ -2567,7 +2631,7 @@ impl Agent {
                             turn_id,
                             completion_phase,
                             decision_text,
-                            &turn_control.status,
+                            &effective_status,
                             &operator_visible_response,
                             turn_control.reason.as_deref(),
                             tool_count,
@@ -2580,7 +2644,7 @@ impl Agent {
                             truncate_for_event(&conversation_id, 12),
                             turn,
                             decision_text,
-                            turn_control.status,
+                            effective_status,
                             tool_count
                         )) {
                             tracing::warn!("Failed to append agent turn to activity log: {}", e);
@@ -2590,10 +2654,20 @@ impl Agent {
 
                 let mut trace_lines = vec![format!(
                     "Private chat [{}] turn {} via agentic loop ({} tool call(s))",
-                    truncate_for_event(&conversation_id, 12),
+                    conversation_tag,
                     format_turn_progress(turn, chat_turn_limit),
                     tool_count
                 )];
+                trace_lines.push(format!(
+                    "Loop heat: {}/{} (max similarity {:.2})",
+                    heat_update.heat, heat_update.threshold, heat_update.max_similarity
+                ));
+                if heat_update.tripped {
+                    trace_lines.push("Loop detector tripped: forcing yield to break repetition.".to_string());
+                }
+                for example in &heat_update.repeated_examples {
+                    trace_lines.push(format!("Repeated pattern: {}", truncate_for_event(example, 180)));
+                }
                 if !result.thinking_blocks.is_empty() {
                     trace_lines.push(format!(
                         "Model emitted {} thinking block(s) (hidden from main reply)",
@@ -2608,9 +2682,9 @@ impl Agent {
                         action: "Continuing autonomous operator task".to_string(),
                         result: format!(
                             "[{}] {} tool call(s), status={}. {}",
-                            truncate_for_event(&conversation_id, 12),
+                            conversation_tag,
                             tool_count,
-                            turn_control.status,
+                            effective_status,
                             truncate_for_event(&operator_visible_response, 80)
                         ),
                     })
@@ -2627,7 +2701,7 @@ impl Agent {
                         action: "Continuing operator task in background".to_string(),
                         result: format!(
                             "[{}] handoff complete; {} tool call(s) already executed.",
-                            truncate_for_event(&conversation_id, 12),
+                            conversation_tag,
                             tool_count
                         ),
                     })
@@ -2639,9 +2713,9 @@ impl Agent {
                     action: "Replied to operator".to_string(),
                     result: format!(
                         "[{}] {} tool call(s), status={}. {}",
-                        truncate_for_event(&conversation_id, 12),
+                        conversation_tag,
                         tool_count,
-                        turn_control.status,
+                        effective_status,
                         truncate_for_event(&operator_visible_response, 80)
                     ),
                 })
@@ -2923,6 +2997,8 @@ struct BackgroundSubtaskRequest {
     summary_snapshot: Option<String>,
     chat_system_prompt: String,
     config_snapshot: AgentConfig,
+    latest_orientation: Option<Orientation>,
+    stop_generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2930,6 +3006,91 @@ struct BackgroundSubtaskResult {
     status: String,
     turns_executed: usize,
     total_tool_calls: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LoopTurnSignature {
+    canonical_action: String,
+    canonical_response: String,
+    action_preview: String,
+    response_preview: String,
+    tool_signature: String,
+    tool_count: usize,
+    status: String,
+    decision: TurnDecision,
+}
+
+#[derive(Debug, Clone)]
+struct LoopHeatUpdate {
+    heat: u32,
+    threshold: u32,
+    max_similarity: f64,
+    repeated_examples: Vec<String>,
+    tripped: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LoopHeatTracker {
+    recent: VecDeque<LoopTurnSignature>,
+    heat: u32,
+    threshold: u32,
+    similarity_threshold: f64,
+    window: usize,
+    cooldown: u32,
+}
+
+impl LoopHeatTracker {
+    fn from_config(config: &AgentConfig) -> Self {
+        Self {
+            recent: VecDeque::new(),
+            heat: 0,
+            threshold: configured_loop_heat_threshold(config),
+            similarity_threshold: configured_loop_similarity_threshold(config),
+            window: configured_loop_signature_window(config),
+            cooldown: configured_loop_heat_cooldown(config),
+        }
+    }
+
+    fn observe_turn(&mut self, current: LoopTurnSignature) -> LoopHeatUpdate {
+        let mut max_similarity = 0.0;
+        let mut repeated_examples = Vec::new();
+
+        for previous in self.recent.iter().rev().take(self.window) {
+            let similarity = loop_signature_similarity(previous, &current);
+            if similarity > max_similarity {
+                max_similarity = similarity;
+            }
+            if similarity >= self.similarity_threshold && repeated_examples.len() < 3 {
+                repeated_examples.push(format!(
+                    "status={}, tools={}, action=\"{}\", reply=\"{}\"",
+                    previous.status,
+                    previous.tool_count,
+                    truncate_for_event(previous.action_preview.trim(), 90),
+                    truncate_for_event(previous.response_preview.trim(), 110)
+                ));
+            }
+        }
+
+        if max_similarity >= self.similarity_threshold {
+            let increment = if max_similarity >= 0.985 { 2 } else { 1 };
+            self.heat = self.heat.saturating_add(increment);
+        } else {
+            self.heat = self.heat.saturating_sub(self.cooldown);
+        }
+
+        self.recent.push_back(current);
+        while self.recent.len() > self.window {
+            self.recent.pop_front();
+        }
+
+        LoopHeatUpdate {
+            heat: self.heat,
+            threshold: self.threshold,
+            max_similarity,
+            repeated_examples,
+            tripped: self.heat >= self.threshold,
+        }
+    }
 }
 
 fn parse_concern_signals(response: &str) -> (String, Vec<ConcernSignal>) {
@@ -2951,6 +3112,7 @@ fn build_private_chat_agentic_prompt(
     recent_chat_context: &str,
     summary_snapshot: Option<&str>,
     continuation_hint: Option<&str>,
+    latest_orientation: Option<&Orientation>,
 ) -> String {
     let mut prompt = String::new();
 
@@ -2978,6 +3140,65 @@ fn build_private_chat_agentic_prompt(
         prompt.push_str(summary);
         prompt.push_str("\n\n---\n\n");
     }
+
+    // Explicit OODA context so tool/response actions remain grounded in
+    // current observed state, orientation synthesis, and prior decision state.
+    prompt.push_str("## OODA Context\n\n");
+    prompt.push_str("### Observe\n");
+    if let Some(orientation) = latest_orientation {
+        prompt.push_str(&format!("- user_state: {}\n", summarize_user_state(&orientation.user_state)));
+        if let Some(salient) = orientation.salience_map.first() {
+            prompt.push_str(&format!(
+                "- top_salient: {}\n",
+                truncate_for_event(salient.summary.trim(), 180)
+            ));
+        }
+        if let Some(anomaly) = orientation.anomalies.first() {
+            prompt.push_str(&format!(
+                "- top_anomaly: {}\n",
+                truncate_for_event(anomaly.description.trim(), 180)
+            ));
+        }
+    } else {
+        prompt.push_str("- latest_orientation: unavailable\n");
+    }
+    prompt.push_str("\n### Orient\n");
+    if let Some(orientation) = latest_orientation {
+        prompt.push_str(&format!(
+            "- disposition: {}\n",
+            summarize_disposition(orientation.disposition)
+        ));
+        prompt.push_str(&format!(
+            "- mood: valence={:.2} arousal={:.2} confidence={:.2}\n",
+            orientation.mood_estimate.valence,
+            orientation.mood_estimate.arousal,
+            orientation.mood_estimate.confidence
+        ));
+        prompt.push_str(&format!(
+            "- synthesis: {}\n",
+            truncate_for_event(orientation.raw_synthesis.trim(), 220)
+        ));
+    } else {
+        prompt.push_str("- orientation_synthesis: unavailable\n");
+    }
+    prompt.push_str("\n### Decide\n");
+    if let Some(hint) = continuation_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+    {
+        prompt.push_str("- prior_decision_context: ");
+        prompt.push_str(hint);
+        prompt.push('\n');
+    } else if !new_messages.is_empty() {
+        prompt.push_str(
+            "- prior_decision_context: Fresh operator request; choose whether to act now or ask for clarification.\n",
+        );
+    } else {
+        prompt.push_str(
+            "- prior_decision_context: No fresh operator message; continue only if meaningful progress is possible.\n",
+        );
+    }
+    prompt.push_str("\n---\n\n");
 
     if !new_messages.is_empty() {
         prompt.push_str("## New Operator Message(s)\n\n");
@@ -3297,6 +3518,8 @@ async fn run_background_chat_subtask(
         api_key: request.config_snapshot.llm_api_key.clone(),
         temperature: 0.35,
         max_tokens: 2048,
+        cancel_generation: Some(request.stop_generation.clone()),
+        start_generation: request.stop_generation.load(Ordering::SeqCst),
     };
     let agentic_loop = AgenticLoop::new(loop_config, tool_registry);
     let tool_ctx = build_tool_context_for_profile(
@@ -3312,6 +3535,7 @@ async fn run_background_chat_subtask(
     let mut total_tool_calls = 0usize;
     let mut continuation_hint = Some(request.initial_continuation_hint);
     let background_turn_limit = configured_chat_background_max_turns(&request.config_snapshot);
+    let mut loop_heat_tracker = LoopHeatTracker::from_config(&request.config_snapshot);
 
     let mut turn = 1usize;
     loop {
@@ -3358,6 +3582,7 @@ async fn run_background_chat_subtask(
             &recent_chat_context,
             request.summary_snapshot.as_deref(),
             continuation_hint.as_deref(),
+            request.latest_orientation.as_ref(),
         );
 
         let stream_tx = event_tx.clone();
@@ -3434,10 +3659,10 @@ async fn run_background_chat_subtask(
 
         let (response_without_concerns, concern_signals) = parse_concern_signals(&base_response);
         let turn_control = parse_turn_control(&response_without_concerns, tool_count);
-        let should_continue =
+        let mut should_continue =
             should_continue_autonomous_turn(&turn_control, tool_count, turn, background_turn_limit);
 
-        let operator_visible_response = if !turn_control.operator_response.trim().is_empty() {
+        let mut operator_visible_response = if !turn_control.operator_response.trim().is_empty() {
             turn_control.operator_response.clone()
         } else if should_continue {
             turn_control
@@ -3447,6 +3672,17 @@ async fn run_background_chat_subtask(
         } else {
             response_without_concerns.clone()
         };
+        let mut effective_status = turn_control.status.clone();
+        let heat_update = loop_heat_tracker.observe_turn(build_loop_turn_signature(
+            &turn_control,
+            &operator_visible_response,
+            &result.tool_calls_made,
+        ));
+        if heat_update.tripped {
+            should_continue = false;
+            effective_status = "loop_break".to_string();
+            operator_visible_response = build_loop_heat_shock_message(&heat_update);
+        }
 
         apply_background_concern_updates(
             &db,
@@ -3496,7 +3732,7 @@ async fn run_background_chat_subtask(
 
             let completion_phase = if turn_control.needs_user_input {
                 ChatTurnPhase::AwaitingApproval
-            } else if turn_control.status == "blocked" {
+            } else if effective_status == "blocked" {
                 ChatTurnPhase::Failed
             } else {
                 ChatTurnPhase::Completed
@@ -3513,7 +3749,7 @@ async fn run_background_chat_subtask(
                     conversation_tag,
                     format_turn_progress(turn, background_turn_limit),
                     decision_text,
-                    turn_control.status,
+                    effective_status,
                     tool_count
                 ),
             });
@@ -3522,7 +3758,7 @@ async fn run_background_chat_subtask(
                 turn_id,
                 completion_phase,
                 decision_text,
-                &turn_control.status,
+                &effective_status,
                 &operator_visible_response,
                 turn_control.reason.as_deref(),
                 tool_count,
@@ -3531,7 +3767,7 @@ async fn run_background_chat_subtask(
 
             let _ = db.append_daily_activity_log(&format!(
                 "background [{}] turn {}: decision={}, status={}, tools={}",
-                conversation_tag, turn, decision_text, turn_control.status, tool_count
+                conversation_tag, turn, decision_text, effective_status, tool_count
             ));
         }
 
@@ -3541,6 +3777,16 @@ async fn run_background_chat_subtask(
             format_turn_progress(turn, background_turn_limit),
             tool_count
         )];
+        trace_lines.push(format!(
+            "Loop heat: {}/{} (max similarity {:.2})",
+            heat_update.heat, heat_update.threshold, heat_update.max_similarity
+        ));
+        if heat_update.tripped {
+            trace_lines.push("Loop detector tripped: forcing yield to break repetition.".to_string());
+        }
+        for example in &heat_update.repeated_examples {
+            trace_lines.push(format!("Repeated pattern: {}", truncate_for_event(example, 180)));
+        }
         if !result.thinking_blocks.is_empty() {
             trace_lines.push(format!(
                 "Model emitted {} thinking block(s) (hidden from main reply)",
@@ -3552,9 +3798,12 @@ async fn run_background_chat_subtask(
 
         if should_continue {
             continuation_hint = Some(format!(
-                "Previous autonomous turn: status={}, tools={}, summary=\"{}\", reason=\"{}\". Continue only if meaningful progress is still possible without operator input.",
-                turn_control.status,
+                "Previous autonomous turn: status={}, tools={}, heat={}/{}, similarity={:.2}, summary=\"{}\", reason=\"{}\". Continue only if meaningful progress is still possible without operator input.",
+                effective_status,
                 tool_count,
+                heat_update.heat,
+                heat_update.threshold,
+                heat_update.max_similarity,
                 truncate_for_event(&operator_visible_response.replace('\n', " "), 220),
                 truncate_for_event(turn_control.reason.as_deref().unwrap_or(""), 180)
             ));
@@ -3562,7 +3811,7 @@ async fn run_background_chat_subtask(
             continue;
         }
 
-        let final_status = if turn_control.status == "blocked" {
+        let final_status = if effective_status == "blocked" {
             "blocked".to_string()
         } else {
             "done".to_string()
@@ -3646,6 +3895,127 @@ fn apply_background_concern_updates(
             });
         }
     }
+}
+
+fn build_loop_turn_signature(
+    turn_control: &ParsedTurnControl,
+    operator_visible_response: &str,
+    tool_calls: &[ToolCallRecord],
+) -> LoopTurnSignature {
+    let mut tool_names: Vec<String> = tool_calls.iter().map(|r| r.tool_name.clone()).collect();
+    tool_names.sort();
+    tool_names.dedup();
+    let tool_signature = tool_names.join(" ");
+    let tool_preview = if tool_names.is_empty() {
+        "none".to_string()
+    } else {
+        tool_names.join(",")
+    };
+    let decision_text = match turn_control.decision {
+        TurnDecision::Continue => "continue",
+        TurnDecision::Yield => "yield",
+    };
+    let action_preview = format!(
+        "decision={} status={} tools={} reason={}",
+        decision_text,
+        turn_control.status,
+        tool_preview,
+        truncate_for_event(turn_control.reason.as_deref().unwrap_or(""), 140)
+    );
+    let response_preview = truncate_for_event(operator_visible_response.trim(), 220);
+
+    LoopTurnSignature {
+        canonical_action: canonicalize_loop_text(&action_preview),
+        canonical_response: canonicalize_loop_text(&response_preview),
+        action_preview,
+        response_preview,
+        tool_signature: canonicalize_loop_text(&tool_signature),
+        tool_count: tool_calls.len(),
+        status: turn_control.status.clone(),
+        decision: turn_control.decision,
+    }
+}
+
+fn canonicalize_loop_text(input: &str) -> String {
+    let mut normalized = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphabetic() {
+            normalized.push(ch.to_ascii_lowercase());
+        } else if ch.is_ascii_digit() {
+            normalized.push('0');
+        } else if ch.is_whitespace() || ch == '_' || ch == '-' || ch == '/' {
+            normalized.push(' ');
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn token_jaccard_similarity(a: &str, b: &str) -> f64 {
+    let a_tokens: HashSet<String> = a
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+        .collect();
+    let b_tokens: HashSet<String> = b
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+        .collect();
+
+    if a_tokens.is_empty() && b_tokens.is_empty() {
+        return 1.0;
+    }
+    if a_tokens.is_empty() || b_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let intersection = a_tokens.intersection(&b_tokens).count() as f64;
+    let union = a_tokens.union(&b_tokens).count() as f64;
+    if union <= f64::EPSILON {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+fn loop_signature_similarity(previous: &LoopTurnSignature, current: &LoopTurnSignature) -> f64 {
+    let response_similarity =
+        token_jaccard_similarity(&previous.canonical_response, &current.canonical_response);
+    let action_similarity =
+        token_jaccard_similarity(&previous.canonical_action, &current.canonical_action);
+    let tool_similarity = token_jaccard_similarity(&previous.tool_signature, &current.tool_signature);
+    let status_similarity = if previous.status == current.status {
+        1.0
+    } else {
+        0.0
+    };
+    let decision_similarity = if previous.decision == current.decision {
+        1.0
+    } else {
+        0.0
+    };
+
+    (0.45 * response_similarity)
+        + (0.30 * action_similarity)
+        + (0.15 * tool_similarity)
+        + (0.05 * status_similarity)
+        + (0.05 * decision_similarity)
+}
+
+fn build_loop_heat_shock_message(update: &LoopHeatUpdate) -> String {
+    let mut message = format!(
+        "I detected a repetitive action loop (heat {}/{}, similarity {:.2}) and stopped autonomous continuation so we do not get stuck.",
+        update.heat, update.threshold, update.max_similarity
+    );
+    if !update.repeated_examples.is_empty() {
+        message.push_str("\nRecent repeated patterns:");
+        for example in &update.repeated_examples {
+            message.push_str("\n- ");
+            message.push_str(example);
+        }
+    }
+    message.push_str("\nPlease tell me how you want to proceed.");
+    message
 }
 
 fn should_attempt_autonomous_continuation(
@@ -4115,6 +4485,22 @@ fn configured_chat_background_max_turns(config: &AgentConfig) -> Option<usize> {
     }
 }
 
+fn configured_loop_heat_threshold(config: &AgentConfig) -> u32 {
+    config.loop_heat_threshold.max(1)
+}
+
+fn configured_loop_similarity_threshold(config: &AgentConfig) -> f64 {
+    (config.loop_similarity_threshold as f64).clamp(0.5, 0.9999)
+}
+
+fn configured_loop_signature_window(config: &AgentConfig) -> usize {
+    config.loop_signature_window.max(2) as usize
+}
+
+fn configured_loop_heat_cooldown(config: &AgentConfig) -> u32 {
+    config.loop_heat_cooldown.max(1)
+}
+
 fn format_turn_progress(turn: usize, turn_limit: Option<usize>) -> String {
     match turn_limit {
         Some(limit) => format!("{}/{}", turn, limit),
@@ -4271,7 +4657,7 @@ not a checklist item
             created_at: now,
             processed: false,
         }];
-        let prompt = build_private_chat_agentic_prompt(&msgs, "", "", "", None, None);
+        let prompt = build_private_chat_agentic_prompt(&msgs, "", "", "", None, None, None);
         assert!(prompt.contains("Please list files"));
         assert!(prompt.contains("Use tools"));
     }
@@ -4285,6 +4671,7 @@ not a checklist item
             "",
             None,
             Some("Previous autonomous turn: status=still_working, tools=1"),
+            None,
         );
         assert!(prompt.contains("Autonomous Continuation Context"));
         assert!(!prompt.contains("New Operator Message(s)"));
@@ -4299,9 +4686,52 @@ not a checklist item
             "",
             Some("### Objectives\n- Ship session compaction"),
             None,
+            None,
         );
         assert!(prompt.contains("Conversation Summary Snapshot"));
         assert!(prompt.contains("Ship session compaction"));
+    }
+
+    #[test]
+    fn chat_prompt_includes_ooda_context_when_orientation_is_available() {
+        let orientation = Orientation {
+            user_state: orientation::UserStateEstimate::LightWork {
+                activity: "coding".to_string(),
+                confidence: 0.8,
+            },
+            salience_map: vec![orientation::SalientItem {
+                source: "test".to_string(),
+                summary: "Operator is testing prompt context.".to_string(),
+                relevance: 0.9,
+                relates_to: vec![],
+            }],
+            anomalies: vec![],
+            pending_thoughts: vec![],
+            disposition: orientation::Disposition::Observe,
+            mood_estimate: orientation::MoodEstimate {
+                valence: 0.2,
+                arousal: 0.6,
+                confidence: 0.7,
+            },
+            raw_synthesis: "User actively validating autonomous loop behavior.".to_string(),
+            generated_at: Utc::now(),
+        };
+        let prompt = build_private_chat_agentic_prompt(
+            &[],
+            "",
+            "",
+            "",
+            None,
+            Some("Previous autonomous turn: status=still_working, tools=1"),
+            Some(&orientation),
+        );
+        assert!(prompt.contains("## OODA Context"));
+        assert!(prompt.contains("### Observe"));
+        assert!(prompt.contains("### Orient"));
+        assert!(prompt.contains("### Decide"));
+        assert!(prompt.contains("light_work(coding)"));
+        assert!(prompt.contains("observe"));
+        assert!(prompt.contains("Previous autonomous turn"));
     }
 
     #[test]
@@ -4426,6 +4856,93 @@ not a checklist item
     }
 
     #[test]
+    fn loop_heat_trips_on_repeated_near_identical_turns() {
+        let mut cfg = AgentConfig::default();
+        cfg.loop_heat_threshold = 3;
+        cfg.loop_similarity_threshold = 0.8;
+        cfg.loop_signature_window = 12;
+        cfg.loop_heat_cooldown = 1;
+        let mut tracker = LoopHeatTracker::from_config(&cfg);
+
+        let turn_control = parse_turn_control(
+            "[turn_control]\n{\"decision\":\"continue\",\"status\":\"still_working\",\"needs_user_input\":false,\"reason\":\"checking directory\"}\n[/turn_control]",
+            1,
+        );
+
+        let first = tracker.observe_turn(build_loop_turn_signature(
+            &turn_control,
+            "I am checking the directory structure now.",
+            &[],
+        ));
+        let second = tracker.observe_turn(build_loop_turn_signature(
+            &turn_control,
+            "I am checking the directory structure now.",
+            &[],
+        ));
+        let third = tracker.observe_turn(build_loop_turn_signature(
+            &turn_control,
+            "I am checking the directory structure now.",
+            &[],
+        ));
+        let fourth = tracker.observe_turn(build_loop_turn_signature(
+            &turn_control,
+            "I am checking the directory structure now.",
+            &[],
+        ));
+
+        assert_eq!(first.heat, 0);
+        assert!(second.heat >= 1);
+        assert!(third.heat >= second.heat);
+        assert!(fourth.tripped);
+        assert!(fourth.max_similarity >= 0.8);
+        assert!(!fourth.repeated_examples.is_empty());
+    }
+
+    #[test]
+    fn loop_heat_cools_when_turn_changes_materially() {
+        let mut cfg = AgentConfig::default();
+        cfg.loop_heat_threshold = 8;
+        cfg.loop_similarity_threshold = 0.75;
+        cfg.loop_signature_window = 12;
+        cfg.loop_heat_cooldown = 2;
+        let mut tracker = LoopHeatTracker::from_config(&cfg);
+
+        let repeat_control = parse_turn_control(
+            "[turn_control]\n{\"decision\":\"continue\",\"status\":\"still_working\",\"needs_user_input\":false,\"reason\":\"checking\"}\n[/turn_control]",
+            1,
+        );
+        let changed_control = parse_turn_control(
+            "[turn_control]\n{\"decision\":\"yield\",\"status\":\"done\",\"needs_user_input\":false,\"reason\":\"complete\"}\n[/turn_control]",
+            0,
+        );
+
+        let _ = tracker.observe_turn(build_loop_turn_signature(
+            &repeat_control,
+            "Checking files now.",
+            &[],
+        ));
+        let _ = tracker.observe_turn(build_loop_turn_signature(
+            &repeat_control,
+            "Checking files now.",
+            &[],
+        ));
+        let warm = tracker.observe_turn(build_loop_turn_signature(
+            &repeat_control,
+            "Checking files now.",
+            &[],
+        ));
+        let cooled = tracker.observe_turn(build_loop_turn_signature(
+            &changed_control,
+            "Done. I completed the request.",
+            &[],
+        ));
+
+        assert!(warm.heat >= 2);
+        assert!(cooled.heat < warm.heat);
+        assert!(cooled.max_similarity < cfg.loop_similarity_threshold as f64);
+    }
+
+    #[test]
     fn strips_inline_thinking_tags_from_summary_text() {
         let raw = "<think>hidden</think>\n### Objectives\n- Keep visible";
         let cleaned = strip_inline_thinking_tags(raw);
@@ -4450,6 +4967,7 @@ not a checklist item
             "## Concern Priority Context\n- [active] Ship concerns manager",
             "",
             "",
+            None,
             None,
             None,
         );

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::comfy_client::{ComfyUIClient, GeneratedAssetInfo};
 use crate::comfy_workflow::ComfyWorkflow;
 use crate::config::AgentConfig;
+use crate::http_client::build_http_client;
 
 use super::{Tool, ToolCategory, ToolContext, ToolOutput};
 
@@ -195,7 +196,7 @@ pub struct PostToGraphchanTool {
 impl PostToGraphchanTool {
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
         }
     }
 }

@@ -47,3 +47,4 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 - Tool definitions are now filtered per `ToolContext` before each loop run, preventing out-of-scope tools from being proposed/called.
 - Thinking tags are preserved only as structured metadata (`thinking_blocks`) for optional UI/debug display.
 - Streaming failures automatically degrade to the non-streaming code path instead of failing the entire agentic call.
+- HTTP client initialization now has a panic-safe fallback (`no_proxy`) if default system proxy discovery fails on host OS APIs.

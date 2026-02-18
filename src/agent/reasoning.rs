@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::http_client::build_http_client;
 use crate::skills::SkillEvent;
 
 pub struct ReasoningEngine {
@@ -22,7 +23,7 @@ impl ReasoningEngine {
         system_prompt: String,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_url,
             model,
             api_key,

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::database::{PersonaSnapshot, PersonaTraits};
+use crate::http_client::build_http_client;
 
 /// The result of trajectory inference
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,7 +56,7 @@ pub struct TrajectoryEngine {
 impl TrajectoryEngine {
     pub fn new(api_url: String, model: String, api_key: Option<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             api_url,
             model,
             api_key,
@@ -340,7 +341,7 @@ pub async fn capture_persona_snapshot(
     recent_experiences: &[String],
     guiding_principles: &[String],
 ) -> Result<PersonaSnapshot> {
-    let client = Client::new();
+    let client = build_http_client();
     let url = format!("{}/v1/chat/completions", api_url);
 
     // Build dimensions JSON for the prompt

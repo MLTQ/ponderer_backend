@@ -145,7 +145,8 @@ fn builtin_manifest(config: &AgentConfig) -> BackendPluginManifest {
         id: "builtin.core".to_string(),
         name: "Ponderer Built-ins".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        description: "Core tools and default skill wiring provided by ponderer_backend.".to_string(),
+        description: "Core tools and default skill wiring provided by ponderer_backend."
+            .to_string(),
         provided_tools: vec![
             "shell".to_string(),
             "read_file".to_string(),

@@ -30,3 +30,4 @@ Handles JSON-structured decision-making prompts for event analysis and legacy pr
 
 ## Notes
 - Private operator chat now primarily uses the agentic tool loop, but this module remains active for event-analysis JSON decisions.
+- HTTP client setup now uses shared panic-safe construction (`http_client::build_http_client`) to avoid startup crashes on some host OS proxy APIs.
