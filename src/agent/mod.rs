@@ -48,6 +48,11 @@ const SELF_DIRECTIVE_LAST_RUN_STATE_KEY: &str = "self_directive_last_run_at";
 const MEMORY_EVOLUTION_LAST_RUN_STATE_KEY: &str = "memory_evolution_last_run_at";
 const JOURNAL_LAST_WRITTEN_STATE_KEY: &str = "journal_last_written_at";
 const DREAM_LAST_RUN_STATE_KEY: &str = "dream_last_run_at";
+const SOCIAL_LAST_POST_STATE_KEY: &str = "social_last_post_at";
+/// How long the agent waits before reaching out unprompted when the user is idle/away (seconds).
+const SOCIAL_IDLE_INTERVAL_SECS: u64 = 7200; // 2 hours
+/// Minimum interval even when the user is actively working (seconds).
+const SOCIAL_WORK_INTERVAL_SECS: u64 = 14400; // 4 hours
 const CHAT_TOOL_BLOCK_START: &str = "[tool_calls]";
 const CHAT_TOOL_BLOCK_END: &str = "[/tool_calls]";
 const CHAT_THINKING_BLOCK_START: &str = "[thinking]";
@@ -144,6 +149,20 @@ impl Default for AgentState {
     }
 }
 
+/// Tracks a user request the agent is trying to fulfil across loop iterations.
+/// Set when a chat turn begins; cleared when the turn succeeds; kept (with
+/// incremented attempts) if the turn ends blocked or with no substantive action.
+/// The self-directive uses this to retry stalled goals autonomously.
+#[derive(Debug, Clone)]
+struct PendingGoal {
+    conversation_id: String,
+    /// Short summary of what the user asked for.
+    request_summary: String,
+    /// Number of failed/incomplete attempts so far.
+    attempts: u32,
+    _created_at: chrono::DateTime<Utc>,
+}
+
 pub struct Agent {
     skills: Arc<RwLock<Vec<Box<dyn Skill>>>>,
     tool_registry: Arc<ToolRegistry>,
@@ -164,6 +183,8 @@ pub struct Agent {
     wake_notify: Arc<Notify>,
     background_subtasks:
         Arc<Mutex<HashMap<String, tokio::task::JoinHandle<BackgroundSubtaskResult>>>>,
+    /// Goal the agent is currently trying to complete (or most recently failed to complete).
+    pending_goal: Arc<RwLock<Option<PendingGoal>>>,
 }
 
 impl Agent {
@@ -264,6 +285,7 @@ impl Agent {
             wake_generation: Arc::new(AtomicU64::new(0)),
             wake_notify: Arc::new(Notify::new()),
             background_subtasks: Arc::new(Mutex::new(HashMap::new())),
+            pending_goal: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -517,7 +539,10 @@ impl Agent {
             let config_snapshot = { self.config.read().await.clone() };
 
             // Check if it's time for persona evolution (Ludonarrative Assonantic Tracing)
-            self.maybe_evolve_persona().await;
+            // Skip if operator messages are already waiting — chat preempts background work.
+            if !self.has_pending_operator_messages().await {
+                self.maybe_evolve_persona().await;
+            }
 
             // Check for rate limiting
             if self.is_rate_limited().await {
@@ -752,14 +777,16 @@ impl Agent {
         self.set_state(AgentVisualState::Thinking).await;
 
         let mut user_message = String::from(
-            "Run one self-directed micro-task that is useful right now and safe to execute without operator input.\n\
-             Priority order:\n\
-             1) advance active concerns\n\
-             2) improve memory/task hygiene via write_memory/search_memory\n\
-             3) gather low-risk local context that helps later operator turns.\n\
-             If no meaningful task exists, respond exactly with NO_ACTION.\n\
-             If blocked by approvals/access, use available tools and summarize what is blocked.\n\
-             Keep the final response concise.",
+            "This is your autonomous time — no one is asking you anything right now.\n\
+             Sit with what's calling for your attention. What are you curious about? \
+             What feels unfinished? What would be useful to learn, record, or explore right now?\n\n\
+             You have three kinds of drives pulling on you:\n\
+             • Completion — something started that wants to be finished\n\
+             • Curiosity — something you noticed that wants to be understood\n\
+             • Care — something that could go wrong and bears watching\n\n\
+             Look at your concerns and memory notes. Let them guide you toward something real to do.\n\
+             Use your tools. Take action. You don't have to solve everything — one genuine step is enough.\n\
+             If truly nothing calls to you, say so briefly and honestly.",
         );
 
         if !concern_hints.is_empty() {
@@ -776,12 +803,28 @@ impl Agent {
             }
         }
 
+        // If a previous user request stalled, surface it so the self-directive can
+        // try to make progress on it before wandering to something else.
+        let stalled_goal = {
+            let goal = self.pending_goal.read().await;
+            goal.clone()
+        };
+        if let Some(ref goal) = stalled_goal {
+            user_message.push_str(&format!(
+                "\n\nIMPORTANT: A previous request from the operator is still unfinished after {} attempt(s):\n\
+                 \"{}\"\n\
+                 Try to make progress on this now if you can do so safely without operator input.",
+                goal.attempts + 1,
+                goal.request_summary
+            ));
+        }
+
         let loop_config = AgenticConfig {
             max_iterations: configured_agentic_max_iterations(config_snapshot),
             api_url: agentic_api_url(&config_snapshot.llm_api_url),
             model: config_snapshot.llm_model.clone(),
             api_key: config_snapshot.llm_api_key.clone(),
-            temperature: 0.25,
+            temperature: 0.6,
             max_tokens: 1600,
             cancel_generation: Some(self.stop_generation.clone()),
             start_generation: self.stop_generation.load(Ordering::SeqCst),
@@ -796,7 +839,8 @@ impl Agent {
             config_snapshot.username.clone(),
         );
         let self_directive_system_prompt = format!(
-            "{}\n\nYou are in autonomous self-directive mode. Choose one useful task, execute it, and report the result clearly.",
+            "{}\n\nYou are in autonomous self-directed mode with full use of your tools. \
+             Follow your curiosity. Act on what matters to you. Report what you did.",
             config_snapshot.system_prompt
         );
 
@@ -805,12 +849,9 @@ impl Agent {
             .await
         {
             Ok(result) => {
-                let summary = result
-                    .response
-                    .unwrap_or_else(|| "NO_ACTION".to_string())
-                    .trim()
-                    .to_string();
-                let no_action = summary.eq_ignore_ascii_case("NO_ACTION");
+                let summary = result.response.unwrap_or_default().trim().to_string();
+                // "did nothing" = no tools and empty/trivial response
+                let did_nothing = result.tool_calls_made.is_empty() && summary.is_empty();
                 let tool_count = result.tool_calls_made.len();
 
                 let mut trace_lines = vec![format!(
@@ -826,16 +867,16 @@ impl Agent {
                 trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
                 self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
 
-                if no_action && tool_count == 0 {
+                if did_nothing {
                     self.emit(AgentEvent::Observation(
-                        "Self-directive cycle found no immediate action.".to_string(),
+                        "Self-directive: nothing called for attention this cycle.".to_string(),
                     ))
                     .await;
                     return;
                 }
 
-                let event_result = if no_action {
-                    format!("{} tool call(s) attempted without a final summary.", tool_count)
+                let event_result = if summary.is_empty() {
+                    format!("{} tool call(s).", tool_count)
                 } else {
                     format!(
                         "{} tool call(s). {}",
@@ -859,7 +900,7 @@ impl Agent {
                     )) {
                         tracing::warn!("Failed to append self-directive log entry: {}", e);
                     }
-                    if !no_action {
+                    if !summary.is_empty() {
                         let note = format!("[autonomy] {}", summary);
                         if let Err(e) = db.add_chat_message("agent", &note) {
                             tracing::warn!(
@@ -876,6 +917,121 @@ impl Agent {
                     e
                 )))
                 .await;
+            }
+        }
+    }
+
+    /// Check whether the social drive should fire — if enough time has passed since the
+    /// agent last spoke unprompted AND the orientation contains something worth saying,
+    /// generate a short natural message and post it to chat.
+    async fn maybe_post_social_message(
+        &self,
+        config_snapshot: &AgentConfig,
+        orientation: &Orientation,
+    ) {
+        if !config_snapshot.enable_ambient_loop {
+            return;
+        }
+        // Don't interrupt when the user is actively chatting.
+        if self.has_pending_operator_messages().await {
+            return;
+        }
+        // Nothing interesting in the orientation → no reason to reach out.
+        let has_content = !orientation.pending_thoughts.is_empty()
+            || !orientation.anomalies.is_empty()
+            || !orientation.salience_map.is_empty();
+        if !has_content {
+            return;
+        }
+
+        // Choose the minimum quiet interval based on user state.
+        let min_interval_secs = match orientation.user_state {
+            orientation::UserStateEstimate::DeepWork { .. } => SOCIAL_WORK_INTERVAL_SECS,
+            _ => SOCIAL_IDLE_INTERVAL_SECS,
+        };
+
+        let is_due = {
+            let db_lock = self.database.read().await;
+            let Some(db) = db_lock.as_ref() else {
+                return;
+            };
+            let last = db
+                .get_state(SOCIAL_LAST_POST_STATE_KEY)
+                .ok()
+                .flatten()
+                .and_then(|raw| raw.parse::<chrono::DateTime<Utc>>().ok());
+            last.map(|t| {
+                Utc::now() - t >= ChronoDuration::seconds(min_interval_secs as i64)
+            })
+            .unwrap_or(false) // Don't fire on very first boot — wait for first real interaction.
+        };
+
+        if !is_due {
+            return;
+        }
+
+        // Build a minimal context snapshot to ground the message.
+        let thought_text = orientation
+            .pending_thoughts
+            .first()
+            .map(|t| t.content.as_str())
+            .or_else(|| {
+                orientation
+                    .anomalies
+                    .first()
+                    .map(|a| a.description.as_str())
+            })
+            .unwrap_or("");
+
+        let social_system_prompt = format!(
+            "{}\n\nYou are speaking to {} unprompted — you have something on your mind and decided to say it. \
+             Write one short, natural, direct message (1-3 sentences). \
+             No greetings, no 'just checking in', no formalities. Just say the thing.",
+            config_snapshot.system_prompt,
+            config_snapshot.username
+        );
+        let social_user_message = format!(
+            "What you have on your mind right now:\n{}\n\nWrite your message.",
+            thought_text
+        );
+
+        let client = crate::llm_client::LlmClient::new(
+            agentic_api_url(&config_snapshot.llm_api_url),
+            config_snapshot.llm_api_key.clone().unwrap_or_default(),
+            config_snapshot.llm_model.clone(),
+        );
+        let messages = vec![
+            crate::llm_client::Message {
+                role: "system".to_string(),
+                content: social_system_prompt,
+            },
+            crate::llm_client::Message {
+                role: "user".to_string(),
+                content: social_user_message,
+            },
+        ];
+
+        match client.generate(messages).await
+        {
+            Ok(response) => {
+                let message = response.trim().to_string();
+                if !message.is_empty() {
+                    self.emit(AgentEvent::Observation(format!(
+                        "Social drive: posting to chat: {}",
+                        truncate_for_event(&message, 120)
+                    )))
+                    .await;
+                    self.post_ambient_chat_message(&message).await;
+
+                    // Record this so we don't fire again too soon.
+                    let db_lock = self.database.read().await;
+                    if let Some(db) = db_lock.as_ref() {
+                        let _ = db.set_state(SOCIAL_LAST_POST_STATE_KEY, &Utc::now().to_rfc3339());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Social drive LLM call failed: {}", e);
             }
         }
     }
@@ -1700,6 +1856,36 @@ impl Agent {
         .await;
     }
 
+    /// Post an unprompted agent message to the default conversation so the user
+    /// can see it when they next open the chat. Used by Surface and Interrupt
+    /// dispositions to let the agent speak without waiting to be asked.
+    async fn post_ambient_chat_message(&self, content: &str) {
+        let saved = {
+            let db_lock = self.database.read().await;
+            if let Some(ref db) = *db_lock {
+                db.add_chat_message_in_conversation(
+                    crate::database::DEFAULT_CHAT_CONVERSATION_ID,
+                    "agent",
+                    content,
+                )
+                .is_ok()
+            } else {
+                false
+            }
+        };
+        if saved {
+            // Notify the frontend that a new message is ready.
+            self.emit(AgentEvent::ChatStreaming {
+                conversation_id: crate::database::DEFAULT_CHAT_CONVERSATION_ID.to_string(),
+                content: String::new(),
+                done: true,
+            })
+            .await;
+        } else {
+            tracing::warn!("post_ambient_chat_message: failed to persist message to DB");
+        }
+    }
+
     async fn apply_chat_concern_updates(
         &self,
         conversation_id: &str,
@@ -1805,6 +1991,34 @@ impl Agent {
                         ),
                     })
                     .await;
+
+                    if result.status.starts_with("failed") {
+                        // Post a visible failure notice to the conversation so the user
+                        // knows what happened and can ask for a retry.
+                        let failure_msg = format_chat_message_with_metadata(
+                            &format!(
+                                "I ran into a problem while working on this in the background and had to stop. You can ask me to try again.",
+                            ),
+                            &[],
+                            &[],
+                        );
+                        let db_lock = self.database.read().await;
+                        if let Some(db) = db_lock.as_ref() {
+                            let _ = db.add_chat_message_in_conversation(
+                                &conversation_id,
+                                "agent",
+                                &failure_msg,
+                            );
+                        }
+                    }
+
+                    // Signal the frontend that messages are ready.
+                    self.emit(AgentEvent::ChatStreaming {
+                        conversation_id: conversation_id.clone(),
+                        content: String::new(),
+                        done: true,
+                    })
+                    .await;
                 }
                 Err(e) => {
                     self.emit(AgentEvent::Error(format!(
@@ -1812,6 +2026,26 @@ impl Agent {
                         truncate_for_event(&conversation_id, 12),
                         e
                     )))
+                    .await;
+                    // Post a failure notice so the user isn't left hanging.
+                    let failure_msg = format_chat_message_with_metadata(
+                        "I was working on something in the background but the task crashed unexpectedly. Please ask me to try again.",
+                        &[],
+                        &[],
+                    );
+                    let db_lock = self.database.read().await;
+                    if let Some(db) = db_lock.as_ref() {
+                        let _ = db.add_chat_message_in_conversation(
+                            &conversation_id,
+                            "agent",
+                            &failure_msg,
+                        );
+                    }
+                    self.emit(AgentEvent::ChatStreaming {
+                        conversation_id: conversation_id.clone(),
+                        content: String::new(),
+                        done: true,
+                    })
                     .await;
                 }
             }
@@ -2069,6 +2303,12 @@ impl Agent {
     }
 
     async fn run_ambient_tick(&self, pending_events: &[SkillEvent]) -> Option<Orientation> {
+        // If operator messages arrived while the engaged tick was running, skip the
+        // ambient work entirely — they'll be processed first on the next iteration.
+        if self.has_pending_operator_messages().await {
+            return None;
+        }
+
         let config_snapshot = { self.config.read().await.clone() };
 
         if config_snapshot.enable_concerns {
@@ -2092,6 +2332,11 @@ impl Agent {
 
         if config_snapshot.enable_heartbeat {
             self.maybe_run_heartbeat().await;
+        }
+
+        // Social drive: check if it's time to reach out to the user unprompted.
+        if let Some(ref o) = orientation {
+            self.maybe_post_social_message(&config_snapshot, o).await;
         }
 
         orientation
@@ -2126,23 +2371,43 @@ impl Agent {
             Disposition::Surface => {
                 if let Some(thought) = orientation.pending_thoughts.first() {
                     self.emit(AgentEvent::Observation(format!(
-                        "Pending thought: {}",
+                        "Surfacing thought to chat: {}",
                         truncate_for_event(&thought.content, 180)
                     )))
                     .await;
+                    self.post_ambient_chat_message(&thought.content).await;
                 } else if let Some(anomaly) = orientation.anomalies.first() {
                     self.emit(AgentEvent::Observation(format!(
-                        "Notable anomaly: {}",
+                        "Surfacing anomaly to chat: {}",
                         truncate_for_event(&anomaly.description, 180)
                     )))
                     .await;
+                    self.post_ambient_chat_message(&anomaly.description).await;
                 }
             }
             Disposition::Interrupt => {
-                self.emit(AgentEvent::Observation(
-                    "Disposition suggests interrupt-level attention.".to_string(),
-                ))
-                .await;
+                // Interrupt is higher urgency — post the most salient item to chat
+                // so the user sees it immediately when they look, plus log it.
+                let message = if let Some(thought) = orientation.pending_thoughts.first() {
+                    Some(thought.content.clone())
+                } else if let Some(anomaly) = orientation.anomalies.first() {
+                    Some(anomaly.description.clone())
+                } else {
+                    None
+                };
+                if let Some(msg) = message {
+                    self.emit(AgentEvent::Observation(format!(
+                        "Interrupt: posting to chat: {}",
+                        truncate_for_event(&msg, 180)
+                    )))
+                    .await;
+                    self.post_ambient_chat_message(&msg).await;
+                } else {
+                    self.emit(AgentEvent::Observation(
+                        "Interrupt disposition with no pending thoughts or anomalies.".to_string(),
+                    ))
+                    .await;
+                }
             }
             Disposition::Observe | Disposition::Idle => {}
         }
@@ -2601,6 +2866,27 @@ impl Agent {
             let mut continuation_hint: Option<String> = None;
             let mut marked_initial_messages = false;
             let mut loop_heat_tracker = LoopHeatTracker::from_config(&config_snapshot);
+
+            // Register the goal so it survives errors and can be retried autonomously.
+            let request_summary = conversation_messages
+                .first()
+                .map(|m| truncate_for_event(m.content.trim(), 120))
+                .unwrap_or_default();
+            if !request_summary.is_empty() {
+                let mut goal = self.pending_goal.write().await;
+                let prev_attempts = goal
+                    .as_ref()
+                    .filter(|g| g.conversation_id == conversation_id)
+                    .map(|g| g.attempts)
+                    .unwrap_or(0);
+                *goal = Some(PendingGoal {
+                    conversation_id: conversation_id.clone(),
+                    request_summary,
+                    attempts: prev_attempts,
+                    _created_at: Utc::now(),
+                });
+            }
+            let mut goal_completed = false;
             let conversation_working_memory_context = {
                 let db_lock = self.database.read().await;
                 if let Some(ref db) = *db_lock {
@@ -2876,13 +3162,7 @@ impl Agent {
                     }
                 };
 
-                let base_response = result.response.unwrap_or_else(|| {
-                    if result.tool_calls_made.is_empty() {
-                        "I do not have a useful response yet.".to_string()
-                    } else {
-                        "I ran tools for your request. Details are attached below.".to_string()
-                    }
-                });
+                let base_response = result.response.unwrap_or_default();
                 let tool_count = result.tool_calls_made.len();
                 let (response_without_concerns, concern_signals) =
                     parse_concern_signals(&base_response);
@@ -2924,6 +3204,23 @@ impl Agent {
                     effective_status = "loop_break".to_string();
                     operator_visible_response = build_loop_heat_shock_message(&heat_update);
                 }
+
+                // When the turn is ending as blocked (not simply awaiting user approval),
+                // ensure there's always a visible, actionable message — the model may have
+                // set status=blocked without writing anything for the operator to read.
+                if effective_status == "blocked"
+                    && !turn_control.needs_user_input
+                    && !should_continue
+                    && operator_visible_response.trim().is_empty()
+                {
+                    operator_visible_response = format!(
+                        "I got stuck and couldn't make progress on this{}. Try rephrasing or providing more context.",
+                        turn_control.reason.as_deref()
+                            .map(|r| format!(" ({})", truncate_for_event(r, 120)))
+                            .unwrap_or_default()
+                    );
+                }
+
                 let continuation_hint_text = format!(
                     "Previous autonomous turn: status={}, tools={}, heat={}/{}, similarity={:.2}, summary=\"{}\", reason=\"{}\". Continue only if meaningful progress is still possible without operator input.",
                     effective_status,
@@ -3031,6 +3328,11 @@ impl Agent {
                                 tracing::warn!("Failed to save agent chat reply: {}", e);
                             }
                         }
+                        // Reset the social drive clock — we just spoke to the user.
+                        let _ = db.set_state(
+                            SOCIAL_LAST_POST_STATE_KEY,
+                            &Utc::now().to_rfc3339(),
+                        );
                     }
                 }
 
@@ -3148,6 +3450,13 @@ impl Agent {
                     "Loop heat: {}/{} (max similarity {:.2})",
                     heat_update.heat, heat_update.threshold, heat_update.max_similarity
                 ));
+                if !turn_control.block_was_present {
+                    trace_lines.push(format!(
+                        "turn_control block absent (tools={}); defaulted to {}",
+                        tool_count,
+                        if tool_count > 0 { "continue" } else { "yield" }
+                    ));
+                }
                 if heat_update.tripped {
                     trace_lines.push("Loop detector tripped: forcing yield to break repetition.".to_string());
                 }
@@ -3206,7 +3515,51 @@ impl Agent {
                     ),
                 })
                 .await;
+
+                // Completion verification (Ponderer-5y8): flag turns that replied with
+                // no tool calls to what looked like an action request — potential non-completion.
+                if tool_count == 0 && effective_status == "done" {
+                    let original_text = pending_messages
+                        .first()
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
+                    if looks_like_action_request(original_text) {
+                        self.emit(AgentEvent::Observation(
+                            "Completion check: replied with 0 tool calls to an apparent action request — may not have executed the task."
+                                .to_string(),
+                        ))
+                        .await;
+                        // Don't clear the goal so the self-directive can try.
+                    } else {
+                        goal_completed = true;
+                    }
+                } else {
+                    // Mark goal complete only when turn ended normally (not blocked/heat-break).
+                    if effective_status == "done" || effective_status == "still_working" {
+                        goal_completed = true;
+                    }
+                }
                 break;
+            }
+
+            // Update the goal tracker based on how the inner loop ended.
+            {
+                let mut goal = self.pending_goal.write().await;
+                if goal_completed {
+                    // Successful completion — clear the goal.
+                    if goal
+                        .as_ref()
+                        .is_some_and(|g| g.conversation_id == conversation_id)
+                    {
+                        *goal = None;
+                    }
+                } else if let Some(g) = goal
+                    .as_mut()
+                    .filter(|g| g.conversation_id == conversation_id)
+                {
+                    // Failed or blocked — note the extra attempt for self-directive context.
+                    g.attempts += 1;
+                }
             }
         }
 
@@ -3493,6 +3846,9 @@ struct ParsedTurnControl {
     needs_user_input: bool,
     status: String,
     reason: Option<String>,
+    /// True only when the model explicitly included a [turn_control] block.
+    /// False means the block was absent (the model may have simply forgotten it).
+    block_was_present: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3968,9 +4324,11 @@ fn format_chat_message_with_metadata(
     let mut content = response.trim().to_string();
     if content.is_empty() {
         content = if tool_calls.is_empty() {
-            "I do not have a useful response yet.".to_string()
+            "…".to_string()
         } else {
-            "I ran tools for your request.".to_string()
+            // Tools ran but the model wrote nothing after — the results are embedded
+            // as tool metadata in this message.
+            String::new()
         };
     }
 
@@ -4299,13 +4657,7 @@ async fn run_background_chat_subtask(
             }
         };
 
-        let base_response = result.response.unwrap_or_else(|| {
-            if result.tool_calls_made.is_empty() {
-                "I do not have a useful response yet.".to_string()
-            } else {
-                "I ran tools for your request. Details are attached below.".to_string()
-            }
-        });
+        let base_response = result.response.unwrap_or_default();
         let tool_count = result.tool_calls_made.len();
         total_tool_calls += tool_count;
 
@@ -4901,8 +5253,22 @@ fn parse_turn_control(response: &str, tool_call_count: usize) -> ParsedTurnContr
     } else {
         (cleaned_response, block_json)
     };
-    let mut fallback_decision = TurnDecision::Yield;
-    let mut fallback_reason = None;
+    let block_was_present = block_json.is_some();
+
+    // When no turn_control block was emitted but tools were called, the model was
+    // actively working and likely just forgot the block. Default to Continue so we
+    // don't silently abandon in-progress work. The loop heat detector will catch
+    // genuine infinite loops.
+    let mut fallback_decision = if !block_was_present && tool_call_count > 0 {
+        TurnDecision::Continue
+    } else {
+        TurnDecision::Yield
+    };
+    let mut fallback_reason = if !block_was_present && tool_call_count > 0 {
+        Some("turn_control block absent after tool use — continuing".to_string())
+    } else {
+        None
+    };
     let cleaned_trimmed = cleaned_response.trim().to_string();
 
     // Backward-compatible marker support while prompts transition.
@@ -4974,6 +5340,7 @@ fn parse_turn_control(response: &str, tool_call_count: usize) -> ParsedTurnContr
         needs_user_input,
         status,
         reason,
+        block_was_present,
     }
 }
 
@@ -5261,6 +5628,29 @@ fn summarize_disposition(disposition: Disposition) -> &'static str {
         Disposition::Surface => "surface",
         Disposition::Interrupt => "interrupt",
     }
+}
+
+/// Heuristic: does this text look like a request for an action rather than a question?
+/// Used to flag turns where the agent replied with 0 tool calls to what appeared to be
+/// a task (potential sign that nothing was actually done).
+fn looks_like_action_request(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // Short confirmations / questions are fine with no tools.
+    if lower.len() < 20 {
+        return false;
+    }
+    // Pure questions don't need tools.
+    let trimmed = lower.trim();
+    if trimmed.ends_with('?') && !trimmed.contains('\n') {
+        return false;
+    }
+    let action_words = [
+        "run ", "execute ", "build ", "test ", "install ", "create ", "write ",
+        "delete ", "move ", "rename ", "update ", "fix ", "refactor ", "deploy ",
+        "find and ", "search for", "grep ", "compile ", "generate ",
+        "can you ", "could you ", "please ", "would you ",
+    ];
+    action_words.iter().any(|w| lower.contains(w))
 }
 
 fn truncate_for_event(input: &str, max_chars: usize) -> String {
