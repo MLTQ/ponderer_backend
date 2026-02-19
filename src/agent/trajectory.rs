@@ -194,7 +194,7 @@ Respond ONLY with valid JSON."#,
     }
 
     async fn call_llm(&self, prompt: &str) -> Result<String> {
-        let url = format!("{}/v1/chat/completions", self.api_url);
+        let url = normalize_chat_url(&self.api_url);
 
         #[derive(Serialize)]
         struct ChatRequest {
@@ -342,7 +342,7 @@ pub async fn capture_persona_snapshot(
     guiding_principles: &[String],
 ) -> Result<PersonaSnapshot> {
     let client = build_http_client();
-    let url = format!("{}/v1/chat/completions", api_url);
+    let url = normalize_chat_url(api_url);
 
     // Build dimensions JSON for the prompt
     let dimensions_json: Vec<String> = guiding_principles
@@ -591,6 +591,19 @@ fn extract_balanced(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Normalize an API base URL to a chat completions endpoint, mirroring LlmClient's logic.
+/// Handles base URLs of the form `http://host:port`, `http://host:port/v1`, or the full path.
+fn normalize_chat_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/v1") {
+        format!("{}/chat/completions", trimmed)
+    } else {
+        format!("{}/v1/chat/completions", trimmed)
+    }
 }
 
 #[cfg(test)]

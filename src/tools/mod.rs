@@ -22,7 +22,7 @@ pub mod vision;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -195,13 +195,25 @@ pub struct ToolCallResult {
 /// - Dynamic registration/deregistration of tools
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
+    /// Tools the user has approved for the current session (bypasses autonomous approval block)
+    session_approved: Arc<RwLock<HashSet<String>>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
+            session_approved: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    /// Grant session-level approval for a tool so it runs without prompting for the rest of the session.
+    pub async fn grant_session_approval(&self, tool_name: &str) {
+        self.session_approved
+            .write()
+            .await
+            .insert(tool_name.to_string());
+        tracing::info!("Session approval granted for tool: {}", tool_name);
     }
 
     /// Register a tool. Overwrites any existing tool with the same name.
@@ -291,8 +303,9 @@ impl ToolRegistry {
             }
         };
 
-        // Check if approval is needed
-        if tool.requires_approval() && ctx.autonomous {
+        // Check if approval is needed (skip if user granted session approval)
+        let session_ok = self.session_approved.read().await.contains(&call.name);
+        if tool.requires_approval() && ctx.autonomous && !session_ok {
             return ToolCallResult {
                 name: call.name.clone(),
                 output: ToolOutput::NeedsApproval {

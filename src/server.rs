@@ -160,6 +160,7 @@ pub async fn serve_backend(
         .route("/agent/pause", put(set_pause))
         .route("/agent/toggle-pause", post(toggle_pause))
         .route("/agent/stop", post(stop_agent_turn))
+        .route("/agent/tools/:tool_name/approve", post(approve_tool))
         .route("/ws/events", get(ws_events_route))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
@@ -249,6 +250,10 @@ fn map_agent_event(event: AgentEvent) -> ApiEventEnvelope {
             serde_json::json!({ "id": id, "summary": summary }),
         ),
         AgentEvent::Error(error) => envelope("error", serde_json::json!({ "error": error })),
+        AgentEvent::ApprovalRequest { tool_name, reason } => envelope(
+            "approval_request",
+            serde_json::json!({ "tool_name": tool_name, "reason": reason }),
+        ),
     }
 }
 
@@ -529,6 +534,14 @@ async fn stop_agent_turn(
 ) -> Result<Json<StopResponse>, (StatusCode, String)> {
     state.agent.request_stop().await;
     Ok(Json(StopResponse { stopped: true }))
+}
+
+async fn approve_tool(
+    State(state): State<Arc<ServerState>>,
+    Path(tool_name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state.agent.grant_session_tool_approval(&tool_name).await;
+    Ok(Json(serde_json::json!({ "approved": true, "tool": tool_name })))
 }
 
 async fn ws_events_route(

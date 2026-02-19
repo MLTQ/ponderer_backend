@@ -119,6 +119,11 @@ pub enum AgentEvent {
         summary: String,
     },
     Error(String),
+    /// Emitted when an autonomous tool call was blocked because it needs user approval.
+    ApprovalRequest {
+        tool_name: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -441,6 +446,11 @@ impl Agent {
         .await;
         self.request_wake("stop_requested");
         self.set_state(AgentVisualState::Idle).await;
+    }
+
+    /// Grant session-level approval for a tool, allowing it to run autonomously for the rest of the session.
+    pub async fn grant_session_tool_approval(&self, tool_name: &str) {
+        self.tool_registry.grant_session_approval(tool_name).await;
     }
 
     pub fn notify_operator_message_queued(&self, conversation_id: &str) {
@@ -1858,29 +1868,21 @@ impl Agent {
         .await;
     }
 
-    /// Notify the user via chat if any tool calls in an autonomous pass were blocked
-    /// because they require approval. Posts once per agentic pass that contains blocked tools.
+    /// Emit ApprovalRequest events for any tool calls blocked because they need user approval.
+    /// Deduplicates — only one event per tool name per agentic pass.
     async fn maybe_notify_needs_approval(&self, tool_calls: &[ToolCallRecord]) {
-        let blocked: Vec<&str> = tool_calls
-            .iter()
-            .filter_map(|call| {
-                if matches!(call.output, ToolOutput::NeedsApproval { .. }) {
-                    Some(call.tool_name.as_str())
-                } else {
-                    None
+        let mut notified = std::collections::HashSet::new();
+        for call in tool_calls {
+            if let ToolOutput::NeedsApproval { ref tool, ref reason, .. } = call.output {
+                if notified.insert(tool.clone()) {
+                    self.emit(AgentEvent::ApprovalRequest {
+                        tool_name: tool.clone(),
+                        reason: reason.clone(),
+                    })
+                    .await;
                 }
-            })
-            .collect();
-        if blocked.is_empty() {
-            return;
+            }
         }
-        let tool_list: Vec<String> = blocked.iter().map(|n| format!("`{}`", n)).collect();
-        let msg = format!(
-            "⚠️ I need your approval to use {}. Reply \"allow {}\" to permit it for this session, or configure auto-approval in Settings → Tools.",
-            tool_list.join(", "),
-            blocked[0],
-        );
-        self.post_ambient_chat_message(&msg).await;
     }
 
     /// Post an unprompted agent message to the default conversation so the user
