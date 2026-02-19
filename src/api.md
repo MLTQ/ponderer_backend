@@ -12,6 +12,11 @@ Frontend-only backend API client for Ponderer. Encapsulates authenticated REST c
 ### Chat DTOs (`ChatConversation`, `ChatMessage`, `ChatTurnPhase`)
 - **Does**: Frontend-side models for chat list/history rendering.
 - **Interacts with**: `ui/app.rs` conversation picker and chat renderer.
+- **Notes**: `ChatMessage.turn_id` is optional and used to fetch turn-level prompt diagnostics.
+
+### Prompt DTOs (`ChatTurnPrompt`)
+- **Does**: Carries prompt-inspection payload for one turn (`prompt_text` plus optional `system_prompt_text`).
+- **Interacts with**: `ui/app.rs` prompt inspector window.
 
 ### Runtime DTOs (`AgentVisualState`, `AgentRuntimeStatus`)
 - **Does**: Frontend-side models for status badges/sprite selection and pause/stop controls.
@@ -39,3 +44,4 @@ Frontend-only backend API client for Ponderer. Encapsulates authenticated REST c
 - WS URL is derived from HTTP base URL (`http -> ws`, `https -> wss`).
 - Enum decoding for chat/runtime state is compatibility-tolerant (`snake_case` plus legacy PascalCase aliases) to survive backend/frontend schema drift during upgrades.
 - Conversation list decode errors now include payload preview context to simplify diagnosing response-shape mismatches.
+- `ApiClient::get_turn_prompt` fetches `/v1/turns/:id/prompt` for per-message “View Prompt” inspection (context prompt + optional stored system prompt).

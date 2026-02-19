@@ -207,113 +207,105 @@ pub fn render_private_chat(
     messages: &[ChatMessage],
     streaming_preview: Option<&str>,
     media_cache: &mut ChatMediaCache,
-) {
-    ui.heading("Private Chat");
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new("Direct communication with your agent")
-            .weak()
-            .italics(),
-    );
-    ui.add_space(8.0);
+) -> Option<String> {
+    let mut requested_prompt_turn_id: Option<String> = None;
+    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.heading("Private Chat");
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Direct communication with your agent")
+                .weak()
+                .italics(),
+        );
+        ui.add_space(8.0);
 
-    let chat_scroll_height = ui.available_height().max(120.0);
-    ScrollArea::vertical()
-        .stick_to_bottom(true)
-        .max_height(chat_scroll_height)
-        .show(ui, |ui| {
-            if messages.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new(
-                            "No messages yet. Type below to start chatting with your agent.",
-                        )
-                        .weak()
-                        .italics(),
-                    );
-                });
-                return;
-            }
+        // Never force a minimum here: parent layout may already reserve space
+        // for live-tool output + composer, and forcing a min height causes
+        // overlap/pileups when agent tool activity expands.
+        let chat_scroll_height = ui.available_height().max(0.0);
+        ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .max_height(chat_scroll_height)
+            .show(ui, |ui| {
+                if let Some(preview) = streaming_preview {
+                    let trimmed = preview.trim();
+                    if !trimmed.is_empty() {
+                        let row_width = ui.available_width();
+                        let bubble_cap = (row_width - 8.0).max(120.0);
+                        let max_bubble_width = (row_width * 0.7).max(120.0).min(bubble_cap);
+                        ui.horizontal_top(|ui| {
+                            ui.vertical(|ui| {
+                                render_streaming_preview_bubble(ui, trimmed, max_bubble_width);
+                            });
+                        });
+                        ui.add_space(8.0);
+                    }
+                }
 
-            for msg in messages {
-                let is_operator = msg.role == "operator";
-                let time_str = msg.created_at.format("%H:%M").to_string();
-                let payload = parse_chat_payload(&msg.content);
-                let row_width = ui.available_width();
-                let bubble_cap = (row_width - 8.0).max(120.0);
-                let max_bubble_width = (row_width * 0.7).max(120.0).min(bubble_cap);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(row_width, 0.0),
-                    egui::Layout::left_to_right(egui::Align::TOP),
-                    |ui| {
-                        let bubble_width = max_bubble_width.min(ui.available_width());
+                if messages.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new(
+                                "No messages yet. Type below to start chatting with your agent.",
+                            )
+                            .weak()
+                            .italics(),
+                        );
+                    });
+                    return;
+                }
+
+                for msg in messages {
+                    let is_operator = msg.role == "operator";
+                    let time_str = msg.created_at.format("%H:%M").to_string();
+                    let payload = parse_chat_payload(&msg.content);
+                    let row_width = ui.available_width();
+                    let bubble_cap = (row_width - 8.0).max(120.0);
+                    let max_bubble_width = (row_width * 0.7).max(120.0).min(bubble_cap);
+                    let bubble_width = max_bubble_width.min(row_width);
+                    ui.horizontal_top(|ui| {
                         if is_operator {
-                            let spacer = (ui.available_width() - bubble_width).max(0.0);
+                            let spacer = (row_width - bubble_width).max(0.0);
                             if spacer > 0.0 {
                                 ui.add_space(spacer);
                             }
                         }
 
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(bubble_width, 0.0),
-                            egui::Layout::left_to_right(egui::Align::TOP),
-                            |ui| {
-                                render_chat_message_bubble(
-                                    ui,
-                                    msg,
-                                    &time_str,
-                                    &payload,
-                                    is_operator,
-                                    bubble_width,
-                                    media_cache,
-                                );
-                            },
-                        );
-                    },
-                );
-
-                if !payload.thinking_details.is_empty() || !payload.tool_details.is_empty() {
-                    ui.add_space(4.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(row_width, 0.0),
-                        egui::Layout::left_to_right(egui::Align::TOP),
-                        |ui| {
-                            render_message_detail_panels(ui, &msg.id, &payload);
-                        },
-                    );
-                }
-
-                if let Some(turn_control) = payload.turn_control.as_ref() {
-                    render_turn_control_separator(ui, turn_control);
-                    ui.add_space(6.0);
-                }
-
-                ui.add_space(8.0);
-            }
-
-            if let Some(preview) = streaming_preview {
-                let trimmed = preview.trim();
-                if !trimmed.is_empty() {
-                    let row_width = ui.available_width();
-                    let bubble_cap = (row_width - 8.0).max(120.0);
-                    let max_bubble_width = (row_width * 0.7).max(120.0).min(bubble_cap);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(row_width, 0.0),
-                        egui::Layout::left_to_right(egui::Align::TOP),
-                        |ui| {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(max_bubble_width, 0.0),
-                                egui::Layout::left_to_right(egui::Align::TOP),
-                                |ui| {
-                                    render_streaming_preview_bubble(ui, trimmed, max_bubble_width);
-                                },
+                        ui.vertical(|ui| {
+                            let prompt_clicked = render_chat_message_bubble(
+                                ui,
+                                msg,
+                                &time_str,
+                                &payload,
+                                is_operator,
+                                bubble_width,
+                                media_cache,
                             );
-                        },
-                    );
+                            if prompt_clicked {
+                                if let Some(turn_id) = msg.turn_id.as_deref() {
+                                    requested_prompt_turn_id = Some(turn_id.to_string());
+                                }
+                            }
+                        });
+                    });
+
+                    if let Some(turn_control) = payload.turn_control.as_ref() {
+                        render_turn_control_separator(ui, turn_control);
+                        ui.add_space(6.0);
+                    }
+
+                    if !payload.thinking_details.is_empty() || !payload.tool_details.is_empty() {
+                        ui.add_space(4.0);
+                        ui.horizontal_top(|ui| {
+                            render_message_detail_panels(ui, &msg.id, &payload);
+                        });
+                    }
+
                     ui.add_space(8.0);
                 }
-            }
-        });
+            });
+    });
+    requested_prompt_turn_id
 }
 
 fn render_chat_message_bubble(
@@ -324,7 +316,8 @@ fn render_chat_message_bubble(
     is_operator: bool,
     max_bubble_width: f32,
     media_cache: &mut ChatMediaCache,
-) {
+) -> bool {
+    let mut prompt_clicked = false;
     ui.group(|ui| {
         let inner_width = (max_bubble_width - 14.0).max(100.0);
         ui.set_min_width(inner_width);
@@ -351,6 +344,12 @@ fn render_chat_message_bubble(
         ui.horizontal(|ui| {
             ui.label(RichText::new(role_label).color(role_color).strong());
             ui.label(RichText::new(time_str).weak().small());
+            if !is_operator && msg.turn_id.is_some() {
+                ui.add_space(6.0);
+                if ui.small_button("View Prompt").clicked() {
+                    prompt_clicked = true;
+                }
+            }
         });
 
         ui.add(
@@ -381,6 +380,7 @@ fn render_chat_message_bubble(
             );
         }
     });
+    prompt_clicked
 }
 
 fn render_message_detail_panels(ui: &mut egui::Ui, message_id: &str, payload: &ChatRenderPayload) {

@@ -21,6 +21,10 @@ Defines `AgentApp`, the top-level eframe application for the API-only frontend. 
 - **Does**: Sends operator messages and creates new conversations via backend API.
 - **Interacts with**: `/v1/conversations/:id/messages`, `/v1/conversations`.
 
+### Prompt inspection (`open_prompt_inspector_for_turn`)
+- **Does**: Fetches the exact stored turn prompt payload from backend and opens an egui window showing full context prompt text, optional per-turn system prompt, and source-highlight overlays for context sections.
+- **Interacts with**: `/v1/turns/:id/prompt`, `chat::render_private_chat` prompt-button return value.
+
 ### `persist_config(config)`
 - **Does**: Saves settings/character/workflow config via backend API, syncs local panel state from backend response, and forces avatar reload so mood-avatar changes apply immediately.
 - **Interacts with**: `/v1/config`.
@@ -40,5 +44,7 @@ Defines `AgentApp`, the top-level eframe application for the API-only frontend. 
 ## Notes
 - The app is no longer wired to in-process `Agent`/`AgentDatabase`/`flume` backend channels.
 - WS event stream runs continuously with reconnect; polling refresh every 2s is retained for list/history/status consistency.
-- Composer input is bottom-anchored so expanding live tool output does not push the text box off-screen.
+- Activity panel is now visible by default so autonomous progress and wake/error telemetry are immediately visible without extra clicks.
+- Main chat surface now uses fixed vertical regions (chat history, live tool output, composer) to prevent tool/output panels from overlapping chat bubbles or pushing the composer off-screen.
 - UI-level API failures are surfaced in the activity log as `FrontendEvent::Error` entries.
+- Prompt inspector windows are opened on demand from agent message rows and support toggling system-prompt visibility plus translucent source highlights over prompt sections.

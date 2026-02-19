@@ -31,6 +31,7 @@ pub struct AgentApp {
     chat_media_cache: super::chat::ChatMediaCache,
     live_tool_progress: Vec<LiveToolProgress>,
     streaming_chat_preview: Option<StreamingChatPreview>,
+    prompt_inspector: Option<PromptInspectorWindow>,
     last_chat_refresh: std::time::Instant,
     show_activity_panel: bool,
 }
@@ -46,6 +47,16 @@ struct LiveToolProgress {
     tool_name: String,
     output_preview: String,
     subtask_id: Option<String>,
+}
+
+struct PromptInspectorWindow {
+    open: bool,
+    turn_id: String,
+    prompt_text: String,
+    system_prompt_text: String,
+    show_system_prompt: bool,
+    highlight_sections: bool,
+    error: Option<String>,
 }
 
 impl AgentApp {
@@ -90,8 +101,9 @@ impl AgentApp {
             chat_media_cache: super::chat::ChatMediaCache::new(),
             live_tool_progress: Vec::new(),
             streaming_chat_preview: None,
+            prompt_inspector: None,
             last_chat_refresh: std::time::Instant::now(),
-            show_activity_panel: false,
+            show_activity_panel: true,
         };
 
         app.refresh_status();
@@ -177,6 +189,38 @@ impl AgentApp {
             Err(error) => {
                 tracing::error!("Failed to send chat message: {}", error);
                 self.push_ui_error(format!("Failed to send message: {}", error));
+            }
+        }
+    }
+
+    fn open_prompt_inspector_for_turn(&mut self, turn_id: &str) {
+        match self
+            .runtime
+            .block_on(self.api_client.get_turn_prompt(turn_id))
+        {
+            Ok(prompt) => {
+                self.prompt_inspector = Some(PromptInspectorWindow {
+                    open: true,
+                    turn_id: prompt.turn_id,
+                    prompt_text: prompt.prompt_text,
+                    system_prompt_text: prompt.system_prompt_text.unwrap_or_default(),
+                    show_system_prompt: false,
+                    highlight_sections: false,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                tracing::warn!("Failed to fetch turn prompt {}: {}", turn_id, error);
+                self.prompt_inspector = Some(PromptInspectorWindow {
+                    open: true,
+                    turn_id: turn_id.to_string(),
+                    prompt_text: String::new(),
+                    system_prompt_text: String::new(),
+                    show_system_prompt: false,
+                    highlight_sections: false,
+                    error: Some(error.to_string()),
+                });
+                self.push_ui_error(format!("Failed to load turn prompt: {}", error));
             }
         }
     }
@@ -388,7 +432,10 @@ impl eframe::App for AgentApp {
                             }
                             Err(error) => {
                                 tracing::error!("Failed to stop active turn: {}", error);
-                                self.push_ui_error(format!("Failed to stop active turn: {}", error));
+                                self.push_ui_error(format!(
+                                    "Failed to stop active turn: {}",
+                                    error
+                                ));
                             }
                         }
                     }
@@ -462,117 +509,215 @@ impl eframe::App for AgentApp {
                 .filter(|entry| entry.conversation_id == self.active_conversation_id)
                 .cloned()
                 .collect();
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("💬");
-                    let response = ui.add_sized(
-                        [ui.available_width() - 80.0, 72.0],
-                        egui::TextEdit::multiline(&mut self.user_input)
-                            .hint_text("Message Ponderer...")
-                            .desired_rows(3),
+            let composer_reserved = 112.0_f32;
+            let live_reserved = if active_progress.is_empty() {
+                0.0
+            } else {
+                220.0
+            };
+            let chat_height = (ui.available_height() - composer_reserved - live_reserved).max(0.0);
+
+            let mut requested_prompt_turn_id: Option<String> = None;
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), chat_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    requested_prompt_turn_id = super::chat::render_private_chat(
+                        ui,
+                        &self.chat_history,
+                        active_streaming_preview.as_deref(),
+                        &mut self.chat_media_cache,
                     );
+                },
+            );
+            if let Some(turn_id) = requested_prompt_turn_id {
+                self.open_prompt_inspector_for_turn(&turn_id);
+            }
 
-                    let send_shortcut = response.has_focus()
-                        && ui.input(|i| {
-                            i.key_pressed(egui::Key::Enter)
-                                && !i.modifiers.shift
-                                && !i.modifiers.ctrl
-                                && !i.modifiers.command
-                                && !i.modifiers.alt
+            if !active_progress.is_empty() {
+                ui.add_space(6.0);
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Live Agent Turn").strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "Real-time tool output while the agent is still working",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(170.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            let mut global_lines: Vec<String> = Vec::new();
+                            let mut subtask_groups: Vec<(String, Vec<String>)> = Vec::new();
+
+                            for entry in &active_progress {
+                                let line =
+                                    format!("{} -> {}", entry.tool_name, entry.output_preview);
+                                if let Some(subtask_id) = entry.subtask_id.as_deref() {
+                                    if let Some((_, lines)) =
+                                        subtask_groups.iter_mut().find(|(id, _)| id == subtask_id)
+                                    {
+                                        lines.push(line);
+                                    } else {
+                                        subtask_groups.push((subtask_id.to_string(), vec![line]));
+                                    }
+                                } else {
+                                    global_lines.push(line);
+                                }
+                            }
+
+                            if !global_lines.is_empty() {
+                                ui.label(egui::RichText::new("General").small().weak());
+                                for line in &global_lines {
+                                    ui.monospace(line);
+                                }
+                                ui.add_space(6.0);
+                            }
+
+                            for (subtask_id, lines) in &subtask_groups {
+                                egui::CollapsingHeader::new(format!("Subtask {}", subtask_id))
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        for line in lines {
+                                            ui.monospace(line);
+                                        }
+                                    });
+                            }
                         });
-                    let send_clicked = ui.button("Send").clicked();
-
-                    if (send_shortcut || send_clicked) && !self.user_input.trim().is_empty() {
-                        let msg = self.user_input.trim().to_string();
-                        self.streaming_chat_preview = None;
-                        self.send_chat_message(&msg);
-                        self.user_input.clear();
-                    }
                 });
-                ui.add_space(4.0);
+            }
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Press Enter to send. Shift+Enter inserts a newline.")
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("💬");
+                let response = ui.add_sized(
+                    [ui.available_width() - 80.0, 68.0],
+                    egui::TextEdit::multiline(&mut self.user_input)
+                        .hint_text("Message Ponderer...")
+                        .desired_rows(3),
+                );
+
+                let send_shortcut = response.has_focus()
+                    && ui.input(|i| {
+                        i.key_pressed(egui::Key::Enter)
+                            && !i.modifiers.shift
+                            && !i.modifiers.ctrl
+                            && !i.modifiers.command
+                            && !i.modifiers.alt
+                    });
+                let send_clicked = ui.button("Send").clicked();
+
+                if (send_shortcut || send_clicked) && !self.user_input.trim().is_empty() {
+                    let msg = self.user_input.trim().to_string();
+                    self.streaming_chat_preview = None;
+                    self.send_chat_message(&msg);
+                    self.user_input.clear();
+                }
+            });
+            ui.add_space(8.0);
+        });
+
+        if let Some(inspector) = self.prompt_inspector.as_mut() {
+            let mut open = inspector.open;
+            egui::Window::new(format!(
+                "Turn Prompt · {}",
+                &inspector.turn_id.chars().take(12).collect::<String>()
+            ))
+            .open(&mut open)
+            .resizable(true)
+            .vscroll(true)
+            .show(ctx, |ui| {
                 ui.label(
-                    egui::RichText::new("Press Enter to send. Shift+Enter inserts a newline.")
+                    egui::RichText::new(format!("Turn ID: {}", inspector.turn_id))
                         .small()
                         .weak(),
                 );
-                ui.separator();
-
-                if !active_progress.is_empty() {
+                ui.add_space(6.0);
+                if let Some(error) = inspector.error.as_deref() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                } else if inspector.prompt_text.trim().is_empty() {
+                    ui.label(
+                        egui::RichText::new("No stored prompt text for this turn.")
+                            .small()
+                            .italics()
+                            .weak(),
+                    );
+                } else {
+                    ui.horizontal(|ui| {
+                        let system_label = if inspector.show_system_prompt {
+                            "Hide System Prompt"
+                        } else {
+                            "Show System Prompt"
+                        };
+                        if ui.button(system_label).clicked() {
+                            inspector.show_system_prompt = !inspector.show_system_prompt;
+                        }
+                        let highlight_label = if inspector.highlight_sections {
+                            "Hide Highlights"
+                        } else {
+                            "Highlight Sections"
+                        };
+                        if ui.button(highlight_label).clicked() {
+                            inspector.highlight_sections = !inspector.highlight_sections;
+                        }
+                    });
                     ui.add_space(6.0);
-                    egui::CollapsingHeader::new("Live Agent Turn")
-                        .default_open(true)
-                        .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Context Prompt").strong());
+                    if inspector.highlight_sections {
+                        render_highlighted_prompt_sections(ui, &inspector.prompt_text);
+                    } else {
+                        let mut prompt_text = inspector.prompt_text.clone();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut prompt_text)
+                                .desired_rows(22)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace)
+                                .interactive(false),
+                        );
+                    }
+
+                    if inspector.show_system_prompt {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("System Prompt").strong());
+                        if inspector.system_prompt_text.trim().is_empty() {
                             ui.label(
                                 egui::RichText::new(
-                                    "Real-time tool output while the agent is still working",
+                                    "No stored system prompt for this turn (older turn or migration gap).",
                                 )
                                 .small()
+                                .italics()
                                 .weak(),
                             );
-                            ui.add_space(4.0);
-                            egui::ScrollArea::vertical()
-                                .max_height(180.0)
-                                .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    let mut global_lines: Vec<String> = Vec::new();
-                                    let mut subtask_groups: Vec<(String, Vec<String>)> = Vec::new();
-
-                                    for entry in &active_progress {
-                                        let line =
-                                            format!("{} -> {}", entry.tool_name, entry.output_preview);
-                                        if let Some(subtask_id) = entry.subtask_id.as_deref() {
-                                            if let Some((_, lines)) = subtask_groups
-                                                .iter_mut()
-                                                .find(|(id, _)| id == subtask_id)
-                                            {
-                                                lines.push(line);
-                                            } else {
-                                                subtask_groups.push((subtask_id.to_string(), vec![line]));
-                                            }
-                                        } else {
-                                            global_lines.push(line);
-                                        }
-                                    }
-
-                                    if !global_lines.is_empty() {
-                                        ui.label(egui::RichText::new("General").small().weak());
-                                        for line in &global_lines {
-                                            ui.monospace(line);
-                                        }
-                                        ui.add_space(6.0);
-                                    }
-
-                                    for (subtask_id, lines) in &subtask_groups {
-                                        egui::CollapsingHeader::new(format!("Subtask {}", subtask_id))
-                                            .default_open(true)
-                                            .show(ui, |ui| {
-                                                for line in lines {
-                                                    ui.monospace(line);
-                                                }
-                                            });
-                                    }
-
-                                    if subtask_groups.is_empty() {
-                                        for line in &active_progress {
-                                            ui.monospace(format!(
-                                                "{} -> {}",
-                                                line.tool_name, line.output_preview
-                                            ));
-                                        }
-                                    }
-                                });
-                        });
+                        } else if inspector.highlight_sections {
+                            render_highlighted_prompt_sections(ui, &inspector.system_prompt_text);
+                        } else {
+                            let mut system_prompt = inspector.system_prompt_text.clone();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut system_prompt)
+                                    .desired_rows(16)
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::TextStyle::Monospace)
+                                    .interactive(false),
+                            );
+                        }
+                    }
                 }
-
-                ui.add_space(6.0);
-                super::chat::render_private_chat(
-                    ui,
-                    &self.chat_history,
-                    active_streaming_preview.as_deref(),
-                    &mut self.chat_media_cache,
-                );
             });
-        });
+            inspector.open = open;
+            if !inspector.open {
+                self.prompt_inspector = None;
+            }
+        }
 
         if let Some(new_config) = self.settings_panel.render(ctx) {
             self.persist_config(new_config);
@@ -604,6 +749,149 @@ fn parse_subtask_id(output: &str) -> Option<String> {
     } else {
         Some(id.to_string())
     }
+}
+
+#[derive(Debug, Clone)]
+struct PromptSection {
+    title: String,
+    source: &'static str,
+    color: egui::Color32,
+    body: String,
+}
+
+fn render_highlighted_prompt_sections(ui: &mut egui::Ui, prompt: &str) {
+    let sections = split_prompt_sections(prompt);
+    if sections.is_empty() {
+        let mut raw = prompt.to_string();
+        ui.add(
+            egui::TextEdit::multiline(&mut raw)
+                .desired_rows(10)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace)
+                .interactive(false),
+        );
+        return;
+    }
+
+    for section in sections {
+        let frame = egui::Frame::group(ui.style())
+            .fill(section.color.gamma_multiply(0.15))
+            .stroke(egui::Stroke::new(1.0, section.color.gamma_multiply(0.65)));
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&section.title).strong());
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("source: {}", section.source))
+                        .small()
+                        .color(section.color),
+                );
+            });
+            ui.add_space(3.0);
+            let mut body = section.body.clone();
+            let rows = body.lines().count().clamp(2, 14);
+            ui.add(
+                egui::TextEdit::multiline(&mut body)
+                    .desired_rows(rows)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .interactive(false),
+            );
+        });
+        ui.add_space(6.0);
+    }
+}
+
+fn split_prompt_sections(prompt: &str) -> Vec<PromptSection> {
+    let normalized = prompt.replace("\r\n", "\n");
+    let mut sections = Vec::new();
+
+    for chunk in normalized.split("\n\n---\n\n") {
+        let trimmed = chunk.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let title = trimmed
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .unwrap_or("Context");
+        let (source, color) = classify_prompt_section(title, trimmed);
+        sections.push(PromptSection {
+            title: title.to_string(),
+            source,
+            color,
+            body: trimmed.to_string(),
+        });
+    }
+
+    if sections.is_empty() && !normalized.trim().is_empty() {
+        let trimmed = normalized.trim();
+        let (source, color) = classify_prompt_section("Prompt", trimmed);
+        sections.push(PromptSection {
+            title: "Prompt".to_string(),
+            source,
+            color,
+            body: trimmed.to_string(),
+        });
+    }
+
+    sections
+}
+
+fn classify_prompt_section(title: &str, body: &str) -> (&'static str, egui::Color32) {
+    let title_l = title.to_ascii_lowercase();
+    let body_l = body.to_ascii_lowercase();
+    let pick = |source: &'static str, color: egui::Color32| (source, color);
+
+    if title_l.contains("concern priority context") || body_l.contains("concern priority context") {
+        return pick(
+            "Concerns manager (DB)",
+            egui::Color32::from_rgb(230, 179, 90),
+        );
+    }
+    if title_l.contains("working memory") || body_l.contains("working memory") {
+        return pick(
+            "Working memory (DB)",
+            egui::Color32::from_rgb(130, 180, 255),
+        );
+    }
+    if title_l.contains("recent conversation context") || body_l.contains("recent private chat") {
+        return pick(
+            "Recent chat history",
+            egui::Color32::from_rgb(120, 210, 170),
+        );
+    }
+    if title_l.contains("conversation summary snapshot") {
+        return pick("Compaction summary", egui::Color32::from_rgb(180, 160, 240));
+    }
+    if title_l.contains("recent action digest") {
+        return pick(
+            "Action digest (chat turns)",
+            egui::Color32::from_rgb(255, 150, 120),
+        );
+    }
+    if title_l.contains("previous ooda packet") {
+        return pick(
+            "Previous OODA packet",
+            egui::Color32::from_rgb(255, 200, 120),
+        );
+    }
+    if title_l.contains("ooda context") {
+        return pick(
+            "Orientation + decision context",
+            egui::Color32::from_rgb(140, 235, 140),
+        );
+    }
+    if title_l.contains("new operator message") {
+        return pick("Operator input", egui::Color32::from_rgb(120, 200, 255));
+    }
+    if title_l.contains("autonomous continuation context") {
+        return pick("Continuation hint", egui::Color32::from_rgb(220, 220, 120));
+    }
+
+    pick("Additional context", egui::Color32::from_gray(170))
 }
 
 #[cfg(test)]

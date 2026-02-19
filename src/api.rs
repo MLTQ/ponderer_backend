@@ -49,6 +49,14 @@ pub struct ChatMessage {
     pub content: String,
     pub created_at: DateTime<Utc>,
     pub processed: bool,
+    pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatTurnPrompt {
+    pub turn_id: String,
+    pub prompt_text: String,
+    pub system_prompt_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +134,13 @@ struct ApiEventEnvelope {
 #[derive(Debug, Deserialize)]
 struct SendMessageResponse {
     message_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatTurnPromptResponse {
+    turn_id: String,
+    prompt_text: String,
+    system_prompt_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,6 +291,27 @@ impl ApiClient {
             .context("Failed to decode send message response")?;
 
         Ok(response.message_id)
+    }
+
+    pub async fn get_turn_prompt(&self, turn_id: &str) -> Result<ChatTurnPrompt> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/turns/{}/prompt", turn_id),
+            )
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("GET /v1/turns/{}/prompt failed", turn_id))?
+            .json::<ChatTurnPromptResponse>()
+            .await
+            .context("Failed to decode turn prompt response")?;
+
+        Ok(ChatTurnPrompt {
+            turn_id: response.turn_id,
+            prompt_text: response.prompt_text,
+            system_prompt_text: response.system_prompt_text,
+        })
     }
 
     pub async fn get_agent_status(&self) -> Result<AgentRuntimeStatus> {
@@ -685,8 +721,7 @@ mod tests {
             "last_action_time": "2026-02-18T06:17:38.096788Z"
         });
 
-        let parsed: AgentRuntimeStatus =
-            serde_json::from_value(payload).expect("decode status");
+        let parsed: AgentRuntimeStatus = serde_json::from_value(payload).expect("decode status");
         assert!(matches!(parsed.visual_state, AgentVisualState::Thinking));
     }
 }

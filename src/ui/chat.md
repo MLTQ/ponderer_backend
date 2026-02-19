@@ -9,8 +9,8 @@ Renders the activity log and private chat stream for the API-only frontend. Supp
 - **Does**: Renders `FrontendEvent` items with color-coded formatting for observations, reasoning traces, tool progress, actions, orientation summaries, journal writes, concern lifecycle updates, and errors.
 - **Interacts with**: `crate::api::FrontendEvent`.
 
-### `render_private_chat(ui, messages, streaming_preview, media_cache)`
-- **Does**: Renders chat bubbles from `ChatMessage` records, including right-aligned operator rows, processing hints, metadata expanders, and inline media cards. Uses full available pane height (caller controls composer/live-output layout).
+### `render_private_chat(ui, messages, streaming_preview, media_cache) -> Option<String>`
+- **Does**: Renders chat bubbles from `ChatMessage` records, including right-aligned operator rows, per-agent-message `View Prompt` controls (when `turn_id` exists), processing hints, metadata expanders, and inline media cards. Returns requested `turn_id` when the operator clicks a prompt-inspection button.
 - **Interacts with**: `crate::api::ChatMessage`.
 
 ### `parse_chat_payload(content)`
@@ -24,7 +24,7 @@ Renders the activity log and private chat stream for the API-only frontend. Supp
 
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
-| `app.rs` | `render_private_chat` and `render_event_log` signatures remain stable | Signature changes break UI wiring |
+| `app.rs` | `render_private_chat` returns optional turn-id prompt-inspection request and `render_event_log` signature remains stable | Signature changes break UI wiring |
 | `api.rs` | `FrontendEvent` and `ChatMessage` fields expected by renderer remain compatible | Event/message schema changes require renderer updates |
 | Backend message formatter | Metadata block tags remain stable | Renaming tags breaks payload parsing |
 
@@ -32,3 +32,6 @@ Renders the activity log and private chat stream for the API-only frontend. Supp
 - Thinking and tool-call expanders render below bubbles in full-width rows for readability.
 - Long unbroken tokens are force-wrapped to keep message content visible in narrow windows.
 - Streaming preview displays raw in-flight text until backend persists final response.
+- Message rows use auto-height layout primitives (no fixed zero-height row allocations) to prevent bubble overlap/pileups when the pane is bottom-stuck.
+- Chat content is rendered in a dedicated top-down layout scope so it is not affected by the parent composer's bottom-up anchoring.
+- Chat scroll height now uses the exact remaining parent space (no forced minimum) to avoid overlap when the live tool panel expands.
