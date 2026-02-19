@@ -10,8 +10,12 @@ Defines the shared tool abstraction (`Tool` trait), typed tool I/O (`ToolOutput`
 - **Interacts with**: `tools/agentic.rs` function-calling loop
 
 ### `ToolRegistry`
-- **Does**: Stores tools, builds OpenAI-format tool definitions, and executes calls with approval checks plus per-context allow/deny filtering
+- **Does**: Stores tools, builds OpenAI-format tool definitions, and executes calls with approval checks plus per-context allow/deny filtering. Maintains a `session_approved` set of tool names that bypass the autonomous-mode block for the rest of the session.
 - **Interacts with**: `main.rs` (tool registration), `agent/mod.rs` (shared registry + context policies), `tools/approval.rs`
+
+### `ToolRegistry::grant_session_approval`
+- **Does**: Inserts a tool name into the session-approved set so subsequent autonomous calls to that tool skip the `NeedsApproval` gate.
+- **Interacts with**: `agent/mod.rs` `Agent::grant_session_tool_approval` and `server.rs` `POST /v1/agent/tools/:name/approve`
 
 ### `ToolContext`
 - **Does**: Carries execution metadata (`working_directory`, `username`, `autonomous`) and tool-scope controls (`allowed_tools`, `disallowed_tools`)
@@ -37,5 +41,6 @@ Defines the shared tool abstraction (`Tool` trait), typed tool I/O (`ToolOutput`
 
 ## Notes
 - Approval checks happen at registry execution time, not inside each tool.
+- Session approvals (`grant_session_approval`) override the autonomous-mode NeedsApproval gate for the lifetime of the process; they are not persisted across restarts.
 - Tool availability can now be restricted per run context before the model sees function defs and again at execution time.
 - `ToolOutput::Json` is now a key channel for rich chat metadata (for example media payloads extracted later by `agent/mod.rs` and `ui/chat.rs`).

@@ -31,3 +31,4 @@ Implements persona trajectory inference and snapshot capture. It analyzes histor
 ## Notes
 - Personality dimensions are intentionally open-ended: guiding principles seed expected keys, while LLM can propose new dimensions.
 - HTTP client initialization now uses shared panic-safe construction (`http_client::build_http_client`) for startup portability.
+- `normalize_chat_url()` (module-private) strips double-`/v1` paths: if `api_url` already ends with `/v1`, it appends `/chat/completions` directly; if it ends with `/chat/completions` it passes through unchanged; otherwise it appends `/v1/chat/completions`. Both `call_llm` and `capture_persona_snapshot` use it instead of naïve `format!("{}/v1/chat/completions", ...)` to avoid 404 errors when the configured URL already includes the API version prefix.

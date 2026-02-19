@@ -14,8 +14,12 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - **Interacts with**: all route handlers and auth middleware.
 
 ### REST handlers (`/v1/...`)
-- **Does**: Provide CRUD-like operations for config/conversations/messages plus turn/tool-call/prompt inspection, plugin manifest discovery, and pause/status/stop controls. Message enqueue now also triggers an immediate agent wake signal.
+- **Does**: Provide CRUD-like operations for config/conversations/messages plus turn/tool-call/prompt inspection, plugin manifest discovery, pause/status/stop controls, and tool session-approval grants. Message enqueue also triggers an immediate agent wake signal.
 - **Interacts with**: `database.rs` chat lifecycle APIs, `plugin.rs` manifests, and `agent` runtime control methods.
+
+### `POST /v1/agent/tools/:tool_name/approve`
+- **Does**: Grants session-level approval for a specific tool, allowing it to run autonomously without prompting for the rest of the process lifetime.
+- **Interacts with**: `agent/mod.rs` `Agent::grant_session_tool_approval` → `ToolRegistry::grant_session_approval`.
 
 ### WS handlers (`/v1/ws/events`)
 - **Does**: Broadcasts serialized `ApiEventEnvelope` events (timestamped) to connected clients.

@@ -18,8 +18,16 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `run_loop`, `run_cycle`, and UI-facing event emission
 
 ### `AgentEvent` / `AgentVisualState`
-- **Does**: Defines UI/event bus payloads describing current state, observations, reasoning traces, actions, orientation updates, journal writes, concern lifecycle updates, and errors
-- **Interacts with**: `ui::app` via shared flume channel
+- **Does**: Defines UI/event bus payloads describing current state, observations, reasoning traces, actions, orientation updates, journal writes, concern lifecycle updates, errors, and `ApprovalRequest { tool_name, reason }` for interactive tool-approval popups.
+- **Interacts with**: `ui::app` via shared flume channel; `server.rs` maps `ApprovalRequest` to the `approval_request` WS event type.
+
+### `Agent::grant_session_tool_approval`
+- **Does**: Delegates to `ToolRegistry::grant_session_approval` so the named tool bypasses `NeedsApproval` checks for the rest of the process lifetime.
+- **Interacts with**: `tools/mod.rs` `ToolRegistry::grant_session_approval`; called from `server.rs` `POST /v1/agent/tools/:name/approve`.
+
+### `maybe_notify_needs_approval`
+- **Does**: After each agentic pass, scans returned `ToolCallRecord`s for `NeedsApproval` outputs and emits one `AgentEvent::ApprovalRequest` per unique tool name (deduplicated within the pass). Does not post chat messages.
+- **Interacts with**: `tools::ToolOutput::NeedsApproval`, `Agent::emit`, `AgentEvent::ApprovalRequest`.
 
 ### `run_loop`
 - **Does**: Main background loop; checks pause/rate limits, then executes either legacy single-loop mode or phase-5 three-loop mode (`run_engaged_tick`, `run_ambient_tick`, `run_dream_cycle`) depending on config. Sleep windows are interruptible so queued operator messages can wake the loop immediately.
@@ -104,7 +112,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 | `memory/eval.rs` | Replay evaluation functions remain deterministic and serializable | Breaking report schema or candidate IDs |
 | `ui/chat.rs` | Embedded chat-metadata delimiters remain stable (`[tool_calls]`, `[thinking]`, `[media]`, `[turn_control]`) | Changing envelope formats without parser update |
 | `tools/comfy.rs` | Tool JSON with `media` arrays is transformed into chat-visible media payloads | Changing media extraction shape in formatter |
-| `server.rs` | Explicit pause/status controls remain available (`set_paused`, `runtime_status`) for REST API control | Removing pause/status methods or changing returned status shape |
+| `server.rs` | Explicit pause/status controls remain available (`set_paused`, `runtime_status`) for REST API control; `grant_session_tool_approval` is exposed via `POST /v1/agent/tools/:name/approve` | Removing pause/status/approval methods or changing returned status shape |
 
 ## Notes
 - Current behavior combines periodic skill polling with persona maintenance, optional heartbeat automation, and private chat handling.
