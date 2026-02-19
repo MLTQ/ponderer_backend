@@ -866,6 +866,7 @@ impl Agent {
                 }
                 trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
                 self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
+                self.maybe_notify_needs_approval(&result.tool_calls_made).await;
 
                 if did_nothing {
                     self.emit(AgentEvent::Observation(
@@ -1210,6 +1211,7 @@ impl Agent {
                     result: event_result,
                 })
                 .await;
+                self.maybe_notify_needs_approval(&result.tool_calls_made).await;
 
                 if !no_action {
                     let db_lock = self.database.read().await;
@@ -1856,6 +1858,31 @@ impl Agent {
         .await;
     }
 
+    /// Notify the user via chat if any tool calls in an autonomous pass were blocked
+    /// because they require approval. Posts once per agentic pass that contains blocked tools.
+    async fn maybe_notify_needs_approval(&self, tool_calls: &[ToolCallRecord]) {
+        let blocked: Vec<&str> = tool_calls
+            .iter()
+            .filter_map(|call| {
+                if matches!(call.output, ToolOutput::NeedsApproval { .. }) {
+                    Some(call.tool_name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if blocked.is_empty() {
+            return;
+        }
+        let tool_list: Vec<String> = blocked.iter().map(|n| format!("`{}`", n)).collect();
+        let msg = format!(
+            "⚠️ I need your approval to use {}. Reply \"allow {}\" to permit it for this session, or configure auto-approval in Settings → Tools.",
+            tool_list.join(", "),
+            blocked[0],
+        );
+        self.post_ambient_chat_message(&msg).await;
+    }
+
     /// Post an unprompted agent message to the default conversation so the user
     /// can see it when they next open the chat. Used by Surface and Interrupt
     /// dispositions to let the agent speak without waiting to be asked.
@@ -2245,6 +2272,7 @@ impl Agent {
                 }
                 trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
                 self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
+                self.maybe_notify_needs_approval(&result.tool_calls_made).await;
 
                 if let Some(response) = result.response.as_deref().filter(|r| !r.trim().is_empty())
                 {
@@ -2694,6 +2722,7 @@ impl Agent {
                 }
                 trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
                 self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
+                self.maybe_notify_needs_approval(&result.tool_calls_made).await;
 
                 if let Some(response) = result.response.as_deref().filter(|r| !r.trim().is_empty())
                 {
