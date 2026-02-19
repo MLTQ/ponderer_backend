@@ -445,6 +445,7 @@ async fn send_operator_message(
         .db
         .add_chat_message_in_conversation(&conversation_id, "operator", content)
         .map_err(internal_error)?;
+    state.agent.notify_operator_message_queued(&conversation_id);
 
     Ok(Json(SendMessageResponse {
         status: "queued",

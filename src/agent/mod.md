@@ -6,7 +6,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 ## Components
 
 ### `Agent`
-- **Does**: Owns runtime dependencies (skills, tools, config, database, reasoning engines) plus per-conversation background-subtask handles, and exposes lifecycle operations (`new`, `run_loop`, `reload_config`, `toggle_pause`, `set_paused`, `runtime_status`)
+- **Does**: Owns runtime dependencies (skills, tools, config, database, reasoning engines) plus per-conversation background-subtask handles, wake-signal primitives for interruptible sleeps, and lifecycle operations (`new`, `run_loop`, `reload_config`, `toggle_pause`, `set_paused`, `runtime_status`, `notify_operator_message_queued`)
 - **Interacts with**: `config::AgentConfig`, `database::AgentDatabase`, `skills::*`, `tools::ToolRegistry`, `agent::reasoning`, `agent::trajectory`, `agent::orientation`, `agent::journal`, `agent::concerns`
 
 ### Living Loop foundation modules (`journal`, `concerns`)
@@ -22,7 +22,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `ui::app` via shared flume channel
 
 ### `run_loop`
-- **Does**: Main background loop; checks pause/rate limits, then executes either legacy single-loop mode or phase-5 three-loop mode (`run_engaged_tick`, `run_ambient_tick`, `run_dream_cycle`) depending on config
+- **Does**: Main background loop; checks pause/rate limits, then executes either legacy single-loop mode or phase-5 three-loop mode (`run_engaged_tick`, `run_ambient_tick`, `run_dream_cycle`) depending on config. Sleep windows are interruptible so queued operator messages can wake the loop immediately.
 - **Interacts with**: `maybe_evolve_persona`, `run_engaged_tick`, `run_ambient_tick`, `should_dream`, `run_dream_cycle`, `run_cycle`
 
 ### `run_engaged_tick`
@@ -30,8 +30,12 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `process_chat_messages`, skill polling, `AgenticLoop` skill-event pass
 
 ### `run_ambient_tick`
-- **Does**: Runs orientation + disposition execution + optional concern decay + merged heartbeat scheduling in the ambient loop
-- **Interacts with**: `maybe_update_orientation`, `execute_disposition`, `maybe_run_heartbeat`, `ConcernsManager`
+- **Does**: Runs orientation + disposition execution + optional concern decay + autonomous self-directive scheduling + merged heartbeat scheduling in the ambient loop
+- **Interacts with**: `maybe_update_orientation`, `execute_disposition`, `maybe_run_self_directive`, `maybe_run_heartbeat`, `ConcernsManager`
+
+### `maybe_run_self_directive`
+- **Does**: Periodically executes one self-directed micro-task (from concern/memory context) in ambient mode when no operator messages or background subtasks are active; emits reasoning/action telemetry and persists autonomy summaries.
+- **Interacts with**: `AgenticLoop`, `AgentDatabase` concern/memory/activity-log APIs, `ToolRegistry` via heartbeat capability profile
 
 ### `maybe_run_heartbeat`
 - **Does**: Schedules autonomous heartbeat cycles, reads pending checklist/reminder signals, and invokes the tool-calling loop only when work exists
@@ -61,7 +65,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Rationale**: Keeps long-lived concern memory fresh without spamming low-value updates
 
 ### `process_chat_messages`
-- **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, emits per-tool progress updates, ingests structured concern signals (`[concerns]...[/concerns]`), and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol. Foreground turn caps are optional safety rails; if enabled and exhausted while work can still continue, it offloads to a detached background subtask. It also runs deterministic loop-heat detection on per-turn signatures (action + response + tool set), forces a loop-break yield when repetitive similarity heat reaches configured threshold, persists per-turn user+system prompt payloads for UI inspection, and stores a structured OODA packet per completed autonomous turn.
+- **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, emits per-tool progress updates, ingests structured concern signals (`[concerns]...[/concerns]`), and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol. Foreground turn caps are optional safety rails; if enabled and exhausted while work can still continue, it offloads to a detached background subtask. It also runs deterministic loop-heat detection on per-turn signatures (action + response + tool set), forces a loop-break yield when repetitive similarity heat reaches configured threshold, persists per-turn user+system prompt payloads for UI inspection, stores a structured OODA packet per completed autonomous turn, retries one transient agentic error, and writes an operator-visible fallback failure message on terminal turn failure.
 - **Interacts with**: `database::chat_messages`, `database::chat_conversations`, `database::chat_turns`, `database::chat_turn_tool_calls`, `tools::agentic::AgenticLoop::run_with_history_streaming_and_tool_events`, `ToolRegistry`
 - **Rationale**: Uses continuation hints (not synthetic operator messages) for multi-turn autonomy, scopes private-chat tools away from Graphchan posting, compacts long sessions through persisted summary snapshots, and only persists yielded assistant replies while allowing long tasks to continue asynchronously.
 
@@ -109,6 +113,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - Long-running private chats are compacted as `summary snapshot + recent context + new messages`, with snapshots stored in DB and refreshed after configurable message deltas.
 - Compaction summaries now include a bounded `Recent Reasoning Digest` synthesized from compacted-window OODA packets so older Observe/Orient/Decide/Act continuity survives transcript compression.
 - Private chat emits a structured turn-control block per assistant response; continuation is model-driven (`decision=continue` + no user input needed), with optional turn caps acting only as safety rails.
+- Wake signals from operator message enqueue now interrupt ambient/legacy sleep windows, reducing message-to-turn start latency during long tick intervals.
 - Private chat continuation now also requires meaningful forward progress signals (`tool_count > 0` or `status=still_working`) before another autonomous turn is allowed.
 - When private-chat continuation is still justified at the turn cap, work is handed off to a per-conversation background subtask runner instead of forcing an immediate stop.
 - Foreground and background autonomous chat turns now maintain a deterministic loop-heat counter from signature similarity (response text + turn-control action + tool set). When heat crosses configured threshold, continuation/offload is blocked and the agent yields with a loop-break message.
@@ -117,12 +122,16 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - Turn-control parsing treats visible assistant text as authoritative; block `user_message` is only fallback when visible text is empty and does not resemble a hallucinated `User:`/`Operator:` transcript.
 - Turn-control parsing tolerates malformed metadata envelopes (`[turn_control]` without closing marker) and fenced JSON payloads so continuation decisions remain stable across provider quirks.
 - Private-chat prompts now include concern-priority context ahead of general working memory to bias retrieval toward ongoing topics.
+- Private-chat working-memory injection is now conversation-scoped (`get_working_memory_context_for_conversation`) so daily activity logs do not interleave unrelated threads.
+- Private-chat recent conversation context now uses sanitized message summaries from `database.rs` (raw metadata/tool payload blocks are compacted into terse tags).
 - Private-chat prompts now include an explicit OODA section (`Observe`, `Orient`, `Decide`) sourced from latest orientation + continuation context before action generation, plus optional `Recent Action Digest` and `Previous OODA Packet` sections.
+- Recent Action Digest prompt context is now phase-aware and includes compact reply/error previews in addition to decision/status/tool names.
 - Completed autonomous turns now persist an OODA packet (`observe`, `orient`, `decide`, `act`) so subsequent turns and orientation refresh can consume structured turn-history context instead of raw transcript only.
 - Concern lifecycle now runs in-loop: decay demotes stale concerns, mention matching reactivates them, and structured concern signals create/touch concerns explicitly.
 - Ambient mode merges heartbeat scheduling into ambient ticks instead of a separate pre-cycle call.
 - Dream mode is gated by inactivity/time-of-day and minimum interval, then consolidates journal/context into working memory.
 - Tool-call progress is streamed as events during a turn so the UI can show real-time execution output (for example shell output snippets) before final reply persistence.
+- Ambient mode now includes a periodic self-directive pass that can choose one independent task, run tools, and persist a concise `[autonomy]` summary for later review.
 - Background subtasks reuse the same streaming callbacks, so detached turns still surface incremental tool output and token streaming in activity/chat panes.
 - Each autonomous private-chat turn is persisted in DB before/after execution, including tool-call lineage and terminal state (`completed`, `awaiting_approval`, or `failed`), but only the final yielded assistant message is added to chat history.
 - Orientation is now refreshed once per cycle as a log-only signal: it emits `OrientationUpdate`, persists `orientation_snapshots`, and uses an input signature cache to avoid repeated LLM calls when context is unchanged.
@@ -132,5 +141,6 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - Tool access is now enforced by explicit capability profiles per loop (`private_chat`, `skill_events`, `heartbeat`), with optional config overrides for allow/deny lists.
 - Operator messages and per-turn agent outcomes now append to daily memory log keys (`activity-log-YYYY-MM-DD`) for longitudinal context.
 - Heartbeat mode is guarded by config + due-time checks and is intentionally quiet when no pending tasks/reminders are found.
+- Terminal private-chat turn failures now generate an explicit fallback agent message and streaming completion event instead of silently dropping the turn.
 - Memory evolution scheduling is heartbeat-triggered but independently rate-limited by its own interval key in `agent_state`.
 - The run loop is intentionally conservative around errors: failures emit events and continue after short backoff.

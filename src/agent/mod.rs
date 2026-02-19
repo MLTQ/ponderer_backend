@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 
 use crate::agent::capability_profiles::{build_tool_context_for_profile, AgentCapabilityProfile};
@@ -44,6 +44,7 @@ use crate::tools::ToolOutput;
 use crate::tools::ToolRegistry;
 
 const HEARTBEAT_LAST_RUN_STATE_KEY: &str = "heartbeat_last_run_at";
+const SELF_DIRECTIVE_LAST_RUN_STATE_KEY: &str = "self_directive_last_run_at";
 const MEMORY_EVOLUTION_LAST_RUN_STATE_KEY: &str = "memory_evolution_last_run_at";
 const JOURNAL_LAST_WRITTEN_STATE_KEY: &str = "journal_last_written_at";
 const DREAM_LAST_RUN_STATE_KEY: &str = "dream_last_run_at";
@@ -69,6 +70,7 @@ const CHAT_COMPACTION_OODA_LINE_MAX_CHARS: usize = 170;
 const ACTION_DIGEST_TURN_LIMIT: usize = 12;
 const ACTION_DIGEST_MAX_CHARS: usize = 1400;
 const OODA_PACKET_CONTEXT_MAX_CHARS: usize = 1400;
+const CHAT_WORKING_MEMORY_MAX_CHARS: usize = 2200;
 static ORIENTATION_SCREEN_CAPTURE_FAILURE_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize)]
@@ -158,6 +160,8 @@ pub struct Agent {
     last_orientation_signature: Arc<RwLock<Option<String>>>,
     last_orientation: Arc<RwLock<Option<Orientation>>>,
     stop_generation: Arc<AtomicU64>,
+    wake_generation: Arc<AtomicU64>,
+    wake_notify: Arc<Notify>,
     background_subtasks:
         Arc<Mutex<HashMap<String, tokio::task::JoinHandle<BackgroundSubtaskResult>>>>,
 }
@@ -257,6 +261,8 @@ impl Agent {
             last_orientation_signature: Arc::new(RwLock::new(None)),
             last_orientation: Arc::new(RwLock::new(None)),
             stop_generation: Arc::new(AtomicU64::new(0)),
+            wake_generation: Arc::new(AtomicU64::new(0)),
+            wake_notify: Arc::new(Notify::new()),
             background_subtasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -411,7 +417,23 @@ impl Agent {
             ),
         })
         .await;
+        self.request_wake("stop_requested");
         self.set_state(AgentVisualState::Idle).await;
+    }
+
+    pub fn notify_operator_message_queued(&self, conversation_id: &str) {
+        self.request_wake(&format!(
+            "operator message queued [{}]",
+            truncate_for_event(conversation_id, 12)
+        ));
+    }
+
+    fn request_wake(&self, reason: &str) {
+        self.wake_generation.fetch_add(1, Ordering::SeqCst);
+        self.wake_notify.notify_waiters();
+        let _ = self
+            .event_tx
+            .send(AgentEvent::Observation(format!("Wake signal: {}", reason)));
     }
 
     async fn emit(&self, event: AgentEvent) {
@@ -424,6 +446,51 @@ impl Agent {
         drop(state);
 
         self.emit(AgentEvent::StateChanged(visual_state)).await;
+    }
+
+    async fn has_pending_operator_messages(&self) -> bool {
+        let db_lock = self.database.read().await;
+        let Some(db) = db_lock.as_ref() else {
+            return false;
+        };
+        db.get_unprocessed_operator_messages()
+            .map(|messages| !messages.is_empty())
+            .unwrap_or(false)
+    }
+
+    async fn wait_for_wake_or_timeout(&self, duration: Duration) -> bool {
+        if self.has_pending_operator_messages().await {
+            return true;
+        }
+
+        let baseline_generation = self.wake_generation.load(Ordering::SeqCst);
+        let timeout = sleep(duration);
+        tokio::pin!(timeout);
+
+        loop {
+            tokio::select! {
+                _ = &mut timeout => {
+                    return self.has_pending_operator_messages().await;
+                }
+                _ = self.wake_notify.notified() => {
+                    if self.wake_generation.load(Ordering::SeqCst) != baseline_generation
+                        || self.has_pending_operator_messages().await
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn wait_with_interruptible_sleep(&self, duration: Duration, label: &str) {
+        if self.wait_for_wake_or_timeout(duration).await {
+            self.emit(AgentEvent::Observation(format!(
+                "Wake signal interrupted {} wait; resuming now.",
+                label
+            )))
+            .await;
+        }
     }
 
     pub async fn run_loop(self: Arc<Self>) -> Result<()> {
@@ -440,7 +507,8 @@ impl Agent {
             {
                 let state = self.state.read().await;
                 if state.paused {
-                    sleep(Duration::from_secs(5)).await;
+                    self.wait_with_interruptible_sleep(Duration::from_secs(5), "paused-state")
+                        .await;
                     continue;
                 }
             }
@@ -453,7 +521,8 @@ impl Agent {
 
             // Check for rate limiting
             if self.is_rate_limited().await {
-                sleep(Duration::from_secs(10)).await;
+                self.wait_with_interruptible_sleep(Duration::from_secs(10), "rate-limit")
+                    .await;
                 continue;
             }
 
@@ -464,7 +533,11 @@ impl Agent {
                         tracing::error!("Engaged tick error: {}", e);
                         self.emit(AgentEvent::Error(e.to_string())).await;
                         self.set_state(AgentVisualState::Confused).await;
-                        sleep(Duration::from_secs(10)).await;
+                        self.wait_with_interruptible_sleep(
+                            Duration::from_secs(10),
+                            "engaged-loop-error-backoff",
+                        )
+                        .await;
                         continue;
                     }
                 };
@@ -480,7 +553,7 @@ impl Agent {
                 }
 
                 let tick = self.calculate_tick_duration(&config_snapshot, orientation.as_ref());
-                sleep(tick).await;
+                self.wait_with_interruptible_sleep(tick, "ambient-tick").await;
                 continue;
             }
 
@@ -488,13 +561,21 @@ impl Agent {
             self.maybe_run_heartbeat().await;
 
             let poll_interval = config_snapshot.poll_interval_secs;
-            sleep(Duration::from_secs(poll_interval)).await;
+            self.wait_with_interruptible_sleep(
+                Duration::from_secs(poll_interval),
+                "legacy-poll-interval",
+            )
+            .await;
 
             if let Err(e) = self.run_cycle().await {
                 tracing::error!("Agent cycle error: {}", e);
                 self.emit(AgentEvent::Error(e.to_string())).await;
                 self.set_state(AgentVisualState::Confused).await;
-                sleep(Duration::from_secs(10)).await;
+                self.wait_with_interruptible_sleep(
+                    Duration::from_secs(10),
+                    "legacy-loop-error-backoff",
+                )
+                .await;
             }
         }
     }
@@ -591,6 +672,214 @@ impl Agent {
     ///
     /// It looks for pending checklist items from HEARTBEAT.md-style markdown
     /// and reminder-like working-memory entries before invoking the tool-calling loop.
+    async fn maybe_run_self_directive(
+        &self,
+        config_snapshot: &AgentConfig,
+        pending_events: &[SkillEvent],
+    ) {
+        if !config_snapshot.enable_ambient_loop || !pending_events.is_empty() {
+            return;
+        }
+        if self.has_pending_operator_messages().await {
+            return;
+        }
+        {
+            let mut subtasks = self.background_subtasks.lock().await;
+            subtasks.retain(|_, handle| !handle.is_finished());
+            if !subtasks.is_empty() {
+                return;
+            }
+        }
+
+        let directive_interval_secs = configured_self_directive_interval_secs(config_snapshot);
+        let (should_run, concern_hints, memory_hints) = {
+            let db_lock = self.database.read().await;
+            let Some(db) = db_lock.as_ref() else {
+                tracing::warn!("Self-directive cycle skipped: database unavailable");
+                return;
+            };
+
+            let now = Utc::now();
+            let last_run = db
+                .get_state(SELF_DIRECTIVE_LAST_RUN_STATE_KEY)
+                .ok()
+                .flatten()
+                .and_then(|raw| raw.parse::<chrono::DateTime<Utc>>().ok());
+            let is_due = last_run
+                .map(|last| {
+                    now - last >= ChronoDuration::seconds(directive_interval_secs as i64)
+                })
+                .unwrap_or(true);
+
+            if !is_due {
+                (false, Vec::new(), Vec::new())
+            } else {
+                if let Err(e) = db.set_state(SELF_DIRECTIVE_LAST_RUN_STATE_KEY, &now.to_rfc3339()) {
+                    tracing::warn!("Failed to persist self-directive timestamp: {}", e);
+                }
+                let concerns = db
+                    .get_active_concerns()
+                    .map(|items| {
+                        items
+                            .into_iter()
+                            .take(6)
+                            .map(|concern| {
+                                format!(
+                                    "[{}] {}",
+                                    concern.salience.as_db_str(),
+                                    truncate_for_event(concern.summary.trim(), 120)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let hints = db
+                    .get_all_working_memory()
+                    .map(|entries| collect_heartbeat_memory_hints(&entries))
+                    .unwrap_or_default();
+                (true, concerns, hints)
+            }
+        };
+
+        if !should_run {
+            return;
+        }
+
+        self.emit(AgentEvent::Observation(
+            "Running autonomous self-directive cycle...".to_string(),
+        ))
+        .await;
+        self.set_state(AgentVisualState::Thinking).await;
+
+        let mut user_message = String::from(
+            "Run one self-directed micro-task that is useful right now and safe to execute without operator input.\n\
+             Priority order:\n\
+             1) advance active concerns\n\
+             2) improve memory/task hygiene via write_memory/search_memory\n\
+             3) gather low-risk local context that helps later operator turns.\n\
+             If no meaningful task exists, respond exactly with NO_ACTION.\n\
+             If blocked by approvals/access, use available tools and summarize what is blocked.\n\
+             Keep the final response concise.",
+        );
+
+        if !concern_hints.is_empty() {
+            user_message.push_str("\n\nActive concerns:\n");
+            for concern in &concern_hints {
+                user_message.push_str(&format!("- {}\n", concern));
+            }
+        }
+
+        if !memory_hints.is_empty() {
+            user_message.push_str("\nWorking-memory reminders:\n");
+            for note in &memory_hints {
+                user_message.push_str(&format!("- {}\n", note));
+            }
+        }
+
+        let loop_config = AgenticConfig {
+            max_iterations: configured_agentic_max_iterations(config_snapshot),
+            api_url: agentic_api_url(&config_snapshot.llm_api_url),
+            model: config_snapshot.llm_model.clone(),
+            api_key: config_snapshot.llm_api_key.clone(),
+            temperature: 0.25,
+            max_tokens: 1600,
+            cancel_generation: Some(self.stop_generation.clone()),
+            start_generation: self.stop_generation.load(Ordering::SeqCst),
+        };
+        let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
+        let tool_ctx = build_tool_context_for_profile(
+            config_snapshot,
+            AgentCapabilityProfile::Heartbeat,
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".to_string()),
+            config_snapshot.username.clone(),
+        );
+        let self_directive_system_prompt = format!(
+            "{}\n\nYou are in autonomous self-directive mode. Choose one useful task, execute it, and report the result clearly.",
+            config_snapshot.system_prompt
+        );
+
+        match agentic_loop
+            .run(&self_directive_system_prompt, &user_message, &tool_ctx)
+            .await
+        {
+            Ok(result) => {
+                let summary = result
+                    .response
+                    .unwrap_or_else(|| "NO_ACTION".to_string())
+                    .trim()
+                    .to_string();
+                let no_action = summary.eq_ignore_ascii_case("NO_ACTION");
+                let tool_count = result.tool_calls_made.len();
+
+                let mut trace_lines = vec![format!(
+                    "Self-directive cycle ({} tool call(s))",
+                    tool_count
+                )];
+                if !result.thinking_blocks.is_empty() {
+                    trace_lines.push(format!(
+                        "Model emitted {} thinking block(s) (hidden from summary)",
+                        result.thinking_blocks.len()
+                    ));
+                }
+                trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
+                self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
+
+                if no_action && tool_count == 0 {
+                    self.emit(AgentEvent::Observation(
+                        "Self-directive cycle found no immediate action.".to_string(),
+                    ))
+                    .await;
+                    return;
+                }
+
+                let event_result = if no_action {
+                    format!("{} tool call(s) attempted without a final summary.", tool_count)
+                } else {
+                    format!(
+                        "{} tool call(s). {}",
+                        tool_count,
+                        truncate_for_event(&summary, 240)
+                    )
+                };
+
+                self.emit(AgentEvent::ActionTaken {
+                    action: "Autonomous self-directive".to_string(),
+                    result: event_result.clone(),
+                })
+                .await;
+
+                let db_lock = self.database.read().await;
+                if let Some(db) = db_lock.as_ref() {
+                    if let Err(e) = db.append_daily_activity_log(&format!(
+                        "self-directive: tools={} summary={}",
+                        tool_count,
+                        truncate_for_event(summary.trim(), 220)
+                    )) {
+                        tracing::warn!("Failed to append self-directive log entry: {}", e);
+                    }
+                    if !no_action {
+                        let note = format!("[autonomy] {}", summary);
+                        if let Err(e) = db.add_chat_message("agent", &note) {
+                            tracing::warn!(
+                                "Failed to persist self-directive chat summary: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                self.emit(AgentEvent::Error(format!(
+                    "Self-directive cycle failed: {}",
+                    e
+                )))
+                .await;
+            }
+        }
+    }
+
     async fn maybe_run_heartbeat(&self) {
         let config_snapshot = { self.config.read().await.clone() };
         let enabled = config_snapshot.enable_heartbeat;
@@ -1798,6 +2087,9 @@ impl Agent {
             .await;
         }
 
+        self.maybe_run_self_directive(&config_snapshot, pending_events)
+            .await;
+
         if config_snapshot.enable_heartbeat {
             self.maybe_run_heartbeat().await;
         }
@@ -2246,19 +2538,16 @@ impl Agent {
         .await;
         self.set_state(AgentVisualState::Thinking).await;
 
-        let (working_memory_context, concerns_priority_context, config_snapshot) = {
+        let (concerns_priority_context, config_snapshot) = {
             let db_lock = self.database.read().await;
-            let (wm, concerns_ctx) = if let Some(ref db) = *db_lock {
-                (
-                    db.get_working_memory_context().unwrap_or_default(),
-                    ConcernsManager::build_priority_context(db, 10, 220).unwrap_or_default(),
-                )
+            let concerns_ctx = if let Some(ref db) = *db_lock {
+                ConcernsManager::build_priority_context(db, 10, 220).unwrap_or_default()
             } else {
-                (String::new(), String::new())
+                String::new()
             };
 
             let config = self.config.read().await;
-            (wm, concerns_ctx, config.clone())
+            (concerns_ctx, config.clone())
         };
         let latest_orientation = self.last_orientation.read().await.clone();
         let llm_api_url = config_snapshot.llm_api_url.clone();
@@ -2312,6 +2601,18 @@ impl Agent {
             let mut continuation_hint: Option<String> = None;
             let mut marked_initial_messages = false;
             let mut loop_heat_tracker = LoopHeatTracker::from_config(&config_snapshot);
+            let conversation_working_memory_context = {
+                let db_lock = self.database.read().await;
+                if let Some(ref db) = *db_lock {
+                    db.get_working_memory_context_for_conversation(
+                        &conversation_id,
+                        CHAT_WORKING_MEMORY_MAX_CHARS,
+                    )
+                    .unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            };
             let conversation_summary_context = self
                 .maybe_refresh_conversation_compaction_summary(
                     &conversation_id,
@@ -2402,7 +2703,7 @@ impl Agent {
                 let user_message = build_private_chat_agentic_prompt(
                     &pending_messages,
                     &concerns_priority_context,
-                    &working_memory_context,
+                    &conversation_working_memory_context,
                     &recent_chat_context,
                     conversation_summary_context.as_deref(),
                     continuation_hint.as_deref(),
@@ -2445,17 +2746,39 @@ impl Agent {
                     });
                 };
 
-                let result = match agentic_loop
-                    .run_with_history_streaming_and_tool_events(
-                        &chat_system_prompt,
-                        vec![],
-                        &user_message,
-                        &tool_ctx,
-                        &stream_callback,
-                        Some(&tool_event_callback),
-                    )
-                    .await
-                {
+                let mut attempts = 0usize;
+                let result = loop {
+                    attempts += 1;
+                    match agentic_loop
+                        .run_with_history_streaming_and_tool_events(
+                            &chat_system_prompt,
+                            vec![],
+                            &user_message,
+                            &tool_ctx,
+                            &stream_callback,
+                            Some(&tool_event_callback),
+                        )
+                        .await
+                    {
+                        Ok(result) => break Ok(result),
+                        Err(e) if attempts < 2 => {
+                            self.emit(AgentEvent::Observation(format!(
+                                "Operator task [{}] turn {} hit an error; retrying once ({})",
+                                conversation_tag,
+                                format_turn_progress(turn, chat_turn_limit),
+                                truncate_for_event(&e.to_string(), 180)
+                            )))
+                            .await;
+                            self.wait_with_interruptible_sleep(
+                                Duration::from_millis(900),
+                                "chat-turn-retry-backoff",
+                            )
+                            .await;
+                        }
+                        Err(e) => break Err(e),
+                    }
+                };
+                let result = match result {
                     Ok(result) => result,
                     Err(e) => {
                         if let Some(turn_id) = turn_id.as_deref() {
@@ -2485,6 +2808,69 @@ impl Agent {
                             conversation_tag,
                             e
                         )))
+                        .await;
+
+                        let fallback_response = format!(
+                            "I hit an internal error while working on your request and stopped this turn. Error: {}. Send a follow-up and I will retry immediately.",
+                            truncate_for_event(&e.to_string(), 180)
+                        );
+                        let fallback_chat = format_chat_message_with_metadata(
+                            &fallback_response,
+                            &[],
+                            &[],
+                        );
+                        let mut fallback_saved = false;
+                        let db_lock = self.database.read().await;
+                        if let Some(ref db) = *db_lock {
+                            let save_result = if let Some(turn_id) = turn_id.as_deref() {
+                                db.add_chat_message_in_turn(
+                                    &conversation_id,
+                                    turn_id,
+                                    "agent",
+                                    &fallback_chat,
+                                )
+                            } else {
+                                db.add_chat_message_in_conversation(
+                                    &conversation_id,
+                                    "agent",
+                                    &fallback_chat,
+                                )
+                            };
+
+                            fallback_saved = save_result.is_ok();
+                            if !fallback_saved {
+                                tracing::warn!(
+                                    "Failed to persist fallback error message for conversation [{}]",
+                                    conversation_tag
+                                );
+                            }
+
+                            if fallback_saved && !marked_initial_messages {
+                                for msg in &conversation_messages {
+                                    if let Err(mark_err) = db.mark_message_processed(&msg.id) {
+                                        tracing::warn!(
+                                            "Failed to mark failed-turn message as processed: {}",
+                                            mark_err
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        self.emit(AgentEvent::ChatStreaming {
+                            conversation_id: conversation_id.clone(),
+                            content: String::new(),
+                            done: true,
+                        })
+                        .await;
+                        self.emit(AgentEvent::ActionTaken {
+                            action: "Replied with failure fallback".to_string(),
+                            result: format!(
+                                "[{}] turn {} ended with internal error; fallback message delivered={}",
+                                conversation_tag,
+                                turn,
+                                fallback_saved
+                            ),
+                        })
                         .await;
                         break;
                     }
@@ -2557,7 +2943,7 @@ impl Agent {
                         .spawn_background_subtask(BackgroundSubtaskRequest {
                             conversation_id: conversation_id.clone(),
                             initial_continuation_hint: continuation_hint_text.clone(),
-                            working_memory_context: working_memory_context.clone(),
+                            working_memory_context: conversation_working_memory_context.clone(),
                             concerns_priority_context: concerns_priority_context.clone(),
                             summary_snapshot: conversation_summary_context.clone(),
                             chat_system_prompt: chat_system_prompt.clone(),
@@ -2604,7 +2990,7 @@ impl Agent {
                 let orient_stage = build_orient_stage(
                     latest_orientation.as_ref(),
                     &concerns_priority_context,
-                    &working_memory_context,
+                    &conversation_working_memory_context,
                 );
                 let decide_stage = build_decide_stage(
                     &turn_control,
@@ -3800,6 +4186,12 @@ async fn run_background_chat_subtask(
         let recent_chat_context = db
             .get_chat_context_for_conversation(&request.conversation_id, CHAT_CONTEXT_RECENT_LIMIT)
             .unwrap_or_default();
+        let working_memory_context = db
+            .get_working_memory_context_for_conversation(
+                &request.conversation_id,
+                CHAT_WORKING_MEMORY_MAX_CHARS,
+            )
+            .unwrap_or_else(|_| request.working_memory_context.clone());
         let recent_action_digest = db
             .get_recent_action_digest_for_conversation(
                 &request.conversation_id,
@@ -3823,7 +4215,7 @@ async fn run_background_chat_subtask(
         let user_message = build_private_chat_agentic_prompt(
             &[],
             &request.concerns_priority_context,
-            &request.working_memory_context,
+            &working_memory_context,
             &recent_chat_context,
             request.summary_snapshot.as_deref(),
             continuation_hint.as_deref(),
@@ -3967,7 +4359,7 @@ async fn run_background_chat_subtask(
         let orient_stage = build_orient_stage(
             request.latest_orientation.as_ref(),
             &request.concerns_priority_context,
-            &request.working_memory_context,
+            &working_memory_context,
         );
         let decide_stage = build_decide_stage(
             &turn_control,
@@ -4934,6 +5326,11 @@ fn configured_chat_background_max_turns(config: &AgentConfig) -> Option<usize> {
     }
 }
 
+fn configured_self_directive_interval_secs(config: &AgentConfig) -> u64 {
+    let base = config.ambient_min_interval_secs.max(15);
+    base.saturating_mul(6).clamp(60, 900)
+}
+
 fn configured_loop_heat_threshold(config: &AgentConfig) -> u32 {
     config.loop_heat_threshold.max(1)
 }
@@ -5065,6 +5462,22 @@ not a checklist item
     }
 
     #[test]
+    fn self_directive_interval_is_derived_from_ambient_tick() {
+        let mut cfg = AgentConfig::default();
+        cfg.ambient_min_interval_secs = 30;
+        assert_eq!(configured_self_directive_interval_secs(&cfg), 180);
+    }
+
+    #[test]
+    fn self_directive_interval_is_clamped() {
+        let mut cfg = AgentConfig::default();
+        cfg.ambient_min_interval_secs = 1;
+        assert_eq!(configured_self_directive_interval_secs(&cfg), 90);
+        cfg.ambient_min_interval_secs = 500;
+        assert_eq!(configured_self_directive_interval_secs(&cfg), 900);
+    }
+
+    #[test]
     fn picks_non_baseline_memory_promotion_candidate() {
         let traces = default_replay_trace_set();
         let report = evaluate_trace_set(
@@ -5105,6 +5518,7 @@ not a checklist item
             content: "Please list files".to_string(),
             created_at: now,
             processed: false,
+            turn_id: None,
         }];
         let prompt =
             build_private_chat_agentic_prompt(&msgs, "", "", "", None, None, None, None, None);
@@ -5444,6 +5858,7 @@ not a checklist item
                 content: "Please inspect the workspace and report findings.".to_string(),
                 created_at: now,
                 processed: true,
+                turn_id: None,
             },
             crate::database::ChatMessage {
                 id: "m2".to_string(),
@@ -5453,6 +5868,7 @@ not a checklist item
                     .to_string(),
                 created_at: now,
                 processed: true,
+                turn_id: None,
             },
         ];
         let packets = vec![OodaTurnPacketRecord {

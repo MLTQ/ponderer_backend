@@ -26,7 +26,7 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 
 ### `WorkingMemoryEntry`
 - **Does**: Key-value scratchpad entries the agent can read/write between sessions
-- **Interacts with**: `memory::MemoryBackend` contract, `get_working_memory_context()` formats all entries for LLM context injection
+- **Interacts with**: `memory::MemoryBackend` contract, `get_working_memory_context()` (global) and `get_working_memory_context_for_conversation()` (chat-scoped) format entries for LLM context injection
 
 ### Working-memory search/log methods (`search_working_memory`, `append_daily_activity_log`)
 - **Does**: Performs ranked text search over persisted memory entries and appends timestamped daily activity lines into date-keyed memory notes
@@ -86,11 +86,11 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - **Interacts with**: `agent::process_chat_messages`, `server.rs` prompt inspection route, frontend prompt inspector
 
 ### OODA/action digest methods (`save_ooda_turn_packet`, `get_latest_ooda_turn_packet`, `get_latest_ooda_turn_packet_for_conversation`, `get_recent_ooda_turn_packets_for_conversation_before`, `get_recent_action_digest`, `get_recent_action_digest_for_conversation`)
-- **Does**: Stores structured OODA packets per completed turn, serves bounded packet windows before a compaction cutoff, and emits deterministic summaries of recent turn decisions/tool usage
+- **Does**: Stores structured OODA packets per completed turn, serves bounded packet windows before a compaction cutoff, and emits deterministic high-signal summaries of recent turn phase/decision/tool usage plus compact reply/error previews
 - **Interacts with**: `agent::maybe_update_orientation`, private-chat prompt assembly, and conversation-compaction summary generation
 
 ### Chat conversation methods (`create_chat_conversation`, `list_chat_conversations`, `get_chat_conversation`, `add_chat_message_in_conversation`, `add_chat_message_in_turn`, `get_chat_history_for_conversation`, `get_chat_context_for_conversation`)
-- **Does**: Creates/lists/fetches conversation threads, writes messages (optionally bound to a turn), and returns thread-scoped history/context
+- **Does**: Creates/lists/fetches conversation threads, writes messages (optionally bound to a turn), and returns thread-scoped history/context; chat context formatting strips raw metadata blocks (`tool_calls`, `thinking`, `media`, `turn_control`, `concerns`) into compact summaries
 - **Interacts with**: `ui::app::AgentApp` new-chat/switch-chat actions, `agent::process_chat_messages` per-conversation prompt building
 
 ### Chat compaction methods (`count_chat_messages_for_conversation`, `get_chat_history_slice_for_conversation`, `upsert_chat_conversation_summary`, `get_chat_conversation_summary`)
@@ -129,6 +129,8 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - Conversation compaction snapshots are stored in `chat_conversation_summaries` and updated opportunistically by the agent loop when message-count thresholds are exceeded.
 - Living Loop ll.1 adds four additive tables: `journal_entries`, `concerns`, `orientation_snapshots`, `pending_thoughts_queue`.
 - OODA continuity adds additive table `ooda_turn_packets` plus supporting indexes on `(conversation_id, created_at)` and `(turn_id)`.
+- Conversation-scoped working-memory context keeps stable notes while filtering noisy cross-conversation activity lines by conversation tag.
+- Chat-context rendering now compacts metadata envelopes into concise tags so prompt windows avoid large embedded tool outputs.
 - Memory design metadata is stored in `agent_state` under `memory_design_id` and `memory_schema_version`.
 - Memory evolution archive uses three tables: `memory_design_archive`, `memory_eval_runs`, `memory_promotion_decisions`.
 - `memory_promotion_decisions` enforces rollback fields (`rollback_design_id`, `rollback_schema_version`) as NOT NULL.

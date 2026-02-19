@@ -292,7 +292,7 @@ impl OrientationEngine {
         match parsed {
             Ok(response) => Ok(self.parse_orientation(response, &context)),
             Err(error) => {
-                tracing::warn!(
+                tracing::debug!(
                     "Orientation LLM parse failed, using heuristic fallback: {}",
                     error
                 );

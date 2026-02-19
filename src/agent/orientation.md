@@ -35,7 +35,7 @@ Implements the Living Loop orientation engine: synthesizes presence, concerns, j
 | UI event handling | `Disposition`/`UserStateEstimate` remain stable enough for readable status summaries | Changing enum semantics without updating renderers |
 
 ## Notes
-- `orient` currently tolerates model format drift by falling back to heuristic orientation.
+- `orient` tolerates model format drift by falling back to heuristic orientation; parse failures are logged at debug level to reduce operator-facing warning noise.
 - Orientation JSON parsing accepts common alias field names (`salience_map`, `pending_actions`, `mood_estimate`, etc.) and mixed schema shapes (string or object forms for `user_state`, `mood`, and list entries), reducing parse failures with weaker/local models.
 - Fast-path signatures are intentionally bucketed (idle/cpu/memory/time) to reduce unnecessary model calls.
 - Desktop observations are optional and only present when the runtime orientation path supplies them.

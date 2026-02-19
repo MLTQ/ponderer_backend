@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -111,6 +111,16 @@ pub struct ChatMessage {
 
 pub const DEFAULT_CHAT_SESSION_ID: &str = "default_session";
 pub const DEFAULT_CHAT_CONVERSATION_ID: &str = "default";
+const CHAT_TOOL_BLOCK_START: &str = "[tool_calls]";
+const CHAT_TOOL_BLOCK_END: &str = "[/tool_calls]";
+const CHAT_THINKING_BLOCK_START: &str = "[thinking]";
+const CHAT_THINKING_BLOCK_END: &str = "[/thinking]";
+const CHAT_MEDIA_BLOCK_START: &str = "[media]";
+const CHAT_MEDIA_BLOCK_END: &str = "[/media]";
+const CHAT_TURN_CONTROL_BLOCK_START: &str = "[turn_control]";
+const CHAT_TURN_CONTROL_BLOCK_END: &str = "[/turn_control]";
+const CHAT_CONCERNS_BLOCK_START: &str = "[concerns]";
+const CHAT_CONCERNS_BLOCK_END: &str = "[/concerns]";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1656,6 +1666,57 @@ impl AgentDatabase {
         Ok(context)
     }
 
+    /// Get conversation-scoped working memory context to reduce cross-thread noise.
+    pub fn get_working_memory_context_for_conversation(
+        &self,
+        conversation_id: &str,
+        max_chars: usize,
+    ) -> Result<String> {
+        let entries = self.get_all_working_memory()?;
+        if entries.is_empty() {
+            return Ok(String::new());
+        }
+
+        let conversation_tag = short_conversation_tag(conversation_id);
+        let mut context = String::from("## Your Working Memory (Notes to Self)\n\n");
+        let mut appended = 0usize;
+
+        for entry in entries {
+            if entry.content.trim().is_empty() {
+                continue;
+            }
+
+            if entry.key.starts_with("activity-log-") {
+                if let Some(filtered) = filter_activity_log_for_conversation(
+                    &entry.content,
+                    &conversation_tag,
+                    14,
+                ) {
+                    context.push_str(&format!("### {}\n{}\n\n", entry.key, filtered));
+                    appended += 1;
+                }
+            } else {
+                context.push_str(&format!(
+                    "### {}\n{}\n\n",
+                    entry.key,
+                    truncate_for_db_digest(entry.content.trim(), 900)
+                ));
+                appended += 1;
+            }
+
+            if context.chars().count() >= max_chars.max(320) {
+                context = truncate_for_db_digest(&context, max_chars.max(320));
+                break;
+            }
+        }
+
+        if appended == 0 {
+            return Ok(String::new());
+        }
+
+        Ok(context)
+    }
+
     // ========================================================================
     // Living Loop Foundation - Journal
     // ========================================================================
@@ -3011,151 +3072,111 @@ impl AgentDatabase {
         let limit = limit.max(1) as i64;
         let mut lines: Vec<String> = Vec::new();
 
-        if let Some(conversation_id) = conversation_id {
-            let mut stmt = conn.prepare(
-                "SELECT
-                    conversation_id,
-                    started_at,
-                    decision,
-                    status,
-                    tool_call_count,
-                    reason,
-                    error,
-                    COALESCE(
-                      (
-                        SELECT GROUP_CONCAT(tool_name, ',')
-                        FROM (
-                          SELECT tool_name
-                          FROM chat_turn_tool_calls tc
-                          WHERE tc.turn_id = ct.id
-                          ORDER BY call_index ASC
-                          LIMIT 4
-                        )
-                      ),
-                      ''
-                    ) AS tool_preview
-                 FROM chat_turns ct
-                 WHERE conversation_id = ?1
-                 ORDER BY started_at DESC
-                 LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![conversation_id, limit], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)? as usize,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            })?;
-            for row in rows {
-                let (
-                    convo,
-                    started_at,
-                    decision,
-                    status,
-                    tool_count,
-                    reason,
-                    error,
-                    tool_preview,
-                ) = row?;
-                lines.push(format!(
-                    "- [{}] conv={} decision={} status={} tools={}{}{}{}",
-                    started_at,
-                    convo,
-                    decision.unwrap_or_else(|| "-".to_string()),
-                    status.unwrap_or_else(|| "-".to_string()),
-                    tool_count,
-                    if tool_preview.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", tool_preview)
-                    },
-                    reason
-                        .as_deref()
-                        .map(|value| format!(" reason=\"{}\"", truncate_for_db_digest(value, 120)))
-                        .unwrap_or_default(),
-                    error
-                        .as_deref()
-                        .map(|value| format!(" error=\"{}\"", truncate_for_db_digest(value, 120)))
-                        .unwrap_or_default()
+        let mut stmt = conn.prepare(
+            "SELECT
+                ct.conversation_id,
+                ct.started_at,
+                ct.phase_state,
+                ct.decision,
+                ct.status,
+                ct.tool_call_count,
+                ct.reason,
+                ct.error,
+                COALESCE(
+                  (
+                    SELECT GROUP_CONCAT(tool_name, ',')
+                    FROM (
+                      SELECT tool_name
+                      FROM chat_turn_tool_calls tc
+                      WHERE tc.turn_id = ct.id
+                      ORDER BY call_index ASC
+                      LIMIT 4
+                    )
+                  ),
+                  ''
+                ) AS tool_preview,
+                COALESCE(cm.content, '') AS agent_content
+             FROM chat_turns ct
+             LEFT JOIN chat_messages cm ON cm.id = ct.agent_message_id
+             WHERE (?1 IS NULL OR ct.conversation_id = ?1)
+             ORDER BY ct.started_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![conversation_id, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)? as usize,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })?;
+        for row in rows {
+            let (
+                convo,
+                started_at,
+                phase_state,
+                decision,
+                status,
+                tool_count,
+                reason,
+                error,
+                tool_preview,
+                agent_content,
+            ) = row?;
+            let mut line = format!(
+                "- [{}] {}phase={} decision={} status={} tools={}{}",
+                started_at,
+                if conversation_id.is_some() {
+                    String::new()
+                } else {
+                    format!("conv={} ", convo)
+                },
+                phase_state,
+                decision.unwrap_or_else(|| "-".to_string()),
+                status.unwrap_or_else(|| "-".to_string()),
+                tool_count,
+                if tool_preview.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", tool_preview)
+                }
+            );
+
+            let response_preview = summarize_chat_message_for_context(&agent_content);
+            if let Some(error_text) = error
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                line.push_str(&format!(
+                    " error=\"{}\"",
+                    truncate_for_db_digest(error_text, 140)
+                ));
+            } else if !response_preview.is_empty() {
+                line.push_str(&format!(
+                    " reply=\"{}\"",
+                    truncate_for_db_digest(&response_preview, 160)
                 ));
             }
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT
-                    conversation_id,
-                    started_at,
-                    decision,
-                    status,
-                    tool_call_count,
-                    reason,
-                    error,
-                    COALESCE(
-                      (
-                        SELECT GROUP_CONCAT(tool_name, ',')
-                        FROM (
-                          SELECT tool_name
-                          FROM chat_turn_tool_calls tc
-                          WHERE tc.turn_id = ct.id
-                          ORDER BY call_index ASC
-                          LIMIT 4
-                        )
-                      ),
-                      ''
-                    ) AS tool_preview
-                 FROM chat_turns ct
-                 ORDER BY started_at DESC
-                 LIMIT ?1",
-            )?;
-            let rows = stmt.query_map(params![limit], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)? as usize,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            })?;
-            for row in rows {
-                let (
-                    convo,
-                    started_at,
-                    decision,
-                    status,
-                    tool_count,
-                    reason,
-                    error,
-                    tool_preview,
-                ) = row?;
-                lines.push(format!(
-                    "- [{}] conv={} decision={} status={} tools={}{}{}{}",
-                    started_at,
-                    convo,
-                    decision.unwrap_or_else(|| "-".to_string()),
-                    status.unwrap_or_else(|| "-".to_string()),
-                    tool_count,
-                    if tool_preview.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", tool_preview)
-                    },
-                    reason
-                        .as_deref()
-                        .map(|value| format!(" reason=\"{}\"", truncate_for_db_digest(value, 120)))
-                        .unwrap_or_default(),
-                    error
-                        .as_deref()
-                        .map(|value| format!(" error=\"{}\"", truncate_for_db_digest(value, 120)))
-                        .unwrap_or_default()
+
+            if let Some(reason_text) = reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                line.push_str(&format!(
+                    " reason=\"{}\"",
+                    truncate_for_db_digest(reason_text, 120)
                 ));
             }
+
+            lines.push(line);
         }
 
         if lines.is_empty() {
@@ -3425,10 +3446,361 @@ impl AgentDatabase {
             } else {
                 "You"
             };
-            context.push_str(&format!("**{}**: {}\n\n", role_display, msg.content));
+            let sanitized = summarize_chat_message_for_context(&msg.content);
+            if sanitized.is_empty() {
+                continue;
+            }
+            context.push_str(&format!("**{}**: {}\n\n", role_display, sanitized));
         }
         Ok(context)
     }
+}
+
+fn short_conversation_tag(conversation_id: &str) -> String {
+    truncate_for_db_digest(conversation_id.trim(), 12)
+}
+
+fn filter_activity_log_for_conversation(
+    content: &str,
+    conversation_tag: &str,
+    max_lines: usize,
+) -> Option<String> {
+    let mut lines = content.lines();
+    let heading = lines.next().unwrap_or_default().trim();
+    let relevant_lines = lines
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+
+            if trimmed.contains(&format!("[{}]", conversation_tag)) {
+                return true;
+            }
+
+            let lowered = trimmed.to_ascii_lowercase();
+            !lowered.contains("operator [")
+                && !lowered.contains("agent [")
+                && !lowered.contains("chat [")
+                && !lowered.contains("conversation [")
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    if relevant_lines.is_empty() {
+        return None;
+    }
+
+    let keep_from = relevant_lines.len().saturating_sub(max_lines.max(1));
+    let mut rendered = String::new();
+    if !heading.is_empty() {
+        rendered.push_str(heading);
+        rendered.push_str("\n\n");
+    }
+    rendered.push_str(&relevant_lines[keep_from..].join("\n"));
+    Some(rendered)
+}
+
+fn summarize_chat_message_for_context(content: &str) -> String {
+    let (without_tools, tool_blocks) =
+        extract_tagged_blocks(content, CHAT_TOOL_BLOCK_START, CHAT_TOOL_BLOCK_END);
+    let (without_thinking, thinking_blocks) = extract_tagged_blocks(
+        &without_tools,
+        CHAT_THINKING_BLOCK_START,
+        CHAT_THINKING_BLOCK_END,
+    );
+    let (without_media, media_blocks) =
+        extract_tagged_blocks(&without_thinking, CHAT_MEDIA_BLOCK_START, CHAT_MEDIA_BLOCK_END);
+    let (without_turn_control, turn_control_blocks) = extract_tagged_blocks(
+        &without_media,
+        CHAT_TURN_CONTROL_BLOCK_START,
+        CHAT_TURN_CONTROL_BLOCK_END,
+    );
+    let (visible_text, concern_blocks) =
+        extract_tagged_blocks(&without_turn_control, CHAT_CONCERNS_BLOCK_START, CHAT_CONCERNS_BLOCK_END);
+
+    let compact_visible = compact_whitespace(&visible_text);
+    let mut tags: Vec<String> = Vec::new();
+    if let Some(summary) = summarize_tool_call_blocks(&tool_blocks) {
+        tags.push(summary);
+    }
+    if let Some(summary) = summarize_media_blocks(&media_blocks) {
+        tags.push(summary);
+    }
+    if let Some(summary) = summarize_thinking_blocks(&thinking_blocks) {
+        tags.push(summary);
+    }
+    if let Some(summary) = summarize_turn_control_blocks(&turn_control_blocks) {
+        tags.push(summary);
+    }
+    if let Some(summary) = summarize_concern_blocks(&concern_blocks) {
+        tags.push(summary);
+    }
+
+    let mut rendered = if compact_visible.is_empty() {
+        String::new()
+    } else {
+        compact_visible
+    };
+
+    if !tags.is_empty() {
+        if !rendered.is_empty() {
+            rendered.push(' ');
+        }
+        rendered.push('[');
+        rendered.push_str(&tags.join(" | "));
+        rendered.push(']');
+    }
+
+    truncate_for_db_digest(rendered.trim(), 900)
+}
+
+fn extract_tagged_blocks(content: &str, start_tag: &str, end_tag: &str) -> (String, Vec<String>) {
+    let mut remaining = content.to_string();
+    let mut blocks: Vec<String> = Vec::new();
+
+    loop {
+        let Some(start_idx) = remaining.find(start_tag) else {
+            break;
+        };
+
+        let mut block_start = start_idx + start_tag.len();
+        if remaining[block_start..].starts_with('\n') {
+            block_start += 1;
+        }
+
+        let (block_raw, next_remaining) = if let Some(rel_end) = remaining[block_start..].find(end_tag)
+        {
+            let block_end = block_start + rel_end;
+            let mut suffix_start = block_end + end_tag.len();
+            if remaining[suffix_start..].starts_with('\n') {
+                suffix_start += 1;
+            }
+            (
+                remaining[block_start..block_end].to_string(),
+                format!("{}{}", &remaining[..start_idx], &remaining[suffix_start..]),
+            )
+        } else {
+            (
+                remaining[block_start..].to_string(),
+                remaining[..start_idx].to_string(),
+            )
+        };
+
+        let trimmed = block_raw.trim();
+        if !trimmed.is_empty() {
+            blocks.push(trimmed.to_string());
+        }
+        remaining = next_remaining;
+    }
+
+    (remaining, blocks)
+}
+
+fn summarize_tool_call_blocks(blocks: &[String]) -> Option<String> {
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let mut total = 0usize;
+    let mut names: Vec<String> = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut error_count = 0usize;
+    let mut parse_failures = 0usize;
+
+    for block in blocks {
+        match serde_json::from_str::<serde_json::Value>(block) {
+            Ok(serde_json::Value::Array(items)) => {
+                total += items.len();
+                for item in items {
+                    let tool_name = item
+                        .get("tool_name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    if let Some(name) = tool_name {
+                        if seen_names.insert(name.to_string()) && names.len() < 3 {
+                            names.push(name.to_string());
+                        }
+                    }
+
+                    let is_error_kind = item
+                        .get("output_kind")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .map(|kind| kind.eq_ignore_ascii_case("error"))
+                        .unwrap_or(false);
+                    let output_preview_error = item
+                        .get("output_preview")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .map(|preview| {
+                            let lowered = preview.to_ascii_lowercase();
+                            lowered.contains("[error]") || lowered.contains("error:")
+                        })
+                        .unwrap_or(false);
+                    if is_error_kind || output_preview_error {
+                        error_count += 1;
+                    }
+                }
+            }
+            _ => parse_failures += 1,
+        }
+    }
+
+    if total == 0 && parse_failures == 0 {
+        return None;
+    }
+
+    let mut summary = if total > 0 {
+        format!("tools={}", total)
+    } else {
+        "tools=metadata".to_string()
+    };
+    if !names.is_empty() {
+        let extra = total.saturating_sub(names.len());
+        if extra > 0 {
+            summary.push_str(&format!(" ({} +{})", names.join(","), extra));
+        } else {
+            summary.push_str(&format!(" ({})", names.join(",")));
+        }
+    }
+    if error_count > 0 {
+        summary.push_str(&format!(", errors={}", error_count));
+    }
+    if parse_failures > 0 {
+        summary.push_str(", raw=true");
+    }
+    Some(summary)
+}
+
+fn summarize_media_blocks(blocks: &[String]) -> Option<String> {
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let mut total = 0usize;
+    let mut kinds: Vec<String> = Vec::new();
+    let mut seen_kinds: HashSet<String> = HashSet::new();
+    let mut parse_failures = 0usize;
+
+    for block in blocks {
+        match serde_json::from_str::<serde_json::Value>(block) {
+            Ok(serde_json::Value::Array(items)) => {
+                total += items.len();
+                for item in items {
+                    let kind = item
+                        .get("media_kind")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| item.get("kind").and_then(serde_json::Value::as_str))
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    if let Some(kind) = kind {
+                        if seen_kinds.insert(kind.to_string()) && kinds.len() < 2 {
+                            kinds.push(kind.to_string());
+                        }
+                    }
+                }
+            }
+            _ => parse_failures += 1,
+        }
+    }
+
+    if total == 0 && parse_failures == 0 {
+        return None;
+    }
+
+    let mut summary = if total > 0 {
+        format!("media={}", total)
+    } else {
+        "media=metadata".to_string()
+    };
+    if !kinds.is_empty() {
+        summary.push_str(&format!(" ({})", kinds.join(",")));
+    }
+    if parse_failures > 0 {
+        summary.push_str(", raw=true");
+    }
+    Some(summary)
+}
+
+fn summarize_thinking_blocks(blocks: &[String]) -> Option<String> {
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let mut hints = 0usize;
+    for block in blocks {
+        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(block) {
+            hints += items.len();
+        }
+    }
+
+    Some(if hints > 0 {
+        format!("thinking={} hidden", hints)
+    } else {
+        format!("thinking={} block(s) hidden", blocks.len())
+    })
+}
+
+fn summarize_turn_control_blocks(blocks: &[String]) -> Option<String> {
+    if blocks.is_empty() {
+        return None;
+    }
+
+    for block in blocks.iter().rev() {
+        let payload = block
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        let decision = value
+            .get("decision")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let status = value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        if decision.is_some() || status.is_some() {
+            return Some(format!(
+                "turn={}/{}",
+                decision.unwrap_or("-"),
+                status.unwrap_or("-")
+            ));
+        }
+    }
+
+    Some("turn=metadata".to_string())
+}
+
+fn summarize_concern_blocks(blocks: &[String]) -> Option<String> {
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let mut total = 0usize;
+    for block in blocks {
+        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(block) {
+            total += items.len();
+        }
+    }
+
+    Some(if total > 0 {
+        format!("concerns={}", total)
+    } else {
+        "concerns=metadata".to_string()
+    })
+}
+
+fn compact_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn truncate_for_db_digest(input: &str, max_chars: usize) -> String {
@@ -3629,6 +4001,69 @@ mod tests {
             .expect("daily log exists");
         assert!(item.content.contains("Ran memory search tool"));
         assert!(item.content.contains("Answered operator request"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn conversation_scoped_working_memory_filters_activity_lines() {
+        let path = temp_db_path("conversation_working_memory");
+        let db = AgentDatabase::new(&path).expect("db init");
+
+        let conversation_id = "73a4b73d-8589-4763-9e8f-a0a237225f8d";
+        let conversation_tag = short_conversation_tag(conversation_id);
+        let other_tag = short_conversation_tag("0fc67f06-da6d-42da-90fd-619ef8e9b6b2");
+
+        db.set_working_memory(
+            "activity-log-2026-02-19",
+            &format!(
+                "Daily activity log for 2026-02-19\n\n- [04:00:00 UTC] operator [{}]: first task\n- [04:01:00 UTC] agent [{}] turn 1: decision=yield\n- [04:02:00 UTC] operator [{}]: unrelated task\n- [04:03:00 UTC] self-directive: tools=0 summary=\n",
+                conversation_tag, conversation_tag, other_tag
+            ),
+        )
+        .expect("seed activity log");
+        db.set_working_memory("project-brief", "Keep autonomous turns bounded to useful work.")
+            .expect("seed stable memory");
+
+        let scoped = db
+            .get_working_memory_context_for_conversation(conversation_id, 4000)
+            .expect("scoped context");
+
+        assert!(scoped.contains(&conversation_tag));
+        assert!(!scoped.contains(&other_tag));
+        assert!(scoped.contains("self-directive"));
+        assert!(scoped.contains("project-brief"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn chat_context_strips_raw_metadata_blocks() {
+        let path = temp_db_path("chat_context_sanitization");
+        let db = AgentDatabase::new(&path).expect("db init");
+        let conversation = db
+            .create_chat_conversation(Some("Context sanitize"))
+            .expect("create conversation");
+
+        db.add_chat_message_in_conversation(&conversation.id, "operator", "Please run tools")
+            .expect("insert operator message");
+        db.add_chat_message_in_conversation(
+            &conversation.id,
+            "agent",
+            "Done.\n\n[tool_calls]\n[{\"tool_name\":\"list_directory\",\"output_kind\":\"text\",\"output_preview\":\"file-a\\nfile-b\"}]\n[/tool_calls]\n\n[thinking]\n[\"private note\"]\n[/thinking]\n\n[turn_control]\n{\"decision\":\"yield\",\"status\":\"done\"}\n[/turn_control]",
+        )
+        .expect("insert agent message");
+
+        let context = db
+            .get_chat_context_for_conversation(&conversation.id, 10)
+            .expect("chat context");
+
+        assert!(context.contains("Done."));
+        assert!(context.contains("tools=1"));
+        assert!(context.contains("thinking=1 hidden"));
+        assert!(context.contains("turn=yield/done"));
+        assert!(!context.contains("[tool_calls]"));
+        assert!(!context.contains("file-a\\nfile-b"));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -3864,6 +4299,14 @@ mod tests {
             "Cargo.toml",
         )
         .expect("record tool call");
+        let agent_message_id = db
+            .add_chat_message_in_turn(
+                &conversation.id,
+                &turn_id,
+                "agent",
+                "Listed files.\n\n[tool_calls]\n[{\"tool_name\":\"list_directory\",\"output_kind\":\"text\",\"output_preview\":\"Cargo.toml\"}]\n[/tool_calls]",
+            )
+            .expect("insert agent message");
         db.complete_chat_turn(
             &turn_id,
             ChatTurnPhase::Completed,
@@ -3872,7 +4315,7 @@ mod tests {
             "Completed listing files",
             Some("completed"),
             1,
-            None,
+            Some(&agent_message_id),
         )
         .expect("complete turn");
 
@@ -3929,8 +4372,10 @@ mod tests {
         let digest = db
             .get_recent_action_digest_for_conversation(&conversation.id, 8, 1000)
             .expect("digest");
+        assert!(digest.contains("phase=completed"));
         assert!(digest.contains("decision=yield"));
         assert!(digest.contains("list_directory"));
+        assert!(digest.contains("reply=\"Listed files."));
 
         let _ = std::fs::remove_file(&path);
     }
