@@ -254,6 +254,9 @@ fn map_agent_event(event: AgentEvent) -> ApiEventEnvelope {
             "approval_request",
             serde_json::json!({ "tool_name": tool_name, "reason": reason }),
         ),
+        AgentEvent::CycleStart { label } => {
+            envelope("cycle_start", serde_json::json!({ "label": label }))
+        }
     }
 }
 

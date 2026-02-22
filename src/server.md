@@ -21,6 +21,9 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - **Does**: Grants session-level approval for a specific tool, allowing it to run autonomously without prompting for the rest of the process lifetime.
 - **Interacts with**: `agent/mod.rs` `Agent::grant_session_tool_approval` → `ToolRegistry::grant_session_approval`.
 
+### `cycle_start` WS event
+- **Does**: Emitted by `map_agent_event` whenever the backend fires `AgentEvent::CycleStart { label }`. Carries a `label` string (e.g. `"💬 Engaged"`, `"🌿 Ambient"`) that the frontend uses to group activity-log events into collapsible turn groups.
+
 ### WS handlers (`/v1/ws/events`)
 - **Does**: Broadcasts serialized `ApiEventEnvelope` events (timestamped) to connected clients.
 - **Interacts with**: `spawn_event_bridge`, `map_agent_event`, backend frontend/event consumers.

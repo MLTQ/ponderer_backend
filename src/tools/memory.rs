@@ -2,6 +2,7 @@
 //!
 //! - `search_memory`: query persisted working memory entries.
 //! - `write_memory`: create or update a working-memory note.
+//! - `write_session_handoff`: write a cross-session continuity note injected at the top of next-session context.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -205,6 +206,76 @@ impl Tool for MemoryWriteTool {
             "key": key,
             "mode": mode,
             "content": final_content,
+        })))
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Memory
+    }
+}
+
+/// The fixed working-memory key used to store the cross-session handoff note.
+pub const SESSION_HANDOFF_KEY: &str = "session-handoff";
+
+pub struct WriteSessionHandoffTool;
+
+impl WriteSessionHandoffTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for WriteSessionHandoffTool {
+    fn name(&self) -> &str {
+        "write_session_handoff"
+    }
+
+    fn description(&self) -> &str {
+        "Write a handoff note for your next session. Use this when wrapping up work to capture: \
+         what you were doing, how far you got, the immediate next step, and any open questions or blockers. \
+         This note is injected at the very top of your context when you return, letting you resume instantly \
+         without re-reading history. Overwrite the previous note each time — one clean note per wrap-up."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The handoff note. Include: what you were working on, progress so far, the next concrete step, and any open questions or blockers. Be specific enough that you can resume cold."
+                }
+            },
+            "required": ["content"]
+        })
+    }
+
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let content = match params.get("content").and_then(Value::as_str).map(str::trim) {
+            Some(value) if !value.is_empty() => value,
+            _ => {
+                return Ok(ToolOutput::Error(
+                    "Missing required 'content' parameter".to_string(),
+                ))
+            }
+        };
+
+        let db = match open_database() {
+            Ok(db) => db,
+            Err(e) => return Ok(ToolOutput::Error(e.to_string())),
+        };
+
+        if let Err(e) = db.set_working_memory(SESSION_HANDOFF_KEY, content) {
+            return Ok(ToolOutput::Error(format!(
+                "Failed to save handoff note: {}",
+                e
+            )));
+        }
+
+        Ok(ToolOutput::Json(json!({
+            "status": "ok",
+            "message": "Handoff note saved. It will be injected at the top of your context when you return.",
         })))
     }
 

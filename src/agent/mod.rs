@@ -119,6 +119,10 @@ pub enum AgentEvent {
         summary: String,
     },
     Error(String),
+    /// Emitted at the start of each major agent cycle for UI turn grouping.
+    CycleStart {
+        label: String,
+    },
     /// Emitted when an autonomous tool call was blocked because it needs user approval.
     ApprovalRequest {
         tool_name: String,
@@ -780,6 +784,7 @@ impl Agent {
             return;
         }
 
+        self.emit(AgentEvent::CycleStart { label: "🧠 Self-directive".to_string() }).await;
         self.emit(AgentEvent::Observation(
             "Running autonomous self-directive cycle...".to_string(),
         ))
@@ -1120,6 +1125,7 @@ impl Agent {
             return;
         }
 
+        self.emit(AgentEvent::CycleStart { label: "💓 Heartbeat".to_string() }).await;
         self.emit(AgentEvent::Observation(
             "Running autonomous heartbeat checks...".to_string(),
         ))
@@ -2122,6 +2128,7 @@ impl Agent {
 
     async fn run_engaged_tick(&self) -> Result<Vec<SkillEvent>> {
         self.reap_finished_background_subtasks().await;
+        self.emit(AgentEvent::CycleStart { label: "💬 Engaged".to_string() }).await;
 
         // Engaged loop handles direct operator chat + external skill events.
         self.process_chat_messages().await?;
@@ -2338,6 +2345,7 @@ impl Agent {
         if self.has_pending_operator_messages().await {
             return None;
         }
+        self.emit(AgentEvent::CycleStart { label: "🌿 Ambient".to_string() }).await;
 
         let config_snapshot = { self.config.read().await.clone() };
 
@@ -2498,6 +2506,7 @@ impl Agent {
     }
 
     async fn run_dream_cycle(&self, config: &AgentConfig, orientation: Option<&Orientation>) {
+        self.emit(AgentEvent::CycleStart { label: "💤 Dream".to_string() }).await;
         self.emit(AgentEvent::Observation(
             "Starting dream cycle (ambient consolidation)...".to_string(),
         ))
@@ -2556,6 +2565,7 @@ impl Agent {
     }
 
     async fn run_cycle(&self) -> Result<()> {
+        self.emit(AgentEvent::CycleStart { label: "🔄 Cycle".to_string() }).await;
         // First, check for and process any private chat messages
         self.process_chat_messages().await?;
 
@@ -2874,7 +2884,7 @@ impl Agent {
         );
 
         let chat_system_prompt = format!(
-            "{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nDo not use Graphchan posting/reply tools in private chat.\nIf you detect persistent topics/projects/reminders, append a concerns block:\n{}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[\"optional-key\"]}}]\n{}\nUse an empty array when there are no concern updates.\nEvery response MUST end with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.",
+            "{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nDo not use Graphchan posting/reply tools in private chat.\nIf you detect persistent topics/projects/reminders, append a concerns block:\n{}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[\"optional-key\"]}}]\n{}\nUse an empty array when there are no concern updates.\nEvery response MUST end with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.\nWhen completing a significant work session, call write_session_handoff with a concise note: what you worked on, how far you got, the immediate next step, and any open questions. Your next instance will receive this note at the top of its context.",
             system_prompt,
             CHAT_CONCERNS_BLOCK_START,
             CHAT_CONCERNS_BLOCK_END,
@@ -2979,7 +2989,7 @@ impl Agent {
                 )))
                 .await;
 
-                let (recent_chat_context, recent_action_digest, previous_ooda_packet_context) = {
+                let (recent_chat_context, recent_action_digest, previous_ooda_packet_context, session_handoff_note) = {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
                         (
@@ -3011,14 +3021,19 @@ impl Agent {
                                         OODA_PACKET_CONTEXT_MAX_CHARS,
                                     )
                                 }),
+                            db.get_working_memory(crate::tools::memory::SESSION_HANDOFF_KEY)
+                                .ok()
+                                .flatten()
+                                .map(|entry| entry.content),
                         )
                     } else {
-                        (String::new(), None, None)
+                        (String::new(), None, None, None)
                     }
                 };
 
                 let user_message = build_private_chat_agentic_prompt(
                     &pending_messages,
+                    session_handoff_note.as_deref(),
                     &concerns_priority_context,
                     &conversation_working_memory_context,
                     &recent_chat_context,
@@ -4010,6 +4025,7 @@ fn parse_concern_signals(response: &str) -> (String, Vec<ConcernSignal>) {
 
 fn build_private_chat_agentic_prompt(
     new_messages: &[crate::database::ChatMessage],
+    session_handoff_note: Option<&str>,
     concerns_priority_context: &str,
     working_memory_context: &str,
     recent_chat_context: &str,
@@ -4020,6 +4036,16 @@ fn build_private_chat_agentic_prompt(
     previous_ooda_packet: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
+
+    // Handoff note from last session — injected first so it's the first thing in context.
+    if let Some(note) = session_handoff_note
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        prompt.push_str("## Your Handoff Note from Last Session\n\n");
+        prompt.push_str(note);
+        prompt.push_str("\n\n---\n\n");
+    }
 
     if !concerns_priority_context.trim().is_empty() {
         prompt.push_str(concerns_priority_context.trim());
@@ -4601,8 +4627,14 @@ async fn run_background_chat_subtask(
             .ok()
             .flatten()
             .map(|packet| format_ooda_packet_for_context(&packet, OODA_PACKET_CONTEXT_MAX_CHARS));
+        let session_handoff_note = db
+            .get_working_memory(crate::tools::memory::SESSION_HANDOFF_KEY)
+            .ok()
+            .flatten()
+            .map(|entry| entry.content);
         let user_message = build_private_chat_agentic_prompt(
             &[],
+            session_handoff_note.as_deref(),
             &request.concerns_priority_context,
             &working_memory_context,
             &recent_chat_context,
@@ -5942,7 +5974,7 @@ not a checklist item
             turn_id: None,
         }];
         let prompt =
-            build_private_chat_agentic_prompt(&msgs, "", "", "", None, None, None, None, None);
+            build_private_chat_agentic_prompt(&msgs, None, "", "", "", None, None, None, None, None);
         assert!(prompt.contains("Please list files"));
         assert!(prompt.contains("Use tools"));
     }
@@ -5951,6 +5983,7 @@ not a checklist item
     fn chat_prompt_includes_continuation_context_without_fake_operator_turn() {
         let prompt = build_private_chat_agentic_prompt(
             &[],
+            None,
             "",
             "",
             "",
@@ -5968,6 +6001,7 @@ not a checklist item
     fn chat_prompt_includes_summary_snapshot_when_available() {
         let prompt = build_private_chat_agentic_prompt(
             &[],
+            None,
             "",
             "",
             "",
@@ -6007,6 +6041,7 @@ not a checklist item
         };
         let prompt = build_private_chat_agentic_prompt(
             &[],
+            None,
             "",
             "",
             "",
@@ -6252,9 +6287,49 @@ not a checklist item
     }
 
     #[test]
+    fn chat_prompt_injects_session_handoff_note_first() {
+        let prompt = build_private_chat_agentic_prompt(
+            &[],
+            Some("Was working on X. Next step: do Y. Open question: Z?"),
+            "## Concern Priority Context\n- [active] Some concern",
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(prompt.contains("## Your Handoff Note from Last Session"));
+        assert!(prompt.contains("Was working on X"));
+        // Handoff note must appear before concerns context.
+        let note_pos = prompt.find("Handoff Note").unwrap();
+        let concerns_pos = prompt.find("Concern Priority Context").unwrap();
+        assert!(note_pos < concerns_pos, "handoff note should precede concerns context");
+    }
+
+    #[test]
+    fn chat_prompt_omits_handoff_section_when_none() {
+        let prompt = build_private_chat_agentic_prompt(
+            &[],
+            None,
+            "",
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!prompt.contains("Handoff Note from Last Session"));
+    }
+
+    #[test]
     fn chat_prompt_includes_concern_priority_context() {
         let prompt = build_private_chat_agentic_prompt(
             &[],
+            None,
             "## Concern Priority Context\n- [active] Ship concerns manager",
             "",
             "",

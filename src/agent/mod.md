@@ -18,8 +18,8 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `run_loop`, `run_cycle`, and UI-facing event emission
 
 ### `AgentEvent` / `AgentVisualState`
-- **Does**: Defines UI/event bus payloads describing current state, observations, reasoning traces, actions, orientation updates, journal writes, concern lifecycle updates, errors, and `ApprovalRequest { tool_name, reason }` for interactive tool-approval popups.
-- **Interacts with**: `ui::app` via shared flume channel; `server.rs` maps `ApprovalRequest` to the `approval_request` WS event type.
+- **Does**: Defines UI/event bus payloads describing current state, observations, reasoning traces, actions, orientation updates, journal writes, concern lifecycle updates, errors, `ApprovalRequest { tool_name, reason }` for interactive popups, and `CycleStart { label }` emitted at the top of each major cycle (Engaged, Ambient, Dream, Cycle, Self-directive, Heartbeat) for UI turn grouping.
+- **Interacts with**: `ui::app` via shared flume channel; `server.rs` maps all variants to typed WS event types.
 
 ### `Agent::grant_session_tool_approval`
 - **Does**: Delegates to `ToolRegistry::grant_session_approval` so the named tool bypasses `NeedsApproval` checks for the rest of the process lifetime.
@@ -94,6 +94,10 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Does**: Computes adaptive ambient tick frequency from user-state estimate, decides dream-trigger windows (away/deep-night + interval gate), and runs dream-cycle consolidation (trajectory check, journal digest, concern pruning)
 - **Interacts with**: `presence/mod.rs`, `orientation.rs`, `database.rs` state keys and working memory
 
+### `build_private_chat_agentic_prompt` (session handoff note injection)
+- **Does**: Accepts an optional `session_handoff_note: Option<&str>` as the first context parameter. When present, injects it under `## Your Handoff Note from Last Session` at the very top of the prompt — before concerns, working memory, and all other sections. Both the foreground (`process_chat_messages`) and background subtask paths read the note from `AgentDatabase::get_working_memory(SESSION_HANDOFF_KEY)` before calling the assembler.
+- **Interacts with**: `tools::memory::SESSION_HANDOFF_KEY`, `AgentDatabase::get_working_memory`
+
 ### Chat formatting helpers
 - **Does**: Builds operator-chat prompts and serializes tool-call/thinking/media metadata into `[tool_calls]...[/tool_calls]`, `[thinking]...[/thinking]`, and `[media]...[/media]` blocks for inline UI rendering
 - **Interacts with**: `ui/chat.rs` parser for collapsible tool details and media previews
@@ -152,3 +156,4 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - Terminal private-chat turn failures now generate an explicit fallback agent message and streaming completion event instead of silently dropping the turn.
 - Memory evolution scheduling is heartbeat-triggered but independently rate-limited by its own interval key in `agent_state`.
 - The run loop is intentionally conservative around errors: failures emit events and continue after short backoff.
+- The chat system prompt instructs the agent to call `write_session_handoff` when wrapping up a work session. The note is stored under a fixed key (`session-handoff`) and injected as the first context section on the next turn, enabling cold-start resumption without reading history.
