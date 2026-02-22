@@ -232,10 +232,11 @@ impl Tool for WriteSessionHandoffTool {
     }
 
     fn description(&self) -> &str {
-        "Write a handoff note for your next session. Use this when wrapping up work to capture: \
-         what you were doing, how far you got, the immediate next step, and any open questions or blockers. \
-         This note is injected at the very top of your context when you return, letting you resume instantly \
-         without re-reading history. Overwrite the previous note each time — one clean note per wrap-up."
+        "Write a one-shot handoff note for your next session. Use this when wrapping up work to \
+         capture: what you were doing, how far you got, the immediate next step, and any open \
+         questions or blockers. The note is injected at the very top of your next session's context \
+         and then automatically cleared — so if you want continuity across sessions, you must call \
+         this tool again at the end of each session. One clean note per wrap-up; do not call mid-task."
     }
 
     fn parameters_schema(&self) -> Value {

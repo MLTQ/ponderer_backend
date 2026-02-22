@@ -2884,7 +2884,7 @@ impl Agent {
         );
 
         let chat_system_prompt = format!(
-            "{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nDo not use Graphchan posting/reply tools in private chat.\nIf you detect persistent topics/projects/reminders, append a concerns block:\n{}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[\"optional-key\"]}}]\n{}\nUse an empty array when there are no concern updates.\nEvery response MUST end with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.\nWhen completing a significant work session, call write_session_handoff with a concise note: what you worked on, how far you got, the immediate next step, and any open questions. Your next instance will receive this note at the top of its context.",
+            "{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nDo not use Graphchan posting/reply tools in private chat.\nIf you detect persistent topics/projects/reminders, append a concerns block:\n{}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[\"optional-key\"]}}]\n{}\nUse an empty array when there are no concern updates.\nEvery response MUST end with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.\nWhen genuinely wrapping up a work session (decision=yield, task complete or naturally pausing), call write_session_handoff once with a concise note: what you worked on, how far you got, the immediate next step, and open questions. The note is one-shot: it will be injected at the top of the next session's context and then cleared automatically. Do NOT call it mid-task or on every turn.",
             system_prompt,
             CHAT_CONCERNS_BLOCK_START,
             CHAT_CONCERNS_BLOCK_END,
@@ -3021,10 +3021,24 @@ impl Agent {
                                         OODA_PACKET_CONTEXT_MAX_CHARS,
                                     )
                                 }),
-                            db.get_working_memory(crate::tools::memory::SESSION_HANDOFF_KEY)
-                                .ok()
-                                .flatten()
-                                .map(|entry| entry.content),
+                            {
+                                // Consume on read: the note is one-shot. Clear it immediately so
+                                // a stale note is never re-injected if the agent fails to write a
+                                // fresh one before the next session.
+                                let note = db
+                                    .get_working_memory(crate::tools::memory::SESSION_HANDOFF_KEY)
+                                    .ok()
+                                    .flatten()
+                                    .map(|entry| entry.content)
+                                    .filter(|c| !c.trim().is_empty());
+                                if note.is_some() {
+                                    let _ = db.set_working_memory(
+                                        crate::tools::memory::SESSION_HANDOFF_KEY,
+                                        "",
+                                    );
+                                }
+                                note
+                            },
                         )
                     } else {
                         (String::new(), None, None, None)
@@ -4627,11 +4641,19 @@ async fn run_background_chat_subtask(
             .ok()
             .flatten()
             .map(|packet| format_ooda_packet_for_context(&packet, OODA_PACKET_CONTEXT_MAX_CHARS));
-        let session_handoff_note = db
-            .get_working_memory(crate::tools::memory::SESSION_HANDOFF_KEY)
-            .ok()
-            .flatten()
-            .map(|entry| entry.content);
+        // Consume on read: clear immediately so stale notes are never re-injected.
+        let session_handoff_note = {
+            let note = db
+                .get_working_memory(crate::tools::memory::SESSION_HANDOFF_KEY)
+                .ok()
+                .flatten()
+                .map(|entry| entry.content)
+                .filter(|c| !c.trim().is_empty());
+            if note.is_some() {
+                let _ = db.set_working_memory(crate::tools::memory::SESSION_HANDOFF_KEY, "");
+            }
+            note
+        };
         let user_message = build_private_chat_agentic_prompt(
             &[],
             session_handoff_note.as_deref(),
