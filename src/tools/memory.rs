@@ -3,6 +3,7 @@
 //! - `search_memory`: query persisted working memory entries.
 //! - `write_memory`: create or update a working-memory note.
 //! - `write_session_handoff`: write a cross-session continuity note injected at the top of next-session context.
+//! - `scratch_note`: read/write/append/clear a task-scoped scratchpad (ephemeral, cleared when task is done).
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -217,6 +218,7 @@ impl Tool for MemoryWriteTool {
 /// The fixed working-memory key used to store the cross-session handoff note.
 pub const SESSION_HANDOFF_KEY: &str = "session-handoff";
 
+
 pub struct WriteSessionHandoffTool;
 
 impl WriteSessionHandoffTool {
@@ -278,6 +280,137 @@ impl Tool for WriteSessionHandoffTool {
             "status": "ok",
             "message": "Handoff note saved. It will be injected at the top of your context when you return.",
         })))
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Memory
+    }
+}
+
+/// The working-memory key used for the active task scratchpad.
+pub const SCRATCHPAD_KEY: &str = "scratchpad";
+
+pub struct ScratchNoteTool;
+
+impl ScratchNoteTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for ScratchNoteTool {
+    fn name(&self) -> &str {
+        "scratch_note"
+    }
+
+    fn description(&self) -> &str {
+        "Read or update your active task scratchpad — ephemeral working notes for the current task. \
+         Use mode='replace' to overwrite, 'append' to add to what's there, 'clear' to wipe it when \
+         the task is done, or 'read' to retrieve the current contents. \
+         Persists across turns within a session but meant to be cleared when you finish a task. \
+         Good for: what you know so far, steps completed/remaining, things tried that didn't work, \
+         what you'd do next if interrupted."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Content to write (required for replace/append; omit for read/clear)"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["replace", "append", "clear", "read"],
+                    "description": "replace: overwrite; append: add to existing; clear: wipe when done; read: retrieve current contents"
+                }
+            },
+            "required": ["mode"]
+        })
+    }
+
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let mode = params
+            .get("mode")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("read");
+
+        let db = match open_database() {
+            Ok(db) => db,
+            Err(e) => return Ok(ToolOutput::Error(e.to_string())),
+        };
+
+        match mode {
+            "read" => {
+                let content = db
+                    .get_working_memory(SCRATCHPAD_KEY)
+                    .ok()
+                    .flatten()
+                    .map(|e| e.content)
+                    .unwrap_or_default();
+                if content.trim().is_empty() {
+                    Ok(ToolOutput::Json(
+                        json!({ "status": "ok", "content": "", "empty": true }),
+                    ))
+                } else {
+                    Ok(ToolOutput::Json(
+                        json!({ "status": "ok", "content": content, "empty": false }),
+                    ))
+                }
+            }
+            "clear" => {
+                if let Err(e) = db.set_working_memory(SCRATCHPAD_KEY, "") {
+                    return Ok(ToolOutput::Error(format!("Failed to clear scratchpad: {}", e)));
+                }
+                Ok(ToolOutput::Json(
+                    json!({ "status": "ok", "message": "Scratchpad cleared." }),
+                ))
+            }
+            "replace" | "append" => {
+                let content =
+                    match params.get("content").and_then(Value::as_str).map(str::trim) {
+                        Some(v) if !v.is_empty() => v,
+                        _ => {
+                            return Ok(ToolOutput::Error(
+                                "'content' is required for replace/append modes".to_string(),
+                            ))
+                        }
+                    };
+                let final_content = if mode == "append" {
+                    let existing = db
+                        .get_working_memory(SCRATCHPAD_KEY)
+                        .ok()
+                        .flatten()
+                        .map(|e| e.content)
+                        .unwrap_or_default();
+                    if existing.trim().is_empty() {
+                        content.to_string()
+                    } else {
+                        format!("{}\n{}", existing.trim_end(), content)
+                    }
+                } else {
+                    content.to_string()
+                };
+                if let Err(e) = db.set_working_memory(SCRATCHPAD_KEY, &final_content) {
+                    return Ok(ToolOutput::Error(format!(
+                        "Failed to write scratchpad: {}",
+                        e
+                    )));
+                }
+                Ok(ToolOutput::Json(json!({
+                    "status": "ok",
+                    "mode": mode,
+                    "content": final_content,
+                })))
+            }
+            other => Ok(ToolOutput::Error(format!(
+                "Unknown mode '{}'. Use replace, append, clear, or read.",
+                other
+            ))),
+        }
     }
 
     fn category(&self) -> ToolCategory {

@@ -3240,6 +3240,31 @@ impl Agent {
                     chat_turn_limit,
                 );
 
+                // Completion nudge (Ponderer-q2y): if the agent returned 0 tool calls to an
+                // apparent action request and we have room for another turn, force one retry
+                // with an explicit prompt rather than silently accepting a non-answer.
+                let mut completion_retry_hint: Option<String> = None;
+                let within_turn_limit = chat_turn_limit
+                    .map(|limit| turn + 1 < limit)
+                    .unwrap_or(true);
+                if !should_continue
+                    && !should_offload_to_background
+                    && tool_count == 0
+                    && within_turn_limit
+                    && matches!(turn_control.status.as_str(), "done" | "still_working")
+                {
+                    let original_text =
+                        pending_messages.first().map(|m| m.content.as_str()).unwrap_or("");
+                    if looks_like_action_request(original_text) {
+                        completion_retry_hint = Some(
+                            "You responded with no tool calls to what appears to be an action                              request. Please attempt the task now — use the appropriate tools                              to actually execute it rather than just describing what you would do."
+                                .to_string(),
+                        );
+                        should_continue = true;
+                        should_offload_to_background = false;
+                    }
+                }
+
                 let mut background_subtask_spawned = false;
                 let mut operator_visible_response =
                     if !turn_control.operator_response.trim().is_empty() {
@@ -3533,20 +3558,31 @@ impl Agent {
                 self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
 
                 if should_continue {
-                    self.emit(AgentEvent::ActionTaken {
-                        action: "Continuing autonomous operator task".to_string(),
-                        result: format!(
-                            "[{}] {} tool call(s), status={}. {}",
-                            conversation_tag,
-                            tool_count,
-                            effective_status,
-                            truncate_for_event(&operator_visible_response, 80)
-                        ),
-                    })
-                    .await;
+                    if let Some(ref nudge) = completion_retry_hint {
+                        self.emit(AgentEvent::Observation(format!(
+                            "Completion nudge [{}] turn {}: 0 tool calls to action request — forcing retry.",
+                            conversation_tag, turn
+                        )))
+                        .await;
+                        let _ = nudge; // used below
+                    } else {
+                        self.emit(AgentEvent::ActionTaken {
+                            action: "Continuing autonomous operator task".to_string(),
+                            result: format!(
+                                "[{}] {} tool call(s), status={}. {}",
+                                conversation_tag,
+                                tool_count,
+                                effective_status,
+                                truncate_for_event(&operator_visible_response, 80)
+                            ),
+                        })
+                        .await;
+                    }
 
                     pending_messages.clear();
-                    continuation_hint = Some(continuation_hint_text.clone());
+                    continuation_hint = Some(
+                        completion_retry_hint.unwrap_or(continuation_hint_text.clone()),
+                    );
                     turn += 1;
                     continue;
                 }
@@ -3576,8 +3612,8 @@ impl Agent {
                 })
                 .await;
 
-                // Completion verification (Ponderer-5y8): flag turns that replied with
-                // no tool calls to what looked like an action request — potential non-completion.
+                // Completion verification: flag turns that reached the turn limit with 0 tool
+                // calls to an action request (the nudge retry could not run due to turn cap).
                 if tool_count == 0 && effective_status == "done" {
                     let original_text = pending_messages
                         .first()

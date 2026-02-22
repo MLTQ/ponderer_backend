@@ -173,7 +173,7 @@ async fn register_builtin_tools(tool_registry: Arc<ToolRegistry>) -> Result<()> 
         comfy::{GenerateComfyMediaTool, PostToGraphchanTool},
         files::{ListDirectoryTool, PatchFileTool, ReadFileTool, WriteFileTool},
         http::HttpFetchTool,
-        memory::{MemorySearchTool, MemoryWriteTool, WriteSessionHandoffTool},
+        memory::{MemorySearchTool, MemoryWriteTool, ScratchNoteTool, WriteSessionHandoffTool},
         shell::ShellTool,
         skill_bridge::GraphchanSkillTool,
         vision::{
@@ -216,11 +216,14 @@ async fn register_builtin_tools(tool_registry: Arc<ToolRegistry>) -> Result<()> 
     tool_registry
         .register(Arc::new(WriteSessionHandoffTool::new()))
         .await;
+    tool_registry
+        .register(Arc::new(ScratchNoteTool::new()))
+        .await;
     tool_registry.register(Arc::new(HttpFetchTool::new())).await;
     tool_registry
         .register(Arc::new(GraphchanSkillTool::new()))
         .await;
 
-    tracing::info!("Tool registry initialized with 16 built-in tools");
+    tracing::info!("Tool registry initialized with 17 built-in tools");
     Ok(())
 }
