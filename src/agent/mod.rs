@@ -3240,31 +3240,7 @@ impl Agent {
                     chat_turn_limit,
                 );
 
-                // Completion nudge (Ponderer-q2y): if the agent returned 0 tool calls to an
-                // apparent action request and we have room for another turn, force one retry
-                // with an explicit prompt rather than silently accepting a non-answer.
                 let mut completion_retry_hint: Option<String> = None;
-                let within_turn_limit = chat_turn_limit
-                    .map(|limit| turn + 1 < limit)
-                    .unwrap_or(true);
-                if !should_continue
-                    && !should_offload_to_background
-                    && tool_count == 0
-                    && within_turn_limit
-                    && matches!(turn_control.status.as_str(), "done" | "still_working")
-                {
-                    let original_text =
-                        pending_messages.first().map(|m| m.content.as_str()).unwrap_or("");
-                    if looks_like_action_request(original_text) {
-                        completion_retry_hint = Some(
-                            "You responded with no tool calls to what appears to be an action                              request. Please attempt the task now — use the appropriate tools                              to actually execute it rather than just describing what you would do."
-                                .to_string(),
-                        );
-                        should_continue = true;
-                        should_offload_to_background = false;
-                    }
-                }
-
                 let mut background_subtask_spawned = false;
                 let mut operator_visible_response =
                     if !turn_control.operator_response.trim().is_empty() {
@@ -3304,6 +3280,43 @@ impl Agent {
                             .map(|r| format!(" ({})", truncate_for_event(r, 120)))
                             .unwrap_or_default()
                     );
+                }
+
+                // Completion nudge (Ponderer-q2y): force a retry when:
+                // (a) response is suspiciously short/placeholder — the model emitted almost
+                //     nothing (e.g. "...") and no tools ran, regardless of message type, OR
+                // (b) message looks like an action request but 0 tool calls were made.
+                // Runs after operator_visible_response is finalized so we can check length.
+                // Skipped when heat detector tripped (already forcing yield) or at turn limit.
+                if !should_continue
+                    && !should_offload_to_background
+                    && !heat_update.tripped
+                    && tool_count == 0
+                    && chat_turn_limit.map(|lim| turn + 1 < lim).unwrap_or(true)
+                {
+                    let response_len = operator_visible_response.trim().len();
+                    let original_text =
+                        pending_messages.first().map(|m| m.content.as_str()).unwrap_or("");
+                    if response_len < 20 {
+                        // Too short to be useful — retry unconditionally.
+                        completion_retry_hint = Some(
+                            "Your response was too brief. Please provide a complete, \
+                             substantive reply."
+                                .to_string(),
+                        );
+                        should_continue = true;
+                        should_offload_to_background = false;
+                    } else if looks_like_action_request(original_text) {
+                        // Looks like a task but agent used no tools — retry with nudge.
+                        completion_retry_hint = Some(
+                            "You responded with no tool calls to what appears to be an action \
+                             request. Please attempt the task now — use the appropriate tools \
+                             to actually execute it rather than just describing what you would do."
+                                .to_string(),
+                        );
+                        should_continue = true;
+                        should_offload_to_background = false;
+                    }
                 }
 
                 let continuation_hint_text = format!(
