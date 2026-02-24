@@ -59,10 +59,9 @@ fn default_policy(profile: AgentCapabilityProfile) -> ToolCapabilityPolicy {
         AgentCapabilityProfile::PrivateChat => ToolCapabilityPolicy {
             autonomous: false,
             allowed_tools: None,
-            disallowed_tools: vec![
-                "graphchan_skill".to_string(),
-                "post_to_graphchan".to_string(),
-            ],
+            // Graphchan tools are allowed in private chat so the operator can explicitly
+            // direct posts. Spontaneous posting is discouraged via the system prompt.
+            disallowed_tools: vec![],
         },
         AgentCapabilityProfile::SkillEvents => ToolCapabilityPolicy {
             autonomous: true,
@@ -143,21 +142,23 @@ mod tests {
     use crate::config::AgentConfig;
 
     #[test]
-    fn private_chat_blocks_graphchan_tools_by_default() {
+    fn private_chat_allows_graphchan_tools_for_explicit_operator_requests() {
+        // Graphchan tools are no longer hard-blocked in private chat so the operator
+        // can explicitly ask the agent to post. Spontaneous posting is discouraged via
+        // the system prompt instruction, not via capability gating.
         let cfg = AgentConfig::default();
         let policy = resolve_capability_policy(
             AgentCapabilityProfile::PrivateChat,
             &cfg.capability_profiles,
         );
         assert!(!policy.autonomous);
-        assert!(policy
-            .disallowed_tools
-            .iter()
-            .any(|tool| tool.eq_ignore_ascii_case("graphchan_skill")));
-        assert!(policy
-            .disallowed_tools
-            .iter()
-            .any(|tool| tool.eq_ignore_ascii_case("post_to_graphchan")));
+        assert!(
+            !policy
+                .disallowed_tools
+                .iter()
+                .any(|tool| tool.eq_ignore_ascii_case("graphchan_skill")),
+            "graphchan_skill should not be hard-blocked in private chat"
+        );
     }
 
     #[test]
