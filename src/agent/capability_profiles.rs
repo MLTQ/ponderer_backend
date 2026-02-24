@@ -71,17 +71,15 @@ fn default_policy(profile: AgentCapabilityProfile) -> ToolCapabilityPolicy {
         AgentCapabilityProfile::Heartbeat => ToolCapabilityPolicy {
             autonomous: true,
             allowed_tools: None,
-            disallowed_tools: vec![
-                "graphchan_skill".to_string(),
-                "post_to_graphchan".to_string(),
-            ],
+            // Graphchan posting allowed — agent may share relevant updates under its own name.
+            disallowed_tools: vec![],
         },
         AgentCapabilityProfile::Ambient => ToolCapabilityPolicy {
             autonomous: true,
             allowed_tools: None,
+            // Graphchan posting allowed — agent may share thoughts/work under its own name.
+            // Destructive file/shell ops and media generation remain off in ambient mode.
             disallowed_tools: vec![
-                "graphchan_skill".to_string(),
-                "post_to_graphchan".to_string(),
                 "write_file".to_string(),
                 "patch_file".to_string(),
                 "shell".to_string(),
@@ -177,15 +175,19 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_blocks_graphchan_tools_by_default() {
+    fn heartbeat_allows_graphchan_for_autonomous_posting() {
+        // Agent may spontaneously post under its own name; heartbeat no longer blocks it.
         let cfg = AgentConfig::default();
         let policy =
             resolve_capability_policy(AgentCapabilityProfile::Heartbeat, &cfg.capability_profiles);
         assert!(policy.autonomous);
-        assert!(policy
-            .disallowed_tools
-            .iter()
-            .any(|tool| tool.eq_ignore_ascii_case("graphchan_skill")));
+        assert!(
+            !policy
+                .disallowed_tools
+                .iter()
+                .any(|tool| tool.eq_ignore_ascii_case("graphchan_skill")),
+            "graphchan_skill should not be blocked in heartbeat mode"
+        );
     }
 
     #[test]
