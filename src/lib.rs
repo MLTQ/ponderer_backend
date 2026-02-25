@@ -12,4 +12,5 @@ pub mod presence;
 pub mod runtime;
 pub mod server;
 pub mod skills;
+pub mod telegram;
 pub mod tools;

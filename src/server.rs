@@ -137,6 +137,7 @@ pub async fn serve_backend(
     });
 
     spawn_event_bridge(event_rx, ws_events);
+    crate::telegram::spawn_telegram_bot(state.clone());
     runtime.spawn_agent_loop();
 
     let protected = Router::new()
@@ -253,6 +254,16 @@ fn map_agent_event(event: AgentEvent) -> ApiEventEnvelope {
         AgentEvent::ApprovalRequest { tool_name, reason } => envelope(
             "approval_request",
             serde_json::json!({ "tool_name": tool_name, "reason": reason }),
+        ),
+        AgentEvent::ChatReply {
+            conversation_id,
+            content,
+        } => envelope(
+            "chat_reply",
+            serde_json::json!({
+                "conversation_id": conversation_id,
+                "content": content
+            }),
         ),
         AgentEvent::CycleStart { label } => {
             envelope("cycle_start", serde_json::json!({ "label": label }))

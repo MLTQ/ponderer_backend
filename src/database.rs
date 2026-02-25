@@ -111,6 +111,7 @@ pub struct ChatMessage {
 
 pub const DEFAULT_CHAT_SESSION_ID: &str = "default_session";
 pub const DEFAULT_CHAT_CONVERSATION_ID: &str = "default";
+pub const TELEGRAM_CONVERSATION_ID: &str = "telegram";
 const CHAT_TOOL_BLOCK_START: &str = "[tool_calls]";
 const CHAT_TOOL_BLOCK_END: &str = "[/tool_calls]";
 const CHAT_THINKING_BLOCK_START: &str = "[thinking]";

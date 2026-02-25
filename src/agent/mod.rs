@@ -104,6 +104,12 @@ pub enum AgentEvent {
         content: String,
         done: bool,
     },
+    /// Emitted once per operator-visible reply with the clean, stripped response text.
+    /// Use this (not ChatStreaming) to relay finished replies to external channels (e.g. Telegram).
+    ChatReply {
+        conversation_id: String,
+        content: String,
+    },
     ActionTaken {
         action: String,
         result: String,
@@ -3623,6 +3629,13 @@ impl Agent {
                         effective_status,
                         truncate_for_event(&operator_visible_response, 80)
                     ),
+                })
+                .await;
+                // Clean reply event — for external relays (Telegram, etc.) that need the
+                // stripped operator-visible text rather than the raw streaming output.
+                self.emit(AgentEvent::ChatReply {
+                    conversation_id: conversation_id.clone(),
+                    content: operator_visible_response.clone(),
                 })
                 .await;
 
