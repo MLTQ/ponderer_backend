@@ -152,7 +152,12 @@ pub async fn serve_backend(
             "/conversations",
             get(list_conversations).post(create_conversation),
         )
-        .route("/conversations/:id", get(get_conversation))
+        .route(
+            "/conversations/:id",
+            get(get_conversation)
+                .delete(delete_conversation)
+                .patch(update_conversation),
+        )
         .route("/conversations/:id/summary", get(get_conversation_summary))
         .route(
             "/conversations/:id/messages",
@@ -415,6 +420,51 @@ async fn get_conversation(
         .map_err(internal_error)?
     {
         Some(conversation) => Ok(Json(conversation)),
+        None => Err(not_found(format!(
+            "conversation '{}' not found",
+            conversation_id
+        ))),
+    }
+}
+
+async fn delete_conversation(
+    State(state): State<Arc<ServerState>>,
+    Path(conversation_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_conversation(&state, &conversation_id)?;
+    state
+        .db
+        .delete_chat_conversation(&conversation_id)
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(internal_error)
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateConversationRequest {
+    title: Option<String>,
+}
+
+async fn update_conversation(
+    State(state): State<Arc<ServerState>>,
+    Path(conversation_id): Path<String>,
+    Json(body): Json<UpdateConversationRequest>,
+) -> Result<Json<ChatConversation>, (StatusCode, String)> {
+    require_conversation(&state, &conversation_id)?;
+    if let Some(title) = body.title.as_deref() {
+        let title = title.trim();
+        if !title.is_empty() {
+            state
+                .db
+                .update_chat_conversation_title(&conversation_id, title)
+                .map_err(internal_error)?;
+        }
+    }
+    match state
+        .db
+        .get_chat_conversation(&conversation_id)
+        .map_err(internal_error)?
+    {
+        Some(conv) => Ok(Json(conv)),
         None => Err(not_found(format!(
             "conversation '{}' not found",
             conversation_id

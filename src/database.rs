@@ -2575,6 +2575,47 @@ impl AgentDatabase {
         }))
     }
 
+    /// Delete a conversation and all its associated data.
+    pub fn delete_chat_conversation(&self, conversation_id: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        // Delete tool calls for all turns belonging to this conversation.
+        conn.execute(
+            "DELETE FROM chat_turn_tool_calls WHERE turn_id IN (SELECT id FROM chat_turns WHERE conversation_id = ?1)",
+            params![conversation_id],
+        )?;
+        conn.execute(
+            "DELETE FROM chat_turns WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        conn.execute(
+            "DELETE FROM chat_messages WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        conn.execute(
+            "DELETE FROM chat_conversation_summaries WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        conn.execute(
+            "DELETE FROM ooda_turn_packets WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        conn.execute(
+            "DELETE FROM chat_conversations WHERE id = ?1",
+            params![conversation_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update the title of a conversation.
+    pub fn update_chat_conversation_title(&self, conversation_id: &str, title: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE chat_conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
+            params![title, Utc::now().to_rfc3339(), conversation_id],
+        )?;
+        Ok(())
+    }
+
     /// Start a new persisted turn for a conversation.
     pub fn begin_chat_turn(
         &self,

@@ -3497,6 +3497,73 @@ impl Agent {
                                 }
                             }
                             marked_initial_messages = true;
+
+                            // Auto-generate a title from the first user message if the
+                            // conversation still has the default placeholder title.
+                            let first_user_text = conversation_messages
+                                .iter()
+                                .find(|m| m.role == "operator")
+                                .map(|m| m.content.trim().to_string())
+                                .unwrap_or_default();
+                            if !first_user_text.is_empty() {
+                                // Check whether the title is still a generated placeholder.
+                                let needs_title = db
+                                    .get_chat_conversation(&conversation_id)
+                                    .ok()
+                                    .flatten()
+                                    .map(|c| {
+                                        c.title.starts_with("Chat ")
+                                            || c.title == "Default chat"
+                                    })
+                                    .unwrap_or(false);
+
+                                if needs_title {
+                                    let title_conv_id = conversation_id.clone();
+                                    let title_api_url = agentic_api_url(&llm_api_url);
+                                    let title_model = llm_model.clone();
+                                    let title_api_key =
+                                        llm_api_key.clone().unwrap_or_default();
+                                    let title_db = self.database.clone();
+                                    tokio::spawn(async move {
+                                        let client = crate::llm_client::LlmClient::new(
+                                            title_api_url,
+                                            title_api_key,
+                                            title_model,
+                                        );
+                                        let prompt = format!(
+                                            "Generate a concise 3-6 word title for a conversation that starts with this message. \
+                                             Respond with ONLY the title, no quotes, no punctuation at the end:\n\n{}",
+                                            first_user_text.chars().take(400).collect::<String>()
+                                        );
+                                        match client
+                                            .generate(vec![crate::llm_client::Message {
+                                                role: "user".to_string(),
+                                                content: prompt,
+                                            }])
+                                            .await
+                                        {
+                                            Ok(title) => {
+                                                let title = title.trim().trim_matches('"').trim_matches('\'').to_string();
+                                                if !title.is_empty() && title.len() <= 120 {
+                                                    let db_lock = title_db.read().await;
+                                                    if let Some(ref db) = *db_lock {
+                                                        let _ = db.update_chat_conversation_title(
+                                                            &title_conv_id,
+                                                            &title,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Failed to generate conversation title: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
+                            }
                         }
                     }
                 }
