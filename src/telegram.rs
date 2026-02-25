@@ -43,17 +43,14 @@ struct TelegramChat {
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
-/// Spawn the Telegram bot task if `TELEGRAM_BOT_TOKEN` is set.
-/// Does nothing (returns immediately) when the env var is absent.
-pub fn spawn_telegram_bot(state: Arc<ServerState>) {
-    let token = match std::env::var("TELEGRAM_BOT_TOKEN") {
-        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-        _ => return,
-    };
-
-    let allowed_chat_id: Option<i64> = std::env::var("TELEGRAM_CHAT_ID")
-        .ok()
-        .and_then(|s| s.trim().parse().ok());
+/// Spawn the Telegram bot task.
+/// `token` should be the bot token from config (or env var fallback via `AgentConfig::from_env`).
+/// Does nothing if `token` is empty.
+pub fn spawn_telegram_bot(state: Arc<ServerState>, token: String, allowed_chat_id: Option<i64>) {
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return;
+    }
 
     tokio::spawn(async move {
         tracing::info!(

@@ -259,6 +259,13 @@ pub struct AgentConfig {
     #[serde(default)]
     pub avatar_active: Option<String>, // Path to active/working avatar
 
+    // Telegram bot integration
+    #[serde(default)]
+    pub telegram_bot_token: Option<String>,
+    /// Telegram chat ID to accept messages from. None = accept any chat (less secure).
+    #[serde(default)]
+    pub telegram_chat_id: Option<i64>,
+
     // Legacy fields for backward compatibility
     #[serde(default)]
     pub max_posts_per_hour: u32,
@@ -419,6 +426,8 @@ impl Default for AgentConfig {
             avatar_idle: None,
             avatar_thinking: None,
             avatar_active: None,
+            telegram_bot_token: None,
+            telegram_chat_id: None,
             max_posts_per_hour: 10,
         }
     }
@@ -677,6 +686,18 @@ impl AgentConfig {
 
         if let Ok(name) = env::var("AGENT_NAME") {
             config.username = name;
+        }
+
+        if let Ok(token) = env::var("TELEGRAM_BOT_TOKEN") {
+            if !token.trim().is_empty() {
+                config.telegram_bot_token = Some(token.trim().to_string());
+            }
+        }
+
+        if let Ok(id_str) = env::var("TELEGRAM_CHAT_ID") {
+            if let Ok(id) = id_str.trim().parse::<i64>() {
+                config.telegram_chat_id = Some(id);
+            }
         }
 
         config

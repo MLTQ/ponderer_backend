@@ -137,7 +137,11 @@ pub async fn serve_backend(
     });
 
     spawn_event_bridge(event_rx, ws_events);
-    crate::telegram::spawn_telegram_bot(state.clone());
+    crate::telegram::spawn_telegram_bot(
+        state.clone(),
+        runtime.config.telegram_bot_token.clone().unwrap_or_default(),
+        runtime.config.telegram_chat_id,
+    );
     runtime.spawn_agent_loop();
 
     let protected = Router::new()
