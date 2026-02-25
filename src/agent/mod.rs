@@ -2961,6 +2961,10 @@ impl Agent {
                 .await;
 
             let mut turn = 1usize;
+            // Cache the DB-fetched chat context so intermediate messages written
+            // during continuation turns don't re-appear in the prompt and confuse
+            // the model into thinking the task is already done.
+            let mut cached_chat_context: Option<String> = None;
             loop {
                 if let Some(limit) = chat_turn_limit {
                     if turn > limit {
@@ -3003,11 +3007,17 @@ impl Agent {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
                         (
-                            db.get_chat_context_for_conversation(
-                                &conversation_id,
-                                CHAT_CONTEXT_RECENT_LIMIT,
-                            )
-                            .unwrap_or_default(),
+                            // Only read chat context from DB on the first turn of a request.
+                            // On continuation turns the cache prevents intermediate messages
+                            // we just persisted from re-appearing in the prompt context, which
+                            // would cause the model to think the task is already complete.
+                            cached_chat_context.get_or_insert_with(|| {
+                                db.get_chat_context_for_conversation(
+                                    &conversation_id,
+                                    CHAT_CONTEXT_RECENT_LIMIT,
+                                )
+                                .unwrap_or_default()
+                            }).clone(),
                             db.get_recent_action_digest_for_conversation(
                                 &conversation_id,
                                 ACTION_DIGEST_TURN_LIMIT,
