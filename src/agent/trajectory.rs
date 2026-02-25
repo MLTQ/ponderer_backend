@@ -253,22 +253,38 @@ Respond ONLY with valid JSON."#,
             .await
             .context("Failed to send trajectory analysis request")?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("Failed to read trajectory analysis response body")?;
+
+        if !status.is_success() {
             anyhow::bail!("LLM API error {}: {}", status, body);
         }
 
-        let chat_response: ChatResponse = response
-            .json()
-            .await
-            .context("Failed to parse LLM response")?;
+        let chat_response: ChatResponse = serde_json::from_str(&body)
+            .with_context(|| {
+                format!(
+                    "Failed to parse trajectory LLM response. Raw body:\n{}",
+                    body.chars().take(800).collect::<String>()
+                )
+            })?;
 
-        chat_response
+        let content = chat_response
             .choices
             .first()
             .map(|c| c.message.content.clone())
-            .context("Empty LLM response")
+            .unwrap_or_default();
+
+        if content.trim().is_empty() {
+            anyhow::bail!(
+                "LLM returned empty content for trajectory analysis.\n\nFull raw response:\n{}",
+                body.chars().take(1200).collect::<String>()
+            );
+        }
+
+        Ok(content)
     }
 
     fn parse_trajectory_response(
@@ -446,22 +462,36 @@ Be honest about your current state. Respond ONLY with valid JSON."#,
         .await
         .context("Failed to send persona capture request")?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("Failed to read persona capture response body")?;
+
+    if !status.is_success() {
         anyhow::bail!("LLM API error {}: {}", status, body);
     }
 
-    let chat_response: ChatResponse = response
-        .json()
-        .await
-        .context("Failed to parse LLM response")?;
+    let chat_response: ChatResponse = serde_json::from_str(&body)
+        .with_context(|| {
+            format!(
+                "Failed to parse persona capture LLM response. Raw body:\n{}",
+                body.chars().take(800).collect::<String>()
+            )
+        })?;
 
     let content = chat_response
         .choices
         .first()
         .map(|c| c.message.content.clone())
-        .context("Empty LLM response")?;
+        .unwrap_or_default();
+
+    if content.trim().is_empty() {
+        anyhow::bail!(
+            "LLM returned empty content for persona snapshot.\n\nFull raw response:\n{}",
+            body.chars().take(1200).collect::<String>()
+        );
+    }
 
     // Parse the response
     let json_str = extract_json(&content)?;
