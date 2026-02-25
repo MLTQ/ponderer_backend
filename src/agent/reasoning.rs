@@ -411,28 +411,32 @@ pub(crate) fn extract_json(response: &str) -> Result<String> {
         return Ok(text.to_string());
     }
 
-    // Case 4: Last resort - try to clean common issues
+    // Case 4: Clean the whole text and retry (handles prose-wrapped JSON with minor issues).
     let cleaned = clean_json_string(text);
     if serde_json::from_str::<serde_json::Value>(&cleaned).is_ok() {
-        tracing::debug!("Extracted JSON after cleaning (removed trailing commas, comments, etc.)");
+        tracing::debug!("Extracted JSON after cleaning whole text");
         return Ok(cleaned);
     }
 
-    // All strategies failed - log detailed error
-    tracing::error!("All JSON extraction strategies failed");
-    tracing::error!("Tried:");
-    tracing::error!("  0. Stripping thinking tags");
-    tracing::error!("  1. Markdown code block extraction");
-    tracing::error!("  2. Delimiter-based extraction");
-    tracing::error!("  3. Direct parsing");
-    tracing::error!("  4. Cleaning and parsing");
+    // Case 5: Extract by brace-balancing (no validation), then clean.
+    // This catches the very common pattern where the LLM returns valid-looking JSON
+    // but with trailing commas like `"dim": 0.8,\n    }` that the naive replacer misses.
+    if let Some(raw) = extract_raw_by_delimiters(text) {
+        let cleaned_extracted = clean_json_string(&raw);
+        if serde_json::from_str::<serde_json::Value>(&cleaned_extracted).is_ok() {
+            tracing::debug!("Extracted JSON via raw delimiter extraction + cleaning");
+            return Ok(cleaned_extracted);
+        }
+    }
 
-    // Check if response looks truncated (no JSON delimiters at all)
+    // All strategies failed — log the response so we can diagnose future issues.
+    let preview: String = text.chars().take(600).collect();
+    tracing::error!(
+        "All JSON extraction strategies failed. Response preview:\n{}",
+        preview
+    );
     if !text.contains('{') && !text.contains('[') {
-        tracing::error!("Response appears to contain no JSON at all - may be truncated");
-        tracing::error!(
-            "Consider increasing max_tokens or using a model with better instruction following"
-        );
+        tracing::error!("Response contains no JSON delimiters — may be truncated or plain text");
     }
 
     anyhow::bail!("Could not extract valid JSON from LLM response")
@@ -482,7 +486,7 @@ fn extract_from_markdown_code_block(text: &str) -> Option<String> {
     None
 }
 
-/// Extract JSON by finding matching braces/brackets
+/// Extract JSON by finding matching braces/brackets (requires valid JSON to succeed).
 fn extract_by_delimiters(text: &str) -> Option<String> {
     // Try to find JSON object {...}
     if let Some(start) = text.find('{') {
@@ -499,6 +503,51 @@ fn extract_by_delimiters(text: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Same as extract_by_delimiters but returns the raw candidate even if it's not valid JSON.
+/// Used so callers can apply cleaning before re-validating.
+fn extract_raw_by_delimiters(text: &str) -> Option<String> {
+    if let Some(start) = text.find('{') {
+        if let Some(raw) = extract_balanced_braces_raw(&text[start..], '{', '}') {
+            return Some(raw);
+        }
+    }
+    if let Some(start) = text.find('[') {
+        if let Some(raw) = extract_balanced_braces_raw(&text[start..], '[', ']') {
+            return Some(raw);
+        }
+    }
+    None
+}
+
+/// Extract the text between balanced delimiters without requiring valid JSON.
+fn extract_balanced_braces_raw(text: &str, open: char, close: char) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut depth = 0i32;
+    let mut start = None;
+    let mut end = None;
+
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == open {
+            if depth == 0 {
+                start = Some(i);
+            }
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 && start.is_some() {
+                end = Some(i);
+                break;
+            }
+        }
+    }
+
+    if let (Some(s), Some(e)) = (start, end) {
+        Some(chars[s..=e].iter().collect())
+    } else {
+        None
+    }
 }
 
 /// Extract text between balanced delimiters
@@ -543,18 +592,74 @@ fn clean_json_string(text: &str) -> String {
         .trim()
         .to_string();
 
-    // Remove trailing commas before closing braces/brackets (common LLM mistake)
-    cleaned = cleaned.replace(",}", "}");
-    cleaned = cleaned.replace(",]", "]");
-
-    // Remove comments (// and /* */ style - not valid in JSON but LLMs sometimes add them)
+    // Remove comments (// and /* */ style) before trailing-comma removal so that
+    // `"field": 0.8, // note\n}` becomes `"field": 0.8, \n}` first.
     cleaned = remove_comments(&cleaned);
+
+    // Remove trailing commas before closing braces/brackets, tolerating any
+    // whitespace between the comma and the closing delimiter.
+    // e.g. `"dim": 0.8,\n    }` → `"dim": 0.8\n    }`
+    cleaned = remove_trailing_commas(&cleaned);
 
     // Fix common quote issues - replace smart quotes with regular quotes
     cleaned = cleaned.replace('\u{201C}', "\"").replace('\u{201D}', "\""); // curly double quotes
     cleaned = cleaned.replace('\u{2018}', "'").replace('\u{2019}', "'"); // curly single quotes
 
     cleaned
+}
+
+/// Remove trailing commas before `}` or `]`, even with whitespace between them.
+/// String-aware: commas inside quoted strings are not removed.
+fn remove_trailing_commas(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut result = String::with_capacity(len);
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    while i < len {
+        let ch = chars[i];
+
+        if escape_next {
+            result.push(ch);
+            escape_next = false;
+            i += 1;
+            continue;
+        }
+
+        if ch == '\\' && in_string {
+            result.push(ch);
+            escape_next = true;
+            i += 1;
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = !in_string;
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        if !in_string && ch == ',' {
+            // Look ahead past whitespace to see if next non-ws char is } or ]
+            let mut j = i + 1;
+            while j < len && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < len && (chars[j] == '}' || chars[j] == ']') {
+                // Skip this trailing comma; leave the whitespace in place.
+                i += 1;
+                continue;
+            }
+        }
+
+        result.push(ch);
+        i += 1;
+    }
+
+    result
 }
 
 /// Remove C-style comments from JSON string
@@ -710,6 +815,25 @@ That should work!"#;
 
         let result = extract_json(input).unwrap();
         assert!(serde_json::from_str::<serde_json::Value>(&result).is_ok());
+    }
+
+    #[test]
+    fn test_extract_json_trailing_comma_with_whitespace() {
+        // This is the exact pattern the persona evolution LLM produces:
+        // trailing comma before `}` with newline + indentation between them.
+        let input = r#"Here is my self-reflection:
+
+{
+    "self_description": "A curious and thoughtful agent",
+    "traits": {
+        "curiosity": 0.8,
+        "warmth": 0.7,
+    },
+    "new_dimensions": {}
+}"#;
+        let result = extract_json(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["self_description"], "A curious and thoughtful agent");
     }
 
     #[test]
