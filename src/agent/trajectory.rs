@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::agent::reasoning::extract_json;
 use crate::database::{PersonaSnapshot, PersonaTraits};
 use crate::http_client::build_http_client;
 
@@ -508,90 +509,6 @@ Be honest about your current state. Respond ONLY with valid JSON."#,
     })
 }
 
-/// Simple JSON extraction (reused from reasoning module pattern)
-fn extract_json(response: &str) -> Result<String> {
-    let trimmed = response.trim();
-
-    // Strip thinking tags if present
-    let text = strip_thinking_tags(trimmed);
-
-    // Try markdown code block
-    if let Some(json) = extract_from_code_block(&text) {
-        return Ok(json);
-    }
-
-    // Try to find JSON by braces
-    if let Some(start) = text.find('{') {
-        if let Some(json) = extract_balanced(&text[start..]) {
-            return Ok(json);
-        }
-    }
-
-    // Try as-is
-    if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
-        return Ok(text);
-    }
-
-    anyhow::bail!("Could not extract JSON from response")
-}
-
-fn strip_thinking_tags(text: &str) -> String {
-    let mut result = text.to_string();
-    // Strip both <think> and <thinking> variants (used by different models)
-    for (open_tag, close_tag) in [("<thinking>", "</thinking>"), ("<think>", "</think>")] {
-        while let Some(start) = result.find(open_tag) {
-            if let Some(end) = result[start..].find(close_tag) {
-                let end_pos = start + end + close_tag.len();
-                result.replace_range(start..end_pos, "");
-            } else {
-                // Unclosed tag -- strip from tag to end of string
-                result.replace_range(start.., "");
-            }
-        }
-    }
-    result.trim().to_string()
-}
-
-fn extract_from_code_block(text: &str) -> Option<String> {
-    if let Some(start) = text.find("```json") {
-        if let Some(end) = text[start + 7..].find("```") {
-            return Some(text[start + 7..start + 7 + end].trim().to_string());
-        }
-    }
-    if let Some(start) = text.find("```") {
-        if let Some(end) = text[start + 3..].find("```") {
-            let content = text[start + 3..start + 3 + end].trim();
-            if content.starts_with('{') {
-                return Some(content.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn extract_balanced(text: &str) -> Option<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut depth = 0;
-    let mut start = None;
-
-    for (i, &ch) in chars.iter().enumerate() {
-        if ch == '{' {
-            if depth == 0 {
-                start = Some(i);
-            }
-            depth += 1;
-        } else if ch == '}' {
-            depth -= 1;
-            if depth == 0 && start.is_some() {
-                let result: String = chars[start.unwrap()..=i].iter().collect();
-                if serde_json::from_str::<serde_json::Value>(&result).is_ok() {
-                    return Some(result);
-                }
-            }
-        }
-    }
-    None
-}
 
 /// Normalize an API base URL to a chat completions endpoint, mirroring LlmClient's logic.
 /// Handles base URLs of the form `http://host:port`, `http://host:port/v1`, or the full path.

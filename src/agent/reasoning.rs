@@ -381,7 +381,7 @@ impl ReasoningEngine {
 }
 
 /// Extract JSON from LLM response, handling common formatting issues
-fn extract_json(response: &str) -> Result<String> {
+pub(crate) fn extract_json(response: &str) -> Result<String> {
     let trimmed = response.trim();
 
     // Case 0: Strip thinking tags (<think>...</think>) if present
