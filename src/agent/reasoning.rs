@@ -429,17 +429,19 @@ pub(crate) fn extract_json(response: &str) -> Result<String> {
         }
     }
 
-    // All strategies failed — log the response so we can diagnose future issues.
-    let preview: String = text.chars().take(600).collect();
-    tracing::error!(
-        "All JSON extraction strategies failed. Response preview:\n{}",
-        preview
-    );
-    if !text.contains('{') && !text.contains('[') {
-        tracing::error!("Response contains no JSON delimiters — may be truncated or plain text");
-    }
-
-    anyhow::bail!("Could not extract valid JSON from LLM response")
+    // All strategies failed — embed the raw response in the error message so it
+    // surfaces in the Mind tab event log where the user can click ⋯ to read it.
+    let hint = if !text.contains('{') && !text.contains('[') {
+        " (no JSON delimiters found — response may be truncated or plain text)"
+    } else {
+        ""
+    };
+    let raw_preview: String = text.chars().take(1200).collect();
+    anyhow::bail!(
+        "Could not extract valid JSON from LLM response{}.\n\nRaw response:\n{}",
+        hint,
+        raw_preview
+    )
 }
 
 /// Strip thinking tags like <think>...</think> from response
