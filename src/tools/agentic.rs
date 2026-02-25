@@ -418,7 +418,47 @@ impl AgenticLoop {
                 .call_llm_streaming(messages, tool_defs, on_text_stream)
                 .await
             {
-                Ok(message) => return Ok(message),
+                Ok(message) => {
+                    // Some LLM servers silently drop tool_calls in streaming responses even
+                    // when the model intended to call a tool.  Only apply the fallback on
+                    // the first LLM call of a loop iteration (where the last message is
+                    // from the user/system), because subsequent calls (after tool results)
+                    // are producing a final text response and won't have tool_calls.
+                    let has_tool_calls = message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|tc| !tc.is_empty());
+                    let last_role = messages.last().map(|m| m.role.as_str()).unwrap_or("");
+                    let is_first_call = last_role == "user" || last_role == "system";
+                    if has_tool_calls || tool_defs.is_empty() || !is_first_call {
+                        return Ok(message);
+                    }
+                    // Streaming returned no tool_calls on the initial user-facing call.
+                    // Retry with non-streaming; if it finds tool_calls, streaming silently
+                    // dropped them.  If it also returns no tool_calls the response is a
+                    // legitimate text-only reply — return the streaming version so the
+                    // text content already streamed to the caller stays consistent.
+                    let streaming_message = message;
+                    tracing::debug!(
+                        "Streaming returned no tool_calls on initial call; \
+                         retrying non-streaming to check for function calls"
+                    );
+                    let ns_message =
+                        self.call_llm_non_streaming(messages, tool_defs).await?;
+                    let ns_has_tool_calls = ns_message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|tc| !tc.is_empty());
+                    if ns_has_tool_calls {
+                        tracing::info!(
+                            "Non-streaming fallback found tool_calls that streaming dropped"
+                        );
+                        return Ok(ns_message);
+                    }
+                    // Both paths agree: no tool_calls.  Return the streaming message to
+                    // keep the streamed text consistent with what the caller already saw.
+                    return Ok(streaming_message);
+                }
                 Err(e) => {
                     tracing::warn!(
                         "Streaming LLM call failed, falling back to non-streaming: {}",
