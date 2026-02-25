@@ -53,7 +53,7 @@ impl BackendRuntimeBuilder {
         let tool_registry = Arc::new(ToolRegistry::new());
 
         let init_rt = tokio::runtime::Runtime::new()?;
-        init_rt.block_on(register_builtin_tools(tool_registry.clone()))?;
+        init_rt.block_on(register_builtin_tools(tool_registry.clone(), self.event_tx.clone()))?;
 
         let mut manifests = vec![builtin_manifest(&config)];
         for plugin in self.plugins {
@@ -163,17 +163,24 @@ fn builtin_manifest(config: &AgentConfig) -> BackendPluginManifest {
             "write_memory".to_string(),
             "http_fetch".to_string(),
             "graphchan_skill".to_string(),
+            "flag_uncertainty".to_string(),
         ],
         provided_skills,
     }
 }
 
-async fn register_builtin_tools(tool_registry: Arc<ToolRegistry>) -> Result<()> {
+async fn register_builtin_tools(
+    tool_registry: Arc<ToolRegistry>,
+    event_tx: Sender<AgentEvent>,
+) -> Result<()> {
     use crate::tools::{
         comfy::{GenerateComfyMediaTool, PostToGraphchanTool},
         files::{ListDirectoryTool, PatchFileTool, ReadFileTool, WriteFileTool},
         http::HttpFetchTool,
-        memory::{MemorySearchTool, MemoryWriteTool, ScratchNoteTool, WriteSessionHandoffTool},
+        memory::{
+            FlagUncertaintyTool, MemorySearchTool, MemoryWriteTool, ScratchNoteTool,
+            WriteSessionHandoffTool,
+        },
         shell::ShellTool,
         skill_bridge::GraphchanSkillTool,
         vision::{
@@ -223,7 +230,10 @@ async fn register_builtin_tools(tool_registry: Arc<ToolRegistry>) -> Result<()> 
     tool_registry
         .register(Arc::new(GraphchanSkillTool::new()))
         .await;
+    tool_registry
+        .register(Arc::new(FlagUncertaintyTool::new(event_tx)))
+        .await;
 
-    tracing::info!("Tool registry initialized with 17 built-in tools");
+    tracing::info!("Tool registry initialized with 18 built-in tools");
     Ok(())
 }

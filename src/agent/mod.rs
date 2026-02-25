@@ -134,6 +134,12 @@ pub enum AgentEvent {
         tool_name: String,
         reason: String,
     },
+    /// Emitted (non-blocking) when the agent flags uncertainty before acting.
+    /// Surfaces as a toast in the UI; agent continues without waiting.
+    UncertaintyFlagged {
+        question: String,
+        planned_action: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1478,7 +1484,6 @@ impl Agent {
         .await;
 
         self.set_state(AgentVisualState::Happy).await;
-        sleep(Duration::from_secs(2)).await;
 
         Ok(())
     }
@@ -2318,7 +2323,6 @@ impl Agent {
                     })
                     .await;
                     self.set_state(AgentVisualState::Happy).await;
-                    sleep(Duration::from_secs(2)).await;
                 } else {
                     self.emit(AgentEvent::Observation(
                         "No external reply action was required.".to_string(),
@@ -2771,7 +2775,6 @@ impl Agent {
                     })
                     .await;
                     self.set_state(AgentVisualState::Happy).await;
-                    sleep(Duration::from_secs(2)).await;
                 } else {
                     self.emit(AgentEvent::Observation(
                         "No external reply action was required.".to_string(),
@@ -3687,7 +3690,6 @@ impl Agent {
         }
 
         self.set_state(AgentVisualState::Happy).await;
-        sleep(Duration::from_millis(500)).await;
 
         Ok(())
     }

@@ -4,11 +4,13 @@
 //! - `write_memory`: create or update a working-memory note.
 //! - `write_session_handoff`: write a cross-session continuity note injected at the top of next-session context.
 //! - `scratch_note`: read/write/append/clear a task-scoped scratchpad (ephemeral, cleared when task is done).
+//! - `flag_uncertainty`: non-blocking heads-up to the operator before acting under uncertainty.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::agent::AgentEvent;
 use crate::config::AgentConfig;
 use crate::database::AgentDatabase;
 
@@ -415,5 +417,85 @@ impl Tool for ScratchNoteTool {
 
     fn category(&self) -> ToolCategory {
         ToolCategory::Memory
+    }
+}
+
+/// Non-blocking uncertainty signal — tells the operator "heads up, about to do X".
+pub struct FlagUncertaintyTool {
+    event_tx: flume::Sender<AgentEvent>,
+}
+
+impl FlagUncertaintyTool {
+    pub fn new(event_tx: flume::Sender<AgentEvent>) -> Self {
+        Self { event_tx }
+    }
+}
+
+#[async_trait]
+impl Tool for FlagUncertaintyTool {
+    fn name(&self) -> &str {
+        "flag_uncertainty"
+    }
+
+    fn description(&self) -> &str {
+        "Signal that you're about to act on something you're ~90% confident about but want the \
+         operator to know. Returns immediately so you can proceed without waiting. Use before \
+         significant or hard-to-reverse actions when you have a reasonable plan but aren't certain \
+         it's exactly right. Do NOT use as a substitute for the approval gate on genuinely risky \
+         operations that require explicit permission."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "What you're uncertain about (the specific doubt or assumption)"
+                },
+                "planned_action": {
+                    "type": "string",
+                    "description": "What you're about to do despite the uncertainty"
+                }
+            },
+            "required": ["question", "planned_action"]
+        })
+    }
+
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let question = match params.get("question").and_then(Value::as_str).map(str::trim) {
+            Some(v) if !v.is_empty() => v.to_string(),
+            _ => {
+                return Ok(ToolOutput::Error(
+                    "Missing required 'question' parameter".to_string(),
+                ))
+            }
+        };
+        let planned_action = match params
+            .get("planned_action")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        {
+            Some(v) if !v.is_empty() => v.to_string(),
+            _ => {
+                return Ok(ToolOutput::Error(
+                    "Missing required 'planned_action' parameter".to_string(),
+                ))
+            }
+        };
+
+        let _ = self.event_tx.send(AgentEvent::UncertaintyFlagged {
+            question,
+            planned_action,
+        });
+
+        Ok(ToolOutput::Json(json!({
+            "status": "noted",
+            "message": "Uncertainty flagged to operator. Proceed with your planned action.",
+        })))
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::General
     }
 }

@@ -255,6 +255,16 @@ fn map_agent_event(event: AgentEvent) -> ApiEventEnvelope {
             "approval_request",
             serde_json::json!({ "tool_name": tool_name, "reason": reason }),
         ),
+        AgentEvent::UncertaintyFlagged {
+            question,
+            planned_action,
+        } => envelope(
+            "uncertainty_flagged",
+            serde_json::json!({
+                "question": question,
+                "planned_action": planned_action
+            }),
+        ),
         AgentEvent::ChatReply {
             conversation_id,
             content,
