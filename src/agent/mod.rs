@@ -3411,7 +3411,9 @@ impl Agent {
                 );
 
                 let mut agent_message_id: Option<String> = None;
-                if !should_continue {
+                // Always persist messages with visible content so they appear in the chat
+                // immediately rather than only when the agent finishes all tool calls.
+                if !operator_visible_response.trim().is_empty() {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
                         let add_result = if let Some(turn_id) = turn_id.as_deref() {
@@ -3467,7 +3469,6 @@ impl Agent {
                         }
 
                         if !marked_initial_messages
-                            && !should_continue
                             && agent_message_id.is_some()
                         {
                             for msg in &conversation_messages {
