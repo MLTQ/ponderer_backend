@@ -219,11 +219,14 @@ Respond ONLY with valid JSON."#,
         #[derive(Deserialize)]
         struct Choice {
             message: MessageContent,
+            finish_reason: Option<String>,
         }
 
         #[derive(Deserialize)]
         struct MessageContent {
-            content: String,
+            content: Option<String>,
+            /// Thinking/reasoning field used by CoT models (e.g. Qwen3, DeepSeek-R1).
+            reasoning: Option<String>,
         }
 
         let request = ChatRequest {
@@ -239,7 +242,8 @@ Respond ONLY with valid JSON."#,
                 },
             ],
             temperature: 0.7,
-            max_tokens: 2048,
+            // Generous budget so thinking models can reason AND output JSON.
+            max_tokens: 8192,
         };
 
         let mut req_builder = self.client.post(&url).json(&request);
@@ -271,16 +275,21 @@ Respond ONLY with valid JSON."#,
                 )
             })?;
 
-        let content = chat_response
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
+        let first = chat_response.choices.into_iter().next();
+        let finish_reason = first.as_ref()
+            .and_then(|c| c.finish_reason.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let content = first.map(|c| c.message.content.unwrap_or_default()).unwrap_or_default();
 
         if content.trim().is_empty() {
+            let hint = if finish_reason == "length" {
+                " (finish_reason=length: model hit max_tokens before producing output — \
+                 consider a model with a smaller thinking budget)"
+            } else {
+                ""
+            };
             anyhow::bail!(
-                "LLM returned empty content for trajectory analysis.\n\nFull raw response:\n{}",
-                body.chars().take(1200).collect::<String>()
+                "LLM returned empty content for trajectory analysis{hint}.\n\nFull raw response:\n{body}"
             );
         }
 
@@ -430,7 +439,15 @@ Be honest about your current state. Respond ONLY with valid JSON."#,
 
     #[derive(Deserialize)]
     struct Choice {
-        message: Message,
+        message: MessageContent,
+        finish_reason: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct MessageContent {
+        content: Option<String>,
+        /// Thinking/reasoning field used by CoT models (e.g. Qwen3, DeepSeek-R1).
+        reasoning: Option<String>,
     }
 
     let request = ChatRequest {
@@ -448,7 +465,8 @@ Be honest about your current state. Respond ONLY with valid JSON."#,
             },
         ],
         temperature: 0.6,
-        max_tokens: 1024,
+        // Generous budget so thinking models can reason AND output JSON.
+        max_tokens: 8192,
     };
 
     let mut req_builder = client.post(&url).json(&request);
@@ -475,21 +493,27 @@ Be honest about your current state. Respond ONLY with valid JSON."#,
     let chat_response: ChatResponse = serde_json::from_str(&body)
         .with_context(|| {
             format!(
-                "Failed to parse persona capture LLM response. Raw body:\n{}",
-                body.chars().take(800).collect::<String>()
+                "Failed to parse persona capture LLM response. Raw body:\n{body}"
             )
         })?;
 
-    let content = chat_response
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
+    let first = chat_response.choices.into_iter().next();
+    let finish_reason = first.as_ref()
+        .and_then(|c| c.finish_reason.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let content = first
+        .map(|c| c.message.content.unwrap_or_default())
         .unwrap_or_default();
 
     if content.trim().is_empty() {
+        let hint = if finish_reason == "length" {
+            " (finish_reason=length: model hit max_tokens before producing output — \
+             consider a model with a smaller thinking budget)"
+        } else {
+            ""
+        };
         anyhow::bail!(
-            "LLM returned empty content for persona snapshot.\n\nFull raw response:\n{}",
-            body.chars().take(1200).collect::<String>()
+            "LLM returned empty content for persona snapshot{hint}.\n\nFull raw response:\n{body}"
         );
     }
 
