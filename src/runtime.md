@@ -6,7 +6,7 @@ Provides backend-only runtime bootstrap for Ponderer. This is the non-UI assembl
 ## Components
 
 ### `BackendRuntime`
-- **Does**: Owns the initialized backend runtime objects (`Agent`, `ToolRegistry`, `AgentDatabase`, `AgentConfig`) plus loaded plugin manifests.
+- **Does**: Owns the initialized backend runtime objects (`Agent`, `ToolRegistry`, `ProcessRegistry`, `AgentDatabase`, `AgentConfig`) plus loaded plugin manifests.
 - **Interacts with**: frontend bootstrap (`src/main.rs`) and future API server entrypoints.
 
 ### `BackendRuntimeBuilder`
@@ -26,8 +26,8 @@ Provides backend-only runtime bootstrap for Ponderer. This is the non-UI assembl
 - **Interacts with**: `skills::graphchan::GraphchanSkill`.
 
 ### `register_builtin_tools(registry)`
-- **Does**: Registers all built-in tools into `ToolRegistry`.
-- **Interacts with**: tool modules under `tools/`.
+- **Does**: Registers all built-in tools into `ToolRegistry`, including dependency-injected tools like `shell` that need shared runtime state.
+- **Interacts with**: tool modules under `tools/` and shared runtime services such as `process_registry.rs`.
 
 ### `builtin_manifest(config)`
 - **Does**: Declares built-in tool/skill capability manifest as a first-class plugin entry (`builtin.core`).

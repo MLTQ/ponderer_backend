@@ -8,6 +8,7 @@ use crate::agent::{Agent, AgentEvent};
 use crate::config::AgentConfig;
 use crate::database::AgentDatabase;
 use crate::plugin::{BackendPlugin, BackendPluginManifest};
+use crate::process_registry::ProcessRegistry;
 use crate::skills::Skill;
 use crate::tools::ToolRegistry;
 
@@ -15,6 +16,7 @@ pub struct BackendRuntime {
     pub config: AgentConfig,
     pub agent: Arc<Agent>,
     pub tool_registry: Arc<ToolRegistry>,
+    pub process_registry: Arc<ProcessRegistry>,
     pub ui_database: Option<Arc<AgentDatabase>>,
     pub plugin_manifests: Vec<BackendPluginManifest>,
 }
@@ -51,9 +53,14 @@ impl BackendRuntimeBuilder {
         let config = self.config;
         let mut skill_list = build_skills(&config);
         let tool_registry = Arc::new(ToolRegistry::new());
+        let process_registry = Arc::new(ProcessRegistry::new());
 
         let init_rt = tokio::runtime::Runtime::new()?;
-        init_rt.block_on(register_builtin_tools(tool_registry.clone(), self.event_tx.clone()))?;
+        init_rt.block_on(register_builtin_tools(
+            tool_registry.clone(),
+            process_registry.clone(),
+            self.event_tx.clone(),
+        ))?;
 
         let mut manifests = vec![builtin_manifest(&config)];
         for plugin in self.plugins {
@@ -97,6 +104,7 @@ impl BackendRuntimeBuilder {
             config,
             agent,
             tool_registry,
+            process_registry,
             ui_database,
             plugin_manifests: manifests,
         })
@@ -171,6 +179,7 @@ fn builtin_manifest(config: &AgentConfig) -> BackendPluginManifest {
 
 async fn register_builtin_tools(
     tool_registry: Arc<ToolRegistry>,
+    process_registry: Arc<ProcessRegistry>,
     event_tx: Sender<AgentEvent>,
 ) -> Result<()> {
     use crate::tools::{
@@ -189,7 +198,9 @@ async fn register_builtin_tools(
         },
     };
 
-    tool_registry.register(Arc::new(ShellTool::new())).await;
+    tool_registry
+        .register(Arc::new(ShellTool::new(process_registry)))
+        .await;
     tool_registry.register(Arc::new(ReadFileTool::new())).await;
     tool_registry.register(Arc::new(WriteFileTool::new())).await;
     tool_registry

@@ -1,7 +1,7 @@
 # database.rs
 
 ## Purpose
-Provides the agent's persistent memory layer via SQLite. Stores important posts, reflection history, persona snapshots (for personality evolution tracking), private chat sessions/conversations/turns/messages, per-turn tool call lineage, Living Loop foundation records (journal, concerns, orientation snapshots, pending thoughts), and key-value state. Working-memory CRUD routes through a versioned `MemoryBackend` abstraction while preserving the existing KV behavior (`kv_v1`).
+Provides the agent's persistent memory layer via SQLite. Stores important posts, reflection history, persona snapshots (for personality evolution tracking), private chat sessions/conversations/turns/messages, per-turn tool call lineage, recurring scheduled jobs, Living Loop foundation records (journal, concerns, orientation snapshots, pending thoughts), and key-value state. Working-memory CRUD routes through a versioned `MemoryBackend` abstraction while preserving the existing KV behavior (`kv_v1`).
 
 ## Components
 
@@ -69,6 +69,10 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - **Does**: Persist one agent turn with decision/status/error context, stored prompt payloads (`prompt_text`, `system_prompt_text`), and per-tool input/output records for replay/debug
 - **Interacts with**: `agent::process_chat_messages`, future turn history/undo/resume UX
 
+### Scheduled-job methods (`create_scheduled_job`, `list_scheduled_jobs`, `get_scheduled_job`, `update_scheduled_job`, `delete_scheduled_job`, `take_due_scheduled_jobs`)
+- **Does**: Persist recurring interval-based operator-defined jobs, bind each one to a dedicated conversation, and atomically advance due jobs when the agent claims them.
+- **Interacts with**: `scheduled_jobs.rs`, `server.rs` scheduled-job routes, `agent::maybe_enqueue_due_scheduled_jobs`
+
 ### `OodaTurnPacketRecord`
 - **Does**: Persists per-turn OODA summaries (`observe`, `orient`, `decide`, `act`) linked to conversation/turn IDs
 - **Interacts with**: `agent/mod.rs` autonomous private-chat loops and orientation context hydration
@@ -127,6 +131,7 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - `ensure_schema()` performs manual chat migrations by checking `PRAGMA table_info(...)` and adding missing columns (`conversation_id`, `turn_id`, `session_id`, `runtime_state`, `active_turn_id`) in place.
 - `ensure_schema()` also adds `chat_turns.prompt_text` and `chat_turns.system_prompt_text` in place for existing DBs so turn-level prompt inspection is backward-compatible.
 - Conversation compaction snapshots are stored in `chat_conversation_summaries` and updated opportunistically by the agent loop when message-count thresholds are exceeded.
+- Scheduled jobs live in their own additive `scheduled_jobs` table and create a dedicated chat conversation on insert so recurring runs retain thread-local history.
 - Living Loop ll.1 adds four additive tables: `journal_entries`, `concerns`, `orientation_snapshots`, `pending_thoughts_queue`.
 - OODA continuity adds additive table `ooda_turn_packets` plus supporting indexes on `(conversation_id, created_at)` and `(turn_id)`.
 - Conversation-scoped working-memory context keeps stable notes while filtering noisy cross-conversation activity lines by conversation tag.

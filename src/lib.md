@@ -6,7 +6,7 @@ Defines the backend crate surface for Ponderer. This crate is the extraction bou
 ## Components
 
 ### Module exports
-- **Does**: Re-exports backend domain modules (`agent`, `config`, `database`, `tools`, `skills`, `plugin`, etc.) and `runtime` bootstrap.
+- **Does**: Re-exports backend domain modules (`agent`, `config`, `database`, `tools`, `skills`, `plugin`, `process_registry`, `scheduled_jobs`, etc.) and `runtime` bootstrap.
 - **Interacts with**: desktop frontend binary (`src/main.rs`) and future backend service entrypoint(s).
 
 ## Contracts

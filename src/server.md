@@ -10,12 +10,20 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - **Interacts with**: `runtime.rs` (`BackendRuntime`), `agent/mod.rs` (`AgentEvent`), `database.rs` (`AgentDatabase` chat APIs).
 
 ### `ServerState`
-- **Does**: Shared application state containing agent handle, DB handle, auth token, mutable config snapshot, and WS broadcaster.
+- **Does**: Shared application state containing agent handle, DB handle, auth token, mutable config snapshot, shared process registry, and WS broadcaster.
 - **Interacts with**: all route handlers and auth middleware.
 
 ### REST handlers (`/v1/...`)
-- **Does**: Provide CRUD-like operations for config/conversations/messages plus turn/tool-call/prompt inspection, plugin manifest discovery, pause/status/stop controls, and tool session-approval grants. Message enqueue also triggers an immediate agent wake signal.
-- **Interacts with**: `database.rs` chat lifecycle APIs, `plugin.rs` manifests, and `agent` runtime control methods.
+- **Does**: Provide CRUD-like operations for config/conversations/messages, scheduled jobs, process inspection, turn/tool-call/prompt inspection, plugin manifest discovery, pause/status/stop controls, and tool session-approval grants. Message enqueue also triggers an immediate agent wake signal.
+- **Interacts with**: `database.rs` chat + scheduled-job APIs, `process_registry.rs`, `plugin.rs` manifests, and `agent` runtime control methods.
+
+### Scheduled-job routes (`/v1/scheduled-jobs`)
+- **Does**: Exposes list/create/get/update/delete endpoints for interval-based recurring jobs backed by SQLite.
+- **Interacts with**: `database.rs` scheduled-job CRUD and `agent/mod.rs` due-job enqueueing.
+
+### Process routes (`/v1/processes`)
+- **Does**: Lists tracked background processes, returns one process snapshot, and requests process shutdown.
+- **Interacts with**: `process_registry.rs` and `tools/shell.rs` detached execution mode.
 
 ### `POST /v1/agent/tools/:tool_name/approve`
 - **Does**: Grants session-level approval for a specific tool, allowing it to run autonomously without prompting for the rest of the process lifetime.
@@ -50,3 +58,5 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - `GET /v1/turns/:id/prompt` returns the stored per-turn context prompt plus optional stored system prompt, enabling richer per-message context inspection in the frontend.
 - `PUT /v1/agent/pause` is preferred for explicit control; `POST /v1/agent/toggle-pause` remains for backward compatibility.
 - `POST /v1/agent/stop` requests immediate cancellation of in-flight agentic turns and aborts detached background subtasks.
+- Scheduled jobs are API-visible even without dedicated desktop UI wiring yet.
+- Process routes only expose processes started through the tracked background shell path.

@@ -5,7 +5,10 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::process_registry::ProcessRegistry;
 
 use super::{Tool, ToolCategory, ToolContext, ToolOutput};
 
@@ -18,11 +21,13 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 /// Maximum output size before truncation (bytes)
 const MAX_OUTPUT_BYTES: usize = 100_000;
 
-pub struct ShellTool;
+pub struct ShellTool {
+    process_registry: Arc<ProcessRegistry>,
+}
 
 impl ShellTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(process_registry: Arc<ProcessRegistry>) -> Self {
+        Self { process_registry }
     }
 }
 
@@ -52,6 +57,10 @@ impl Tool for ShellTool {
                 "timeout_secs": {
                     "type": "integer",
                     "description": "Timeout in seconds (default: 30, max: 300)"
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "When true, start the command as a tracked background process and return immediately"
                 }
             },
             "required": ["command"]
@@ -72,6 +81,21 @@ impl Tool for ShellTool {
             .as_u64()
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS);
+        let background = params["background"].as_bool().unwrap_or(false);
+
+        if background {
+            let process = self.process_registry.start(command, working_dir).await?;
+            tracing::info!(
+                "ShellTool started background process {} (pid: {:?})",
+                process.id,
+                process.pid
+            );
+            return Ok(ToolOutput::Json(serde_json::json!({
+                "started": true,
+                "background": true,
+                "process": process,
+            })));
+        }
 
         tracing::info!(
             "ShellTool executing: {} (cwd: {}, timeout: {}s)",
@@ -146,7 +170,7 @@ impl Tool for ShellTool {
 
 impl Default for ShellTool {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(ProcessRegistry::new()))
     }
 }
 
@@ -166,7 +190,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_echo_command() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::new(Arc::new(ProcessRegistry::new()));
         let params = serde_json::json!({"command": "echo hello"});
         let result = tool.execute(params, &test_ctx()).await.unwrap();
 
@@ -181,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_failing_command() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::new(Arc::new(ProcessRegistry::new()));
         let params = serde_json::json!({"command": "false"});
         let result = tool.execute(params, &test_ctx()).await.unwrap();
 
@@ -195,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_command_param() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::new(Arc::new(ProcessRegistry::new()));
         let params = serde_json::json!({});
         let result = tool.execute(params, &test_ctx()).await.unwrap();
         assert!(matches!(result, ToolOutput::Error(_)));
@@ -203,13 +227,13 @@ mod tests {
 
     #[test]
     fn test_requires_approval() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::new(Arc::new(ProcessRegistry::new()));
         assert!(tool.requires_approval());
     }
 
     #[test]
     fn test_schema_has_command() {
-        let tool = ShellTool::new();
+        let tool = ShellTool::new(Arc::new(ProcessRegistry::new()));
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["command"].is_object());
         assert!(schema["required"]

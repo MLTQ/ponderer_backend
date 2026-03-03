@@ -541,6 +541,57 @@ impl Agent {
         }
     }
 
+    async fn maybe_enqueue_due_scheduled_jobs(&self) -> bool {
+        let queued_jobs = {
+            let db_lock = self.database.read().await;
+            let Some(db) = db_lock.as_ref() else {
+                return false;
+            };
+
+            let due_jobs = match db.take_due_scheduled_jobs(Utc::now(), 8) {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    tracing::warn!("Failed to load due scheduled jobs: {}", error);
+                    return false;
+                }
+            };
+
+            let mut queued = Vec::new();
+            for job in due_jobs {
+                match db.add_chat_message_in_conversation(
+                    &job.conversation_id,
+                    "operator",
+                    &job.queue_message(),
+                ) {
+                    Ok(_) => queued.push(job),
+                    Err(error) => tracing::warn!(
+                        "Failed to enqueue scheduled job '{}' ({}): {}",
+                        job.name,
+                        job.id,
+                        error
+                    ),
+                }
+            }
+
+            queued
+        };
+
+        if queued_jobs.is_empty() {
+            return false;
+        }
+
+        for job in &queued_jobs {
+            self.emit(AgentEvent::Observation(format!(
+                "Queued scheduled job '{}'.",
+                truncate_for_event(&job.name, 80)
+            )))
+            .await;
+            self.notify_operator_message_queued(&job.conversation_id);
+        }
+
+        true
+    }
+
     pub async fn run_loop(self: Arc<Self>) -> Result<()> {
         tracing::info!("Agent loop starting...");
 
@@ -563,6 +614,7 @@ impl Agent {
 
             self.set_state(AgentVisualState::Idle).await;
             let config_snapshot = { self.config.read().await.clone() };
+            let scheduled_jobs_queued = self.maybe_enqueue_due_scheduled_jobs().await;
 
             // Check if it's time for persona evolution (Ludonarrative Assonantic Tracing)
             // Skip if operator messages are already waiting — chat preempts background work.
@@ -609,6 +661,20 @@ impl Agent {
             }
 
             // Legacy single-loop behavior (backward compatible when ambient loop disabled)
+            if scheduled_jobs_queued {
+                if let Err(e) = self.run_cycle().await {
+                    tracing::error!("Scheduled-job cycle error: {}", e);
+                    self.emit(AgentEvent::Error(e.to_string())).await;
+                    self.set_state(AgentVisualState::Confused).await;
+                    self.wait_with_interruptible_sleep(
+                        Duration::from_secs(10),
+                        "scheduled-job-error-backoff",
+                    )
+                    .await;
+                }
+                continue;
+            }
+
             self.maybe_run_heartbeat().await;
 
             let poll_interval = config_snapshot.poll_interval_secs;

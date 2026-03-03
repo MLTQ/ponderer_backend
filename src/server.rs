@@ -21,7 +21,9 @@ use crate::database::{
     ChatTurnToolCall,
 };
 use crate::plugin::BackendPluginManifest;
+use crate::process_registry::{ProcessInfo, ProcessRegistry};
 use crate::runtime::BackendRuntime;
+use crate::scheduled_jobs::ScheduledJob;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -29,6 +31,7 @@ pub struct ServerState {
     pub db: Arc<AgentDatabase>,
     pub auth: BackendAuthConfig,
     pub config: Arc<tokio::sync::RwLock<AgentConfig>>,
+    pub process_registry: Arc<ProcessRegistry>,
     pub plugin_manifests: Vec<BackendPluginManifest>,
     pub ws_events: broadcast::Sender<ApiEventEnvelope>,
 }
@@ -73,6 +76,11 @@ struct ListTurnsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ListScheduledJobsQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateConversationRequest {
     title: Option<String>,
 }
@@ -85,6 +93,21 @@ struct SendMessageRequest {
 #[derive(Debug, Deserialize)]
 struct SetPauseRequest {
     paused: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateScheduledJobRequest {
+    name: String,
+    prompt: String,
+    interval_minutes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateScheduledJobRequest {
+    name: Option<String>,
+    prompt: Option<String>,
+    interval_minutes: Option<u64>,
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +155,7 @@ pub async fn serve_backend(
         db,
         auth,
         config: Arc::new(tokio::sync::RwLock::new(runtime.config.clone())),
+        process_registry: runtime.process_registry.clone(),
         plugin_manifests: runtime.plugin_manifests.clone(),
         ws_events: ws_events.clone(),
     });
@@ -166,6 +190,16 @@ pub async fn serve_backend(
         .route("/conversations/:id/turns", get(list_turns))
         .route("/turns/:id/tool-calls", get(list_turn_tool_calls))
         .route("/turns/:id/prompt", get(get_turn_prompt))
+        .route("/scheduled-jobs", get(list_scheduled_jobs).post(create_scheduled_job))
+        .route(
+            "/scheduled-jobs/:id",
+            get(get_scheduled_job)
+                .put(update_scheduled_job)
+                .delete(delete_scheduled_job),
+        )
+        .route("/processes", get(list_processes))
+        .route("/processes/:id", get(get_process))
+        .route("/processes/:id/stop", post(stop_process))
         .route("/agent/status", get(get_agent_status))
         .route("/agent/pause", put(set_pause))
         .route("/agent/toggle-pause", post(toggle_pause))
@@ -581,6 +615,122 @@ async fn get_turn_prompt(
         prompt_text: prompt_text.unwrap_or_default(),
         system_prompt_text,
     }))
+}
+
+async fn list_scheduled_jobs(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<ListScheduledJobsQuery>,
+) -> Result<Json<Vec<ScheduledJob>>, (StatusCode, String)> {
+    let limit = clamp_limit(query.limit, 100, 1, 1000);
+    state
+        .db
+        .list_scheduled_jobs(limit)
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn get_scheduled_job(
+    State(state): State<Arc<ServerState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<ScheduledJob>, (StatusCode, String)> {
+    match state.db.get_scheduled_job(&job_id).map_err(internal_error)? {
+        Some(job) => Ok(Json(job)),
+        None => Err(not_found(format!("scheduled job '{}' not found", job_id))),
+    }
+}
+
+async fn create_scheduled_job(
+    State(state): State<Arc<ServerState>>,
+    Json(body): Json<CreateScheduledJobRequest>,
+) -> Result<Json<ScheduledJob>, (StatusCode, String)> {
+    let name = body.name.trim();
+    let prompt = body.prompt.trim();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name cannot be empty".to_string()));
+    }
+    if prompt.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "prompt cannot be empty".to_string()));
+    }
+
+    state
+        .db
+        .create_scheduled_job(name, prompt, body.interval_minutes)
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn update_scheduled_job(
+    State(state): State<Arc<ServerState>>,
+    Path(job_id): Path<String>,
+    Json(body): Json<UpdateScheduledJobRequest>,
+) -> Result<Json<ScheduledJob>, (StatusCode, String)> {
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let prompt = body
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match state
+        .db
+        .update_scheduled_job(
+            &job_id,
+            name,
+            prompt,
+            body.interval_minutes,
+            body.enabled,
+        )
+        .map_err(internal_error)?
+    {
+        Some(job) => Ok(Json(job)),
+        None => Err(not_found(format!("scheduled job '{}' not found", job_id))),
+    }
+}
+
+async fn delete_scheduled_job(
+    State(state): State<Arc<ServerState>>,
+    Path(job_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if state.db.delete_scheduled_job(&job_id).map_err(internal_error)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(not_found(format!("scheduled job '{}' not found", job_id)))
+    }
+}
+
+async fn list_processes(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<Vec<ProcessInfo>>, (StatusCode, String)> {
+    Ok(Json(state.process_registry.list().await))
+}
+
+async fn get_process(
+    State(state): State<Arc<ServerState>>,
+    Path(process_id): Path<String>,
+) -> Result<Json<ProcessInfo>, (StatusCode, String)> {
+    match state.process_registry.get(&process_id).await {
+        Some(process) => Ok(Json(process)),
+        None => Err(not_found(format!("process '{}' not found", process_id))),
+    }
+}
+
+async fn stop_process(
+    State(state): State<Arc<ServerState>>,
+    Path(process_id): Path<String>,
+) -> Result<Json<ProcessInfo>, (StatusCode, String)> {
+    match state
+        .process_registry
+        .stop(&process_id)
+        .await
+        .map_err(internal_error)?
+    {
+        Some(process) => Ok(Json(process)),
+        None => Err(not_found(format!("process '{}' not found", process_id))),
+    }
 }
 
 async fn get_agent_status(

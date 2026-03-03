@@ -126,6 +126,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - Compaction summaries now include a bounded `Recent Reasoning Digest` synthesized from compacted-window OODA packets so older Observe/Orient/Decide/Act continuity survives transcript compression.
 - Private chat emits a structured turn-control block per assistant response; continuation is model-driven (`decision=continue` + no user input needed), with optional turn caps acting only as safety rails.
 - Wake signals from operator message enqueue now interrupt ambient/legacy sleep windows, reducing message-to-turn start latency during long tick intervals.
+- Due scheduled jobs are claimed from SQLite at loop start, converted into operator messages in dedicated conversations, and then processed by the normal chat/tool loop.
 - Private chat continuation now also requires meaningful forward progress signals (`tool_count > 0` or `status=still_working`) before another autonomous turn is allowed.
 - When private-chat continuation is still justified at the turn cap, work is handed off to a per-conversation background subtask runner instead of forcing an immediate stop.
 - Foreground and background autonomous chat turns now maintain a deterministic loop-heat counter from signature similarity (response text + turn-control action + tool set). When heat crosses configured threshold, continuation/offload is blocked and the agent yields with a loop-break message.
