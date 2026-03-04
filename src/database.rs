@@ -358,7 +358,10 @@ impl AgentDatabase {
             conn.execute("ALTER TABLE chat_turns ADD COLUMN prompt_text TEXT", [])?;
         }
         if !Self::table_has_column(conn, "chat_turns", "system_prompt_text")? {
-            conn.execute("ALTER TABLE chat_turns ADD COLUMN system_prompt_text TEXT", [])?;
+            conn.execute(
+                "ALTER TABLE chat_turns ADD COLUMN system_prompt_text TEXT",
+                [],
+            )?;
         }
         Ok(())
     }
@@ -1756,11 +1759,9 @@ impl AgentDatabase {
             }
 
             if entry.key.starts_with("activity-log-") {
-                if let Some(filtered) = filter_activity_log_for_conversation(
-                    &entry.content,
-                    &conversation_tag,
-                    14,
-                ) {
+                if let Some(filtered) =
+                    filter_activity_log_for_conversation(&entry.content, &conversation_tag, 14)
+                {
                     context.push_str(&format!("### {}\n{}\n\n", entry.key, filtered));
                     appended += 1;
                 }
@@ -2857,7 +2858,11 @@ impl AgentDatabase {
         Ok(rows > 0)
     }
 
-    pub fn take_due_scheduled_jobs(&self, now: DateTime<Utc>, limit: usize) -> Result<Vec<ScheduledJob>> {
+    pub fn take_due_scheduled_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ScheduledJob>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, name, prompt, interval_minutes, conversation_id, enabled, last_run_at, next_run_at, created_at, updated_at
@@ -2867,7 +2872,10 @@ impl AgentDatabase {
              LIMIT ?2",
         )?;
         let mut jobs = stmt
-            .query_map(params![now.to_rfc3339(), limit as i64], Self::parse_scheduled_job_row)?
+            .query_map(
+                params![now.to_rfc3339(), limit as i64],
+                Self::parse_scheduled_job_row,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
@@ -3362,11 +3370,7 @@ impl AgentDatabase {
         Ok(rows.into_iter().rev().collect())
     }
 
-    pub fn get_recent_action_digest(
-        &self,
-        limit: usize,
-        max_chars: usize,
-    ) -> Result<String> {
+    pub fn get_recent_action_digest(&self, limit: usize, max_chars: usize) -> Result<String> {
         self.get_recent_action_digest_inner(None, limit, max_chars)
     }
 
@@ -3826,15 +3830,21 @@ fn summarize_chat_message_for_context(content: &str) -> String {
         CHAT_THINKING_BLOCK_START,
         CHAT_THINKING_BLOCK_END,
     );
-    let (without_media, media_blocks) =
-        extract_tagged_blocks(&without_thinking, CHAT_MEDIA_BLOCK_START, CHAT_MEDIA_BLOCK_END);
+    let (without_media, media_blocks) = extract_tagged_blocks(
+        &without_thinking,
+        CHAT_MEDIA_BLOCK_START,
+        CHAT_MEDIA_BLOCK_END,
+    );
     let (without_turn_control, turn_control_blocks) = extract_tagged_blocks(
         &without_media,
         CHAT_TURN_CONTROL_BLOCK_START,
         CHAT_TURN_CONTROL_BLOCK_END,
     );
-    let (visible_text, concern_blocks) =
-        extract_tagged_blocks(&without_turn_control, CHAT_CONCERNS_BLOCK_START, CHAT_CONCERNS_BLOCK_END);
+    let (visible_text, concern_blocks) = extract_tagged_blocks(
+        &without_turn_control,
+        CHAT_CONCERNS_BLOCK_START,
+        CHAT_CONCERNS_BLOCK_END,
+    );
 
     let compact_visible = compact_whitespace(&visible_text);
     let mut tags: Vec<String> = Vec::new();
@@ -3886,23 +3896,23 @@ fn extract_tagged_blocks(content: &str, start_tag: &str, end_tag: &str) -> (Stri
             block_start += 1;
         }
 
-        let (block_raw, next_remaining) = if let Some(rel_end) = remaining[block_start..].find(end_tag)
-        {
-            let block_end = block_start + rel_end;
-            let mut suffix_start = block_end + end_tag.len();
-            if remaining[suffix_start..].starts_with('\n') {
-                suffix_start += 1;
-            }
-            (
-                remaining[block_start..block_end].to_string(),
-                format!("{}{}", &remaining[..start_idx], &remaining[suffix_start..]),
-            )
-        } else {
-            (
-                remaining[block_start..].to_string(),
-                remaining[..start_idx].to_string(),
-            )
-        };
+        let (block_raw, next_remaining) =
+            if let Some(rel_end) = remaining[block_start..].find(end_tag) {
+                let block_end = block_start + rel_end;
+                let mut suffix_start = block_end + end_tag.len();
+                if remaining[suffix_start..].starts_with('\n') {
+                    suffix_start += 1;
+                }
+                (
+                    remaining[block_start..block_end].to_string(),
+                    format!("{}{}", &remaining[..start_idx], &remaining[suffix_start..]),
+                )
+            } else {
+                (
+                    remaining[block_start..].to_string(),
+                    remaining[..start_idx].to_string(),
+                )
+            };
 
         let trimmed = block_raw.trim();
         if !trimmed.is_empty() {
@@ -4048,7 +4058,9 @@ fn summarize_thinking_blocks(blocks: &[String]) -> Option<String> {
 
     let mut hints = 0usize;
     for block in blocks {
-        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(block) {
+        if let Ok(serde_json::Value::Array(items)) =
+            serde_json::from_str::<serde_json::Value>(block)
+        {
             hints += items.len();
         }
     }
@@ -4104,7 +4116,9 @@ fn summarize_concern_blocks(blocks: &[String]) -> Option<String> {
 
     let mut total = 0usize;
     for block in blocks {
-        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(block) {
+        if let Ok(serde_json::Value::Array(items)) =
+            serde_json::from_str::<serde_json::Value>(block)
+        {
             total += items.len();
         }
     }
@@ -4339,8 +4353,11 @@ mod tests {
             ),
         )
         .expect("seed activity log");
-        db.set_working_memory("project-brief", "Keep autonomous turns bounded to useful work.")
-            .expect("seed stable memory");
+        db.set_working_memory(
+            "project-brief",
+            "Keep autonomous turns bounded to useful work.",
+        )
+        .expect("seed stable memory");
 
         let scoped = db
             .get_working_memory_context_for_conversation(conversation_id, 4000)
@@ -4646,8 +4663,7 @@ mod tests {
             act: "Ran list_directory and summarized output.".to_string(),
             created_at: Utc::now(),
         };
-        db.save_ooda_turn_packet(&packet)
-            .expect("save ooda packet");
+        db.save_ooda_turn_packet(&packet).expect("save ooda packet");
 
         let loaded = db
             .get_latest_ooda_turn_packet_for_conversation(&conversation.id)

@@ -6,8 +6,8 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 ## Components
 
 ### `Agent`
-- **Does**: Owns runtime dependencies (skills, tools, config, database, reasoning engines) plus per-conversation background-subtask handles, wake-signal primitives for interruptible sleeps, and lifecycle operations (`new`, `run_loop`, `reload_config`, `toggle_pause`, `set_paused`, `runtime_status`, `notify_operator_message_queued`)
-- **Interacts with**: `config::AgentConfig`, `database::AgentDatabase`, `skills::*`, `tools::ToolRegistry`, `agent::reasoning`, `agent::trajectory`, `agent::orientation`, `agent::journal`, `agent::concerns`
+- **Does**: Owns runtime dependencies (skills, tools, config, database, reasoning engines, runtime plugin host) plus per-conversation background-subtask handles, wake-signal primitives for interruptible sleeps, and lifecycle operations (`new`, `run_loop`, `reload_config`, `toggle_pause`, `set_paused`, `runtime_status`, `notify_operator_message_queued`)
+- **Interacts with**: `config::AgentConfig`, `database::AgentDatabase`, `skills::*`, `tools::ToolRegistry`, `runtime_plugin_host.rs`, `agent::reasoning`, `agent::trajectory`, `agent::orientation`, `agent::journal`, `agent::concerns`
 
 ### Living Loop foundation modules (`journal`, `concerns`)
 - **Does**: Provide typed records for journal entries and concern tracking used by new ll.1 database tables
@@ -30,7 +30,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `tools::ToolOutput::NeedsApproval`, `Agent::emit`, `AgentEvent::ApprovalRequest`.
 
 ### `run_loop`
-- **Does**: Main background loop; checks pause/rate limits, then executes either legacy single-loop mode or phase-5 three-loop mode (`run_engaged_tick`, `run_ambient_tick`, `run_dream_cycle`) depending on config. Sleep windows are interruptible so queued operator messages can wake the loop immediately.
+- **Does**: Main background loop; checks pause/rate limits, applies pending runtime-plugin config changes on the loop runtime, then executes either legacy single-loop mode or phase-5 three-loop mode (`run_engaged_tick`, `run_ambient_tick`, `run_dream_cycle`) depending on config. Sleep windows are interruptible so queued operator messages can wake the loop immediately.
 - **Interacts with**: `maybe_evolve_persona`, `run_engaged_tick`, `run_ambient_tick`, `should_dream`, `run_dream_cycle`, `run_cycle`
 
 ### `run_engaged_tick`
@@ -87,16 +87,24 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `config::AgentConfig.capability_profiles`, `tools::ToolContext`
 
 ### Persona evolution helpers
-- **Does**: Capture persona snapshots and run trajectory inference on schedule
-- **Interacts with**: `agent::trajectory`, `database::persona_history`, reflection timestamps in `agent_state`
+- **Does**: Capture persona snapshots and run trajectory inference on schedule, then emit a bounded `persona_evolved` lifecycle event to the shared runtime plugin host after persistence succeeds.
+- **Interacts with**: `agent::trajectory`, `database::persona_history`, `runtime_plugin_host.rs`, reflection timestamps in `agent_state`
+
+### `collect_prompt_slot_contributions` / `collect_engaged_prompt_contributions`
+- **Does**: Queries the shared runtime plugin host for prompt-slot addenda, constructs the engaged-loop query context (conversation ID, loop label, summary, enabled tools), and degrades to an empty contribution set on plugin-host errors.
+- **Interacts with**: `runtime_plugin_host.rs`, `tools::ToolRegistry`.
+
+### `reload_config`
+- **Does**: Rebuilds the LLM-facing engines from the saved config, bumps a config-generation marker, and wakes the loop so runtime-plugin config is reapplied from the loop runtime instead of the API runtime.
+- **Interacts with**: `runtime_plugin_host.rs`, `tools::ToolRegistry`, `agent::{reasoning,orientation,journal,trajectory}`.
 
 ### `calculate_tick_duration` / `should_dream` / `run_dream_cycle`
 - **Does**: Computes adaptive ambient tick frequency from user-state estimate, decides dream-trigger windows (away/deep-night + interval gate), and runs dream-cycle consolidation (trajectory check, journal digest, concern pruning)
 - **Interacts with**: `presence/mod.rs`, `orientation.rs`, `database.rs` state keys and working memory
 
-### `build_private_chat_agentic_prompt` (session handoff note injection)
-- **Does**: Accepts an optional `session_handoff_note: Option<&str>` as the first context parameter. When present, injects it under `## Your Handoff Note from Last Session` at the very top of the prompt — before concerns, working memory, and all other sections. Both the foreground (`process_chat_messages`) and background subtask paths read the note from `AgentDatabase::get_working_memory(SESSION_HANDOFF_KEY)` before calling the assembler.
-- **Interacts with**: `tools::memory::SESSION_HANDOFF_KEY`, `AgentDatabase::get_working_memory`
+### `build_private_chat_agentic_prompt_with_contributions`
+- **Does**: Builds the private-chat prompt, injects the optional session handoff note under `## Your Handoff Note from Last Session` before all other context, and extends the prompt with bounded runtime-plugin addenda (`engaged.context` under `## Plugin Context`, `engaged.instructions` under `## Plugin Guidance`).
+- **Interacts with**: `tools::memory::SESSION_HANDOFF_KEY`, `AgentDatabase::get_working_memory`, `runtime_plugin_host.rs` prompt-slot types and merge helpers.
 
 ### Chat formatting helpers
 - **Does**: Builds operator-chat prompts and serializes tool-call/thinking/media metadata into `[tool_calls]...[/tool_calls]`, `[thinking]...[/thinking]`, and `[media]...[/media]` blocks for inline UI rendering
@@ -159,3 +167,6 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - The run loop is intentionally conservative around errors: failures emit events and continue after short backoff.
 - The chat system prompt instructs the agent to call `write_session_handoff` when wrapping up a work session. The note is stored under a fixed key (`session-handoff`) and injected as the first context section on the next turn, enabling cold-start resumption without reading history.
 - Completion nudge (Ponderer-q2y): if the agent returns 0 tool calls to an apparent action request with status=done/still_working, and the turn limit allows another turn, `should_continue` is forced true and the next turn's `continuation_hint` is replaced with an explicit "please actually use tools" prompt. The old completion check at the bottom of the turn loop is now only reached when the nudge could not fire (at turn limit).
+- Engaged private-chat prompts now have bounded plugin extension points: runtime plugins can contribute additive `engaged.context` and `engaged.instructions` blocks, but the core prompt framing still belongs to `Agent`.
+- Persona evolution now notifies the runtime plugin host after snapshot persistence so side-effect plugins can react (for example, voice-profile drift) without adding domain-specific state to `Agent`.
+- Config reload now signals the loop to reapply runtime-plugin settings on the agent runtime thread, preventing cross-runtime Tokio process-context issues while still enabling runtime bundles without a full backend restart.

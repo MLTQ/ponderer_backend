@@ -10,7 +10,7 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - **Interacts with**: `runtime.rs` (`BackendRuntime`), `agent/mod.rs` (`AgentEvent`), `database.rs` (`AgentDatabase` chat APIs).
 
 ### `ServerState`
-- **Does**: Shared application state containing agent handle, DB handle, auth token, mutable config snapshot, shared process registry, and WS broadcaster.
+- **Does**: Shared application state containing agent handle, DB handle, auth token, mutable config snapshot, shared process registry, plugin manifests, and WS broadcaster.
 - **Interacts with**: all route handlers and auth middleware.
 
 ### REST handlers (`/v1/...`)
@@ -51,7 +51,8 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 
 ## Notes
 - `/v1/health` is authenticated in `required` mode, matching deny-by-default auth boundaries.
-- `/v1/plugins` exposes loaded plugin manifests (`builtin.core` + extension plugins) for client-side capability discovery.
+- `/v1/plugins` exposes loaded plugin manifests (built-ins, discovered workflow bundles, discovered runtime-process bundles, and extension plugins) for client-side capability discovery, including optional settings-tab metadata and inline settings schemas for the desktop settings window.
+- Runtime-process plugins are initialized by `Agent::run_loop` on the dedicated agent runtime thread so plugin stdio/process handles and tool execution share one Tokio runtime context.
 - Message enqueue validates non-empty content and returns the created `message_id`.
 - Message enqueue (`POST /v1/conversations/:id/messages`) now nudges the agent runtime to wake immediately instead of waiting for the next ambient/poll sleep interval.
 - Conversation-scoped handlers guard against missing conversation IDs with explicit `404` responses.

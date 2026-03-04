@@ -436,9 +436,7 @@ pub(crate) fn extract_json(response: &str) -> Result<String> {
     } else {
         ""
     };
-    anyhow::bail!(
-        "Could not extract valid JSON from LLM response{hint}.\n\nRaw response:\n{text}"
-    )
+    anyhow::bail!("Could not extract valid JSON from LLM response{hint}.\n\nRaw response:\n{text}")
 }
 
 /// Strip thinking tags like <think>...</think> from response

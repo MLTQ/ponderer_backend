@@ -7,16 +7,23 @@ use flume::Sender;
 use crate::agent::{Agent, AgentEvent};
 use crate::config::AgentConfig;
 use crate::database::AgentDatabase;
-use crate::plugin::{BackendPlugin, BackendPluginManifest};
+use crate::plugin::{
+    BackendPlugin, BackendPluginKind, BackendPluginManifest, PluginSettingsTabManifest,
+};
 use crate::process_registry::ProcessRegistry;
+use crate::runtime_plugin_host::RuntimePluginHost;
+use crate::runtime_process_plugin::RuntimeProcessPluginCatalog;
 use crate::skills::Skill;
 use crate::tools::ToolRegistry;
+use crate::workflow_plugin::{SharedWorkflowPluginCatalog, WorkflowPluginCatalog};
 
 pub struct BackendRuntime {
     pub config: AgentConfig,
     pub agent: Arc<Agent>,
     pub tool_registry: Arc<ToolRegistry>,
     pub process_registry: Arc<ProcessRegistry>,
+    pub runtime_plugin_host: Arc<RuntimePluginHost>,
+    pub workflow_plugins: SharedWorkflowPluginCatalog,
     pub ui_database: Option<Arc<AgentDatabase>>,
     pub plugin_manifests: Vec<BackendPluginManifest>,
 }
@@ -51,18 +58,34 @@ impl BackendRuntimeBuilder {
 
     pub fn build(self) -> Result<BackendRuntime> {
         let config = self.config;
-        let mut skill_list = build_skills(&config);
+        let mut skill_list = build_builtin_skills(&config);
         let tool_registry = Arc::new(ToolRegistry::new());
         let process_registry = Arc::new(ProcessRegistry::new());
+        let runtime_process_plugins = Arc::new(RuntimeProcessPluginCatalog::discover()?);
+        let runtime_plugin_host = Arc::new(RuntimePluginHost::with_catalog(
+            runtime_process_plugins.clone(),
+        ));
+        let workflow_plugins = Arc::new(WorkflowPluginCatalog::discover()?);
 
         let init_rt = tokio::runtime::Runtime::new()?;
-        init_rt.block_on(register_builtin_tools(
+        init_rt.block_on(register_builtin_core_tools(
             tool_registry.clone(),
             process_registry.clone(),
             self.event_tx.clone(),
         ))?;
+        init_rt.block_on(register_builtin_comfy_tools(
+            tool_registry.clone(),
+            workflow_plugins.clone(),
+        ))?;
+        init_rt.block_on(register_builtin_orbweaver_tools(tool_registry.clone()))?;
 
-        let mut manifests = vec![builtin_manifest(&config)];
+        let mut manifests = vec![
+            builtin_core_manifest(),
+            builtin_comfy_manifest(),
+            builtin_orbweaver_manifest(),
+        ];
+        manifests.extend(workflow_plugins.manifests());
+        manifests.extend(runtime_process_plugins.manifests());
         for plugin in self.plugins {
             let manifest = plugin.manifest();
             let plugin_id = manifest.id.clone();
@@ -96,6 +119,7 @@ impl BackendRuntimeBuilder {
         let agent = Arc::new(Agent::new(
             skill_list,
             tool_registry.clone(),
+            runtime_plugin_host.clone(),
             config.clone(),
             self.event_tx,
         ));
@@ -105,6 +129,8 @@ impl BackendRuntimeBuilder {
             agent,
             tool_registry,
             process_registry,
+            runtime_plugin_host,
+            workflow_plugins,
             ui_database,
             plugin_manifests: manifests,
         })
@@ -129,31 +155,31 @@ impl BackendRuntime {
     }
 }
 
-fn build_skills(config: &AgentConfig) -> Vec<Box<dyn Skill>> {
+fn build_builtin_skills(config: &AgentConfig) -> Vec<Box<dyn Skill>> {
     let mut skill_list: Vec<Box<dyn Skill>> = Vec::new();
+    skill_list.extend(build_builtin_orbweaver_skills(config));
+    tracing::info!("Loaded {} built-in skill(s)", skill_list.len());
+    skill_list
+}
 
-    if !config.graphchan_api_url.is_empty() {
+fn build_builtin_orbweaver_skills(config: &AgentConfig) -> Vec<Box<dyn Skill>> {
+    let mut skill_list: Vec<Box<dyn Skill>> = Vec::new();
+    if !config.graphchan_api_url.trim().is_empty() {
         tracing::info!("Graphchan skill enabled: {}", config.graphchan_api_url);
         skill_list.push(Box::new(crate::skills::graphchan::GraphchanSkill::new(
             config.graphchan_api_url.clone(),
         )));
     }
-
-    tracing::info!("Loaded {} built-in skill(s)", skill_list.len());
     skill_list
 }
 
-fn builtin_manifest(config: &AgentConfig) -> BackendPluginManifest {
-    let mut provided_skills = Vec::new();
-    if !config.graphchan_api_url.trim().is_empty() {
-        provided_skills.push("graphchan".to_string());
-    }
-
+fn builtin_core_manifest() -> BackendPluginManifest {
     BackendPluginManifest {
         id: "builtin.core".to_string(),
+        kind: BackendPluginKind::Builtin,
         name: "Ponderer Built-ins".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        description: "Core tools and default skill wiring provided by ponderer_backend."
+        description: "Core tools and default runtime wiring provided by ponderer_backend."
             .to_string(),
         provided_tools: vec![
             "shell".to_string(),
@@ -161,29 +187,71 @@ fn builtin_manifest(config: &AgentConfig) -> BackendPluginManifest {
             "write_file".to_string(),
             "list_directory".to_string(),
             "patch_file".to_string(),
-            "generate_comfy_media".to_string(),
-            "post_to_graphchan".to_string(),
             "evaluate_local_image".to_string(),
             "publish_media_to_chat".to_string(),
             "capture_screen".to_string(),
             "capture_camera_snapshot".to_string(),
             "search_memory".to_string(),
             "write_memory".to_string(),
+            "write_session_handoff".to_string(),
+            "scratch_note".to_string(),
             "http_fetch".to_string(),
-            "graphchan_skill".to_string(),
             "flag_uncertainty".to_string(),
         ],
-        provided_skills,
+        provided_skills: Vec::new(),
+        settings_tab: None,
+        settings_schema: None,
     }
 }
 
-async fn register_builtin_tools(
+fn builtin_comfy_manifest() -> BackendPluginManifest {
+    BackendPluginManifest {
+        id: "builtin.comfy".to_string(),
+        kind: BackendPluginKind::Builtin,
+        name: "ComfyUI".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        description: "Built-in ComfyUI transport and legacy workflow tooling.".to_string(),
+        provided_tools: vec![
+            "generate_comfy_media".to_string(),
+            "run_workflow_plugin".to_string(),
+        ],
+        provided_skills: Vec::new(),
+        settings_tab: Some(PluginSettingsTabManifest {
+            id: "skill.comfy".to_string(),
+            title: "ComfyUI".to_string(),
+            order: 200,
+        }),
+        settings_schema: None,
+    }
+}
+
+fn builtin_orbweaver_manifest() -> BackendPluginManifest {
+    BackendPluginManifest {
+        id: "builtin.orbweaver".to_string(),
+        kind: BackendPluginKind::Builtin,
+        name: "OrbWeaver".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        description: "Built-in OrbWeaver / Graphchan integration.".to_string(),
+        provided_tools: vec![
+            "post_to_graphchan".to_string(),
+            "graphchan_skill".to_string(),
+        ],
+        provided_skills: vec!["graphchan".to_string()],
+        settings_tab: Some(PluginSettingsTabManifest {
+            id: "skill.orbweaver".to_string(),
+            title: "OrbWeaver".to_string(),
+            order: 210,
+        }),
+        settings_schema: None,
+    }
+}
+
+async fn register_builtin_core_tools(
     tool_registry: Arc<ToolRegistry>,
     process_registry: Arc<ProcessRegistry>,
     event_tx: Sender<AgentEvent>,
 ) -> Result<()> {
     use crate::tools::{
-        comfy::{GenerateComfyMediaTool, PostToGraphchanTool},
         files::{ListDirectoryTool, PatchFileTool, ReadFileTool, WriteFileTool},
         http::HttpFetchTool,
         memory::{
@@ -191,7 +259,6 @@ async fn register_builtin_tools(
             WriteSessionHandoffTool,
         },
         shell::ShellTool,
-        skill_bridge::GraphchanSkillTool,
         vision::{
             CaptureCameraSnapshotTool, CaptureScreenTool, EvaluateLocalImageTool,
             PublishMediaToChatTool,
@@ -207,12 +274,6 @@ async fn register_builtin_tools(
         .register(Arc::new(ListDirectoryTool::new()))
         .await;
     tool_registry.register(Arc::new(PatchFileTool::new())).await;
-    tool_registry
-        .register(Arc::new(GenerateComfyMediaTool::new()))
-        .await;
-    tool_registry
-        .register(Arc::new(PostToGraphchanTool::new()))
-        .await;
     tool_registry
         .register(Arc::new(EvaluateLocalImageTool::new()))
         .await;
@@ -239,12 +300,38 @@ async fn register_builtin_tools(
         .await;
     tool_registry.register(Arc::new(HttpFetchTool::new())).await;
     tool_registry
-        .register(Arc::new(GraphchanSkillTool::new()))
-        .await;
-    tool_registry
         .register(Arc::new(FlagUncertaintyTool::new(event_tx)))
         .await;
 
-    tracing::info!("Tool registry initialized with 18 built-in tools");
+    tracing::info!("Core tool registry initialized");
+    Ok(())
+}
+
+async fn register_builtin_comfy_tools(
+    tool_registry: Arc<ToolRegistry>,
+    workflow_plugins: SharedWorkflowPluginCatalog,
+) -> Result<()> {
+    use crate::tools::{comfy::GenerateComfyMediaTool, workflow_plugin::RunWorkflowPluginTool};
+
+    tool_registry
+        .register(Arc::new(GenerateComfyMediaTool::new()))
+        .await;
+    tool_registry
+        .register(Arc::new(RunWorkflowPluginTool::new(workflow_plugins)))
+        .await;
+    tracing::info!("ComfyUI plugin tools initialized");
+    Ok(())
+}
+
+async fn register_builtin_orbweaver_tools(tool_registry: Arc<ToolRegistry>) -> Result<()> {
+    use crate::tools::{comfy::PostToGraphchanTool, skill_bridge::GraphchanSkillTool};
+
+    tool_registry
+        .register(Arc::new(PostToGraphchanTool::new()))
+        .await;
+    tool_registry
+        .register(Arc::new(GraphchanSkillTool::new()))
+        .await;
+    tracing::info!("OrbWeaver plugin tools initialized");
     Ok(())
 }

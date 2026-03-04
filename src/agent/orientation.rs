@@ -7,6 +7,10 @@ use crate::agent::journal::JournalEntry;
 use crate::database::PersonaSnapshot;
 use crate::llm_client::{LlmClient, Message as LlmMessage};
 use crate::presence::{PresenceState, ProcessCategory};
+use crate::runtime_plugin_host::{
+    render_prompt_slot_addendum, PromptContribution, PromptContributionMergeLimits,
+    PromptContributionSlot,
+};
 use crate::skills::SkillEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,7 +309,14 @@ impl OrientationEngine {
     }
 
     pub fn build_orientation_prompt(ctx: &OrientationContext) -> String {
-        format!(
+        Self::build_orientation_prompt_with_contributions(ctx, &[])
+    }
+
+    pub fn build_orientation_prompt_with_contributions(
+        ctx: &OrientationContext,
+        prompt_contributions: &[PromptContribution],
+    ) -> String {
+        let mut prompt = format!(
             "You are the orientation engine for an AI companion living on Max's computer.\n\
              Synthesize current signals into situational awareness.\n\n\
              ## Current Time\n{}\n\n\
@@ -331,7 +342,18 @@ impl OrientationEngine {
             ctx.format_previous_ooda_packet(),
             ctx.format_desktop_observation(),
             ctx.format_trajectory(),
-        )
+        );
+
+        if let Some(addendum) = render_prompt_slot_addendum(
+            PromptContributionSlot::OrientationContext,
+            prompt_contributions,
+            PromptContributionMergeLimits::default(),
+        ) {
+            prompt.push_str("\n\n## Plugin Context\n");
+            prompt.push_str(&addendum);
+        }
+
+        prompt
     }
 
     fn parse_orientation(

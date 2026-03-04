@@ -163,7 +163,11 @@ pub async fn serve_backend(
     spawn_event_bridge(event_rx, ws_events);
     crate::telegram::spawn_telegram_bot(
         state.clone(),
-        runtime.config.telegram_bot_token.clone().unwrap_or_default(),
+        runtime
+            .config
+            .telegram_bot_token
+            .clone()
+            .unwrap_or_default(),
         runtime.config.telegram_chat_id,
     );
     runtime.spawn_agent_loop();
@@ -190,7 +194,10 @@ pub async fn serve_backend(
         .route("/conversations/:id/turns", get(list_turns))
         .route("/turns/:id/tool-calls", get(list_turn_tool_calls))
         .route("/turns/:id/prompt", get(get_turn_prompt))
-        .route("/scheduled-jobs", get(list_scheduled_jobs).post(create_scheduled_job))
+        .route(
+            "/scheduled-jobs",
+            get(list_scheduled_jobs).post(create_scheduled_job),
+        )
         .route(
             "/scheduled-jobs/:id",
             get(get_scheduled_job)
@@ -603,12 +610,7 @@ async fn get_turn_prompt(
         .db
         .get_chat_turn_prompt_bundle(&turn_id)
         .map_err(internal_error)?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("turn {} not found", turn_id),
-            )
-        })?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("turn {} not found", turn_id)))?;
 
     Ok(Json(ChatTurnPromptResponse {
         turn_id,
@@ -633,7 +635,11 @@ async fn get_scheduled_job(
     State(state): State<Arc<ServerState>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<ScheduledJob>, (StatusCode, String)> {
-    match state.db.get_scheduled_job(&job_id).map_err(internal_error)? {
+    match state
+        .db
+        .get_scheduled_job(&job_id)
+        .map_err(internal_error)?
+    {
         Some(job) => Ok(Json(job)),
         None => Err(not_found(format!("scheduled job '{}' not found", job_id))),
     }
@@ -649,7 +655,10 @@ async fn create_scheduled_job(
         return Err((StatusCode::BAD_REQUEST, "name cannot be empty".to_string()));
     }
     if prompt.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "prompt cannot be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "prompt cannot be empty".to_string(),
+        ));
     }
 
     state
@@ -677,13 +686,7 @@ async fn update_scheduled_job(
 
     match state
         .db
-        .update_scheduled_job(
-            &job_id,
-            name,
-            prompt,
-            body.interval_minutes,
-            body.enabled,
-        )
+        .update_scheduled_job(&job_id, name, prompt, body.interval_minutes, body.enabled)
         .map_err(internal_error)?
     {
         Some(job) => Ok(Json(job)),
@@ -695,7 +698,11 @@ async fn delete_scheduled_job(
     State(state): State<Arc<ServerState>>,
     Path(job_id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    if state.db.delete_scheduled_job(&job_id).map_err(internal_error)? {
+    if state
+        .db
+        .delete_scheduled_job(&job_id)
+        .map_err(internal_error)?
+    {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(not_found(format!("scheduled job '{}' not found", job_id)))
@@ -769,7 +776,9 @@ async fn approve_tool(
     Path(tool_name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     state.agent.grant_session_tool_approval(&tool_name).await;
-    Ok(Json(serde_json::json!({ "approved": true, "tool": tool_name })))
+    Ok(Json(
+        serde_json::json!({ "approved": true, "tool": tool_name }),
+    ))
 }
 
 async fn ws_events_route(

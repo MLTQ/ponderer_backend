@@ -1,12 +1,12 @@
 # config.rs
 
 ## Purpose
-Defines all configuration for the Ponderer agent, including LLM connection, identity, polling behavior, agentic loop iteration controls, private-chat autonomous turn budgets (foreground + background) with optional unbounded mode, deterministic loop-breaker heat controls (similarity/threshold/window/cooldown), three-loop living-loop toggles (ambient/journal/concerns/dream), autonomous heartbeat scheduling, explicit per-loop tool capability profiles, image generation (ComfyUI), screen/camera capture privacy gating, character card fields, and self-reflection settings. Supports loading from TOML files with environment variable fallback.
+Defines all configuration for the Ponderer agent, including LLM connection, identity, polling behavior, agentic loop iteration controls, private-chat autonomous turn budgets (foreground + background) with optional unbounded mode, deterministic loop-breaker heat controls (similarity/threshold/window/cooldown), three-loop living-loop toggles (ambient/journal/concerns/dream), autonomous heartbeat scheduling, explicit per-loop tool capability profiles, image generation (ComfyUI), plugin-owned settings blobs, screen/camera capture privacy gating, character card fields, and self-reflection settings. Supports loading from TOML files with environment variable fallback.
 
 ## Components
 
 ### `AgentConfig`
-- **Does**: Top-level config struct holding all runtime settings (LLM, Graphchan, identity, ambient/journal/concerns/dream controls, heartbeat, reflection, image gen, screen-capture gate, character, avatars)
+- **Does**: Top-level config struct holding all runtime settings (LLM, Graphchan, identity, ambient/journal/concerns/dream controls, heartbeat, reflection, image gen, namespaced `plugin_settings`, screen-capture gate, character, avatars)
 - **Interacts with**: `main.rs` (loaded at startup), `agent::Agent` (drives behavior), `ui::app::AgentApp` (display/edit)
 
 ### `AgentConfig::load()`
@@ -24,6 +24,7 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 ### `ComfyUIConfig`
 - **Does**: Holds ComfyUI connection and generation parameters (model, dimensions, sampler, scheduler, CFG, steps)
 - **Interacts with**: `comfy_client.rs`, `agent::image_gen`
+- **Rationale**: New workflow bundles still reuse `comfyui.api_url` as the transport endpoint, while plugin-specific model paths and workflow parameters now live under `AgentConfig.plugin_settings`
 
 ### `RespondTo`
 - **Does**: Controls response behavior (`response_type`: "all" or "selective") with optional separate `decision_model`
@@ -41,6 +42,7 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 | `agent::Agent` | Fields: `llm_api_url`, `llm_model`, `llm_api_key`, `system_prompt`, `poll_interval_secs`, `max_tool_iterations`, `disable_tool_iteration_limit`, `max_chat_autonomous_turns`, `max_background_subtask_turns`, `disable_chat_turn_limit`, `disable_background_subtask_turn_limit`, `loop_heat_threshold`, `loop_similarity_threshold`, `loop_signature_window`, `loop_heat_cooldown`, `enable_ambient_loop`, `ambient_min_interval_secs`, `enable_journal`, `journal_min_interval_secs`, `enable_concerns`, `enable_dream_cycle`, `dream_min_interval_secs`, `enable_heartbeat`, `heartbeat_interval_mins`, `heartbeat_checklist_path`, `enable_memory_evolution`, `memory_evolution_interval_hours`, `memory_eval_trace_set_path`, `capability_profiles`, `enable_self_reflection`, `enable_image_generation`, `enable_screen_capture_in_loop`, `enable_camera_capture_tool`, `guiding_principles` | Renaming/removing any of these fields |
 | `tools/vision.rs` | `enable_screen_capture_in_loop` and `enable_camera_capture_tool` must be present and default false | Removing/renaming these privacy gate fields |
 | `comfy_client.rs` | `comfyui.api_url` is a valid HTTP URL | Changing `ComfyUIConfig` structure |
+| Workflow plugin bundles | `plugin_settings[plugin_id]` stores arbitrary JSON objects keyed by plugin id | Removing or changing `plugin_settings` serialization |
 | TOML file | Serde field names and aliases (`agent_name` -> `username`, `check_interval_seconds` -> `poll_interval_secs`) | Removing serde aliases breaks existing config files |
 
 ## Notes
@@ -48,6 +50,7 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - Load discovery scans that executable-root directory plus working directory candidates and picks the newest valid file.
 - When both `ponderer_config.toml` and `agent_config.toml` exist, the newest file wins to avoid stale-file precedence surprises.
 - `database_path` is normalized to an executable-directory absolute runtime path on load, and converted back to a portable relative path when saving TOML.
+- `plugin_settings` is intentionally schema-agnostic at the config layer; validation lives in plugin manifests and runtime bundle loaders.
 - Default LLM is `llama3.2` at `localhost:11434` (Ollama).
 - Living-loop defaults keep phase-5 architecture opt-in (`enable_ambient_loop=false`, `enable_dream_cycle=false`), while `enable_journal`/`enable_concerns` default true for continuity.
 - Heartbeat defaults: disabled, 30-minute interval, checklist path `HEARTBEAT.md`.

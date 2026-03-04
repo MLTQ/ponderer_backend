@@ -23,6 +23,10 @@ use uuid::Uuid;
 use crate::agent::reasoning::extract_json;
 use crate::database::{PersonaSnapshot, PersonaTraits};
 use crate::http_client::build_http_client;
+use crate::runtime_plugin_host::{
+    render_prompt_slot_addendum, PromptContribution, PromptContributionMergeLimits,
+    PromptContributionSlot,
+};
 
 /// The result of trajectory inference
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +97,15 @@ impl TrajectoryEngine {
         history: &[PersonaSnapshot],
         principles: &[String],
     ) -> String {
+        self.build_trajectory_prompt_with_contributions(history, principles, &[])
+    }
+
+    fn build_trajectory_prompt_with_contributions(
+        &self,
+        history: &[PersonaSnapshot],
+        principles: &[String],
+        prompt_contributions: &[PromptContribution],
+    ) -> String {
         let mut prompt = String::new();
 
         prompt.push_str(r#"You are analyzing the evolution of an AI persona over time.
@@ -154,6 +167,16 @@ This persona tracks the following dimensions (each scored 0.0 to 1.0):
             .iter()
             .map(|p| format!("    \"{}\": 0.0-1.0", p))
             .collect();
+
+        if let Some(addendum) = render_prompt_slot_addendum(
+            PromptContributionSlot::PersonaEvolutionConsiderations,
+            prompt_contributions,
+            PromptContributionMergeLimits::default(),
+        ) {
+            prompt.push_str("\n=== PLUGIN CONSIDERATIONS ===\n");
+            prompt.push_str(&addendum);
+            prompt.push('\n');
+        }
 
         prompt.push_str(&format!(
             r#"
@@ -267,19 +290,21 @@ Respond ONLY with valid JSON."#,
             anyhow::bail!("LLM API error {}: {}", status, body);
         }
 
-        let chat_response: ChatResponse = serde_json::from_str(&body)
-            .with_context(|| {
-                format!(
-                    "Failed to parse trajectory LLM response. Raw body:\n{}",
-                    body.chars().take(800).collect::<String>()
-                )
-            })?;
+        let chat_response: ChatResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "Failed to parse trajectory LLM response. Raw body:\n{}",
+                body.chars().take(800).collect::<String>()
+            )
+        })?;
 
         let first = chat_response.choices.into_iter().next();
-        let finish_reason = first.as_ref()
+        let finish_reason = first
+            .as_ref()
             .and_then(|c| c.finish_reason.clone())
             .unwrap_or_else(|| "unknown".to_string());
-        let content = first.map(|c| c.message.content.unwrap_or_default()).unwrap_or_default();
+        let content = first
+            .map(|c| c.message.content.unwrap_or_default())
+            .unwrap_or_default();
 
         if content.trim().is_empty() {
             let hint = if finish_reason == "length" {
@@ -490,15 +515,13 @@ Be honest about your current state. Respond ONLY with valid JSON."#,
         anyhow::bail!("LLM API error {}: {}", status, body);
     }
 
-    let chat_response: ChatResponse = serde_json::from_str(&body)
-        .with_context(|| {
-            format!(
-                "Failed to parse persona capture LLM response. Raw body:\n{body}"
-            )
-        })?;
+    let chat_response: ChatResponse = serde_json::from_str(&body).with_context(|| {
+        format!("Failed to parse persona capture LLM response. Raw body:\n{body}")
+    })?;
 
     let first = chat_response.choices.into_iter().next();
-    let finish_reason = first.as_ref()
+    let finish_reason = first
+        .as_ref()
         .and_then(|c| c.finish_reason.clone())
         .unwrap_or_else(|| "unknown".to_string());
     let content = first
@@ -562,7 +585,6 @@ Be honest about your current state. Respond ONLY with valid JSON."#,
         formative_experiences: recent_experiences.to_vec(),
     })
 }
-
 
 /// Normalize an API base URL to a chat completions endpoint, mirroring LlmClient's logic.
 /// Handles base URLs of the form `http://host:port`, `http://host:port/v1`, or the full path.

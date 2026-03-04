@@ -181,8 +181,11 @@ fn spawn_status_poller(process: Arc<ManagedProcess>) {
                     info.status = "failed".to_string();
                     info.finished_at = Some(Utc::now());
                     let segment = format!("[registry error] {error}\n");
-                    info.recent_output =
-                        push_recent_output(&info.recent_output, &segment, MAX_CAPTURED_OUTPUT_BYTES);
+                    info.recent_output = push_recent_output(
+                        &info.recent_output,
+                        &segment,
+                        MAX_CAPTURED_OUTPUT_BYTES,
+                    );
                     break;
                 }
             }
@@ -192,7 +195,8 @@ fn spawn_status_poller(process: Arc<ManagedProcess>) {
 
 async fn append_output(process: &Arc<ManagedProcess>, segment: &str) {
     let mut info = process.info.write().await;
-    info.recent_output = push_recent_output(&info.recent_output, segment, MAX_CAPTURED_OUTPUT_BYTES);
+    info.recent_output =
+        push_recent_output(&info.recent_output, segment, MAX_CAPTURED_OUTPUT_BYTES);
 }
 
 fn push_recent_output(existing: &str, addition: &str, max_bytes: usize) -> String {

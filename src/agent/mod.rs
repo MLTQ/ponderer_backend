@@ -29,7 +29,9 @@ use crate::agent::orientation::{
     Orientation, OrientationContext, OrientationEngine,
 };
 use crate::config::AgentConfig;
-use crate::database::{AgentDatabase, ChatTurnPhase, OodaTurnPacketRecord, OrientationSnapshotRecord};
+use crate::database::{
+    AgentDatabase, ChatTurnPhase, OodaTurnPacketRecord, OrientationSnapshotRecord,
+};
 use crate::llm_client::{LlmClient, Message as LlmMessage};
 use crate::memory::archive::{MemoryEvalRunRecord, MemoryPromotionPolicy, PromotionOutcome};
 use crate::memory::eval::{
@@ -37,6 +39,11 @@ use crate::memory::eval::{
 };
 use crate::memory::WorkingMemoryEntry;
 use crate::presence::PresenceMonitor;
+use crate::runtime_plugin_host::{
+    render_prompt_slot_addendum, PromptContribution, PromptContributionContext,
+    PromptContributionMergeLimits, PromptContributionSlot, RuntimePluginHost,
+    RuntimePluginLifecycleEvent, RuntimePluginPromptQuery,
+};
 use crate::skills::{Skill, SkillContext, SkillEvent};
 use crate::tools::agentic::{AgenticConfig, AgenticLoop, ToolCallRecord};
 use crate::tools::vision::capture_screen_to_path;
@@ -187,6 +194,7 @@ struct PendingGoal {
 pub struct Agent {
     skills: Arc<RwLock<Vec<Box<dyn Skill>>>>,
     tool_registry: Arc<ToolRegistry>,
+    runtime_plugin_host: Arc<RuntimePluginHost>,
     config: Arc<RwLock<AgentConfig>>,
     state: Arc<RwLock<AgentState>>,
     event_tx: Sender<AgentEvent>,
@@ -199,6 +207,7 @@ pub struct Agent {
     presence_monitor: Arc<Mutex<PresenceMonitor>>,
     last_orientation_signature: Arc<RwLock<Option<String>>>,
     last_orientation: Arc<RwLock<Option<Orientation>>>,
+    config_generation: Arc<AtomicU64>,
     stop_generation: Arc<AtomicU64>,
     wake_generation: Arc<AtomicU64>,
     wake_notify: Arc<Notify>,
@@ -212,6 +221,7 @@ impl Agent {
     pub fn new(
         skills: Vec<Box<dyn Skill>>,
         tool_registry: Arc<ToolRegistry>,
+        runtime_plugin_host: Arc<RuntimePluginHost>,
         config: AgentConfig,
         event_tx: Sender<AgentEvent>,
     ) -> Self {
@@ -290,6 +300,7 @@ impl Agent {
         Self {
             skills: Arc::new(RwLock::new(skills)),
             tool_registry,
+            runtime_plugin_host,
             config: Arc::new(RwLock::new(config)),
             state: Arc::new(RwLock::new(AgentState::default())),
             event_tx,
@@ -302,6 +313,7 @@ impl Agent {
             presence_monitor: Arc::new(Mutex::new(PresenceMonitor::new())),
             last_orientation_signature: Arc::new(RwLock::new(None)),
             last_orientation: Arc::new(RwLock::new(None)),
+            config_generation: Arc::new(AtomicU64::new(0)),
             stop_generation: Arc::new(AtomicU64::new(0)),
             wake_generation: Arc::new(AtomicU64::new(0)),
             wake_notify: Arc::new(Notify::new()),
@@ -372,13 +384,15 @@ impl Agent {
         };
 
         // Update all components atomically
-        *self.config.write().await = new_config;
+        *self.config.write().await = new_config.clone();
         *self.reasoning.write().await = new_reasoning;
         *self.orientation_engine.write().await = new_orientation;
         *self.journal_engine.write().await = new_journal;
         *self.image_gen.write().await = new_image_gen;
         *self.trajectory_engine.write().await = new_trajectory;
         *self.last_orientation_signature.write().await = None;
+        self.config_generation.fetch_add(1, Ordering::SeqCst);
+        self.request_wake("config_reloaded");
 
         self.emit(AgentEvent::Observation(
             "Configuration reloaded".to_string(),
@@ -486,6 +500,64 @@ impl Agent {
 
     async fn emit(&self, event: AgentEvent) {
         let _ = self.event_tx.send(event);
+    }
+
+    async fn collect_prompt_slot_contributions(
+        &self,
+        slot: PromptContributionSlot,
+        context: PromptContributionContext,
+    ) -> Vec<PromptContribution> {
+        let query = RuntimePluginPromptQuery { slot, context };
+        match self
+            .runtime_plugin_host
+            .collect_prompt_contributions(&query)
+            .await
+        {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::warn!(
+                    "Runtime plugin prompt contribution collection failed for slot '{}': {}",
+                    slot.wire_name(),
+                    error
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    async fn collect_engaged_prompt_contributions(
+        &self,
+        conversation_id: &str,
+        has_new_messages: bool,
+        is_continuation: bool,
+    ) -> Vec<PromptContribution> {
+        let context = PromptContributionContext {
+            conversation_id: Some(conversation_id.to_string()),
+            loop_name: Some("engaged".to_string()),
+            current_summary: Some(if has_new_messages {
+                "fresh operator message".to_string()
+            } else if is_continuation {
+                "autonomous continuation".to_string()
+            } else {
+                "engaged turn".to_string()
+            }),
+            enabled_tools: self.tool_registry.list_names().await,
+        };
+
+        let mut contributions = self
+            .collect_prompt_slot_contributions(
+                PromptContributionSlot::EngagedContext,
+                context.clone(),
+            )
+            .await;
+        contributions.extend(
+            self.collect_prompt_slot_contributions(
+                PromptContributionSlot::EngagedInstructions,
+                context,
+            )
+            .await,
+        );
+        contributions
     }
 
     async fn set_state(&self, visual_state: AgentVisualState) {
@@ -601,6 +673,8 @@ impl Agent {
         // Capture initial persona snapshot if this is the first run
         self.maybe_capture_initial_persona().await;
 
+        let mut applied_plugin_config_generation = u64::MAX;
+
         loop {
             // Check if paused
             {
@@ -614,6 +688,18 @@ impl Agent {
 
             self.set_state(AgentVisualState::Idle).await;
             let config_snapshot = { self.config.read().await.clone() };
+            let current_config_generation = self.config_generation.load(Ordering::SeqCst);
+            if current_config_generation != applied_plugin_config_generation {
+                if let Err(error) = self
+                    .runtime_plugin_host
+                    .apply_config(&config_snapshot, self.tool_registry.clone())
+                    .await
+                {
+                    tracing::warn!("Failed to reconfigure runtime plugins: {}", error);
+                } else {
+                    applied_plugin_config_generation = current_config_generation;
+                }
+            }
             let scheduled_jobs_queued = self.maybe_enqueue_due_scheduled_jobs().await;
 
             // Check if it's time for persona evolution (Ludonarrative Assonantic Tracing)
@@ -656,7 +742,8 @@ impl Agent {
                 }
 
                 let tick = self.calculate_tick_duration(&config_snapshot, orientation.as_ref());
-                self.wait_with_interruptible_sleep(tick, "ambient-tick").await;
+                self.wait_with_interruptible_sleep(tick, "ambient-tick")
+                    .await;
                 continue;
             }
 
@@ -823,9 +910,7 @@ impl Agent {
                 .flatten()
                 .and_then(|raw| raw.parse::<chrono::DateTime<Utc>>().ok());
             let is_due = last_run
-                .map(|last| {
-                    now - last >= ChronoDuration::seconds(directive_interval_secs as i64)
-                })
+                .map(|last| now - last >= ChronoDuration::seconds(directive_interval_secs as i64))
                 .unwrap_or(true);
 
             if !is_due {
@@ -862,7 +947,10 @@ impl Agent {
             return;
         }
 
-        self.emit(AgentEvent::CycleStart { label: "🧠 Self-directive".to_string() }).await;
+        self.emit(AgentEvent::CycleStart {
+            label: "🧠 Self-directive".to_string(),
+        })
+        .await;
         self.emit(AgentEvent::Observation(
             "Running autonomous self-directive cycle...".to_string(),
         ))
@@ -960,7 +1048,8 @@ impl Agent {
                 }
                 trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
                 self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
-                self.maybe_notify_needs_approval(&result.tool_calls_made).await;
+                self.maybe_notify_needs_approval(&result.tool_calls_made)
+                    .await;
 
                 if did_nothing {
                     self.emit(AgentEvent::Observation(
@@ -998,10 +1087,7 @@ impl Agent {
                     if !summary.is_empty() {
                         let note = format!("[autonomy] {}", summary);
                         if let Err(e) = db.add_chat_message("agent", &note) {
-                            tracing::warn!(
-                                "Failed to persist self-directive chat summary: {}",
-                                e
-                            );
+                            tracing::warn!("Failed to persist self-directive chat summary: {}", e);
                         }
                     }
                 }
@@ -1055,10 +1141,8 @@ impl Agent {
                 .ok()
                 .flatten()
                 .and_then(|raw| raw.parse::<chrono::DateTime<Utc>>().ok());
-            last.map(|t| {
-                Utc::now() - t >= ChronoDuration::seconds(min_interval_secs as i64)
-            })
-            .unwrap_or(false) // Don't fire on very first boot — wait for first real interaction.
+            last.map(|t| Utc::now() - t >= ChronoDuration::seconds(min_interval_secs as i64))
+                .unwrap_or(false) // Don't fire on very first boot — wait for first real interaction.
         };
 
         if !is_due {
@@ -1106,8 +1190,7 @@ impl Agent {
             },
         ];
 
-        match client.generate(messages).await
-        {
+        match client.generate(messages).await {
             Ok(response) => {
                 let message = response.trim().to_string();
                 if !message.is_empty() {
@@ -1204,7 +1287,10 @@ impl Agent {
             return;
         }
 
-        self.emit(AgentEvent::CycleStart { label: "💓 Heartbeat".to_string() }).await;
+        self.emit(AgentEvent::CycleStart {
+            label: "💓 Heartbeat".to_string(),
+        })
+        .await;
         self.emit(AgentEvent::Observation(
             "Running autonomous heartbeat checks...".to_string(),
         ))
@@ -1306,7 +1392,8 @@ impl Agent {
                     result: event_result,
                 })
                 .await;
-                self.maybe_notify_needs_approval(&result.tool_calls_made).await;
+                self.maybe_notify_needs_approval(&result.tool_calls_made)
+                    .await;
 
                 if !no_action {
                     let db_lock = self.database.read().await;
@@ -1532,6 +1619,21 @@ impl Agent {
             }
         }
 
+        let previous_self_description = history
+            .iter()
+            .filter(|item| item.id != updated_snapshot.id)
+            .max_by_key(|item| item.captured_at)
+            .map(|item| item.self_description.clone());
+        let plugin_event = RuntimePluginLifecycleEvent::PersonaEvolved {
+            current_self_description: updated_snapshot.self_description.clone(),
+            previous_self_description,
+            trajectory: updated_snapshot.inferred_trajectory.clone(),
+            guiding_principles: guiding_principles.clone(),
+        };
+        if let Err(error) = self.runtime_plugin_host.dispatch_event(&plugin_event).await {
+            tracing::warn!("Runtime plugin persona_evolved dispatch failed: {}", error);
+        }
+
         // 6. Emit reasoning trace with trajectory insights
         self.emit(AgentEvent::ReasoningTrace(vec![
             "Persona Evolution Complete".to_string(),
@@ -1639,7 +1741,9 @@ impl Agent {
                     db.get_latest_ooda_turn_packet()
                         .ok()
                         .flatten()
-                        .map(|packet| format_ooda_packet_for_context(&packet, OODA_PACKET_CONTEXT_MAX_CHARS)),
+                        .map(|packet| {
+                            format_ooda_packet_for_context(&packet, OODA_PACKET_CONTEXT_MAX_CHARS)
+                        }),
                 )
             } else {
                 (Vec::new(), Vec::new(), None, None, None)
@@ -1957,7 +2061,12 @@ impl Agent {
     async fn maybe_notify_needs_approval(&self, tool_calls: &[ToolCallRecord]) {
         let mut notified = std::collections::HashSet::new();
         for call in tool_calls {
-            if let ToolOutput::NeedsApproval { ref tool, ref reason, .. } = call.output {
+            if let ToolOutput::NeedsApproval {
+                ref tool,
+                ref reason,
+                ..
+            } = call.output
+            {
                 if notified.insert(tool.clone()) {
                     self.emit(AgentEvent::ApprovalRequest {
                         tool_name: tool.clone(),
@@ -2181,6 +2290,7 @@ impl Agent {
 
         let conversation_id = request.conversation_id.clone();
         let tool_registry = self.tool_registry.clone();
+        let runtime_plugin_host = self.runtime_plugin_host.clone();
         let event_tx = self.event_tx.clone();
         let handle =
             tokio::task::spawn_blocking(
@@ -2191,6 +2301,7 @@ impl Agent {
                     Ok(rt) => rt.block_on(run_background_chat_subtask(
                         request,
                         tool_registry,
+                        runtime_plugin_host,
                         event_tx,
                     )),
                     Err(e) => BackgroundSubtaskResult {
@@ -2206,7 +2317,10 @@ impl Agent {
 
     async fn run_engaged_tick(&self) -> Result<Vec<SkillEvent>> {
         self.reap_finished_background_subtasks().await;
-        self.emit(AgentEvent::CycleStart { label: "💬 Engaged".to_string() }).await;
+        self.emit(AgentEvent::CycleStart {
+            label: "💬 Engaged".to_string(),
+        })
+        .await;
 
         // Engaged loop handles direct operator chat + external skill events.
         self.process_chat_messages().await?;
@@ -2359,7 +2473,8 @@ impl Agent {
                 }
                 trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
                 self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
-                self.maybe_notify_needs_approval(&result.tool_calls_made).await;
+                self.maybe_notify_needs_approval(&result.tool_calls_made)
+                    .await;
 
                 if let Some(response) = result.response.as_deref().filter(|r| !r.trim().is_empty())
                 {
@@ -2422,7 +2537,10 @@ impl Agent {
         if self.has_pending_operator_messages().await {
             return None;
         }
-        self.emit(AgentEvent::CycleStart { label: "🌿 Ambient".to_string() }).await;
+        self.emit(AgentEvent::CycleStart {
+            label: "🌿 Ambient".to_string(),
+        })
+        .await;
 
         let config_snapshot = { self.config.read().await.clone() };
 
@@ -2583,7 +2701,10 @@ impl Agent {
     }
 
     async fn run_dream_cycle(&self, config: &AgentConfig, orientation: Option<&Orientation>) {
-        self.emit(AgentEvent::CycleStart { label: "💤 Dream".to_string() }).await;
+        self.emit(AgentEvent::CycleStart {
+            label: "💤 Dream".to_string(),
+        })
+        .await;
         self.emit(AgentEvent::Observation(
             "Starting dream cycle (ambient consolidation)...".to_string(),
         ))
@@ -2642,7 +2763,10 @@ impl Agent {
     }
 
     async fn run_cycle(&self) -> Result<()> {
-        self.emit(AgentEvent::CycleStart { label: "🔄 Cycle".to_string() }).await;
+        self.emit(AgentEvent::CycleStart {
+            label: "🔄 Cycle".to_string(),
+        })
+        .await;
         // First, check for and process any private chat messages
         self.process_chat_messages().await?;
 
@@ -2811,7 +2935,8 @@ impl Agent {
                 }
                 trace_lines.extend(tool_trace_lines(&result.tool_calls_made));
                 self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
-                self.maybe_notify_needs_approval(&result.tool_calls_made).await;
+                self.maybe_notify_needs_approval(&result.tool_calls_made)
+                    .await;
 
                 if let Some(response) = result.response.as_deref().filter(|r| !r.trim().is_empty())
                 {
@@ -3069,7 +3194,12 @@ impl Agent {
                 )))
                 .await;
 
-                let (recent_chat_context, recent_action_digest, previous_ooda_packet_context, session_handoff_note) = {
+                let (
+                    recent_chat_context,
+                    recent_action_digest,
+                    previous_ooda_packet_context,
+                    session_handoff_note,
+                ) = {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
                         (
@@ -3077,13 +3207,15 @@ impl Agent {
                             // On continuation turns the cache prevents intermediate messages
                             // we just persisted from re-appearing in the prompt context, which
                             // would cause the model to think the task is already complete.
-                            cached_chat_context.get_or_insert_with(|| {
-                                db.get_chat_context_for_conversation(
-                                    &conversation_id,
-                                    CHAT_CONTEXT_RECENT_LIMIT,
-                                )
-                                .unwrap_or_default()
-                            }).clone(),
+                            cached_chat_context
+                                .get_or_insert_with(|| {
+                                    db.get_chat_context_for_conversation(
+                                        &conversation_id,
+                                        CHAT_CONTEXT_RECENT_LIMIT,
+                                    )
+                                    .unwrap_or_default()
+                                })
+                                .clone(),
                             db.get_recent_action_digest_for_conversation(
                                 &conversation_id,
                                 ACTION_DIGEST_TURN_LIMIT,
@@ -3131,7 +3263,15 @@ impl Agent {
                     }
                 };
 
-                let user_message = build_private_chat_agentic_prompt(
+                let prompt_contributions = self
+                    .collect_engaged_prompt_contributions(
+                        &conversation_id,
+                        !pending_messages.is_empty(),
+                        continuation_hint.is_some(),
+                    )
+                    .await;
+
+                let user_message = build_private_chat_agentic_prompt_with_contributions(
                     &pending_messages,
                     session_handoff_note.as_deref(),
                     &concerns_priority_context,
@@ -3142,13 +3282,16 @@ impl Agent {
                     latest_orientation.as_ref(),
                     recent_action_digest.as_deref(),
                     previous_ooda_packet_context.as_deref(),
+                    &prompt_contributions,
                 );
                 if let Some(turn_id) = turn_id.as_deref() {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
-                        if let Err(e) =
-                            db.set_chat_turn_prompt_bundle(turn_id, &user_message, &chat_system_prompt)
-                        {
+                        if let Err(e) = db.set_chat_turn_prompt_bundle(
+                            turn_id,
+                            &user_message,
+                            &chat_system_prompt,
+                        ) {
                             tracing::warn!(
                                 "Failed to persist chat turn prompt [{}]: {}",
                                 truncate_for_event(turn_id, 12),
@@ -3237,8 +3380,7 @@ impl Agent {
                         }
                         self.emit(AgentEvent::Error(format!(
                             "Private chat turn failed [{}]: {}",
-                            conversation_tag,
-                            e
+                            conversation_tag, e
                         )))
                         .await;
 
@@ -3246,11 +3388,8 @@ impl Agent {
                             "I hit an internal error while working on your request and stopped this turn. Error: {}. Send a follow-up and I will retry immediately.",
                             truncate_for_event(&e.to_string(), 180)
                         );
-                        let fallback_chat = format_chat_message_with_metadata(
-                            &fallback_response,
-                            &[],
-                            &[],
-                        );
+                        let fallback_chat =
+                            format_chat_message_with_metadata(&fallback_response, &[], &[]);
                         let mut fallback_saved = false;
                         let db_lock = self.database.read().await;
                         if let Some(ref db) = *db_lock {
@@ -3381,8 +3520,10 @@ impl Agent {
                     && chat_turn_limit.map(|lim| turn + 1 < lim).unwrap_or(true)
                 {
                     let response_len = operator_visible_response.trim().len();
-                    let original_text =
-                        pending_messages.first().map(|m| m.content.as_str()).unwrap_or("");
+                    let original_text = pending_messages
+                        .first()
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
                     if response_len < 20 {
                         // Too short to be useful — retry unconditionally.
                         completion_retry_hint = Some(
@@ -3515,10 +3656,7 @@ impl Agent {
                             }
                         }
                         // Reset the social drive clock — we just spoke to the user.
-                        let _ = db.set_state(
-                            SOCIAL_LAST_POST_STATE_KEY,
-                            &Utc::now().to_rfc3339(),
-                        );
+                        let _ = db.set_state(SOCIAL_LAST_POST_STATE_KEY, &Utc::now().to_rfc3339());
                     }
                 }
 
@@ -3544,9 +3682,7 @@ impl Agent {
                             }
                         }
 
-                        if !marked_initial_messages
-                            && agent_message_id.is_some()
-                        {
+                        if !marked_initial_messages && agent_message_id.is_some() {
                             for msg in &conversation_messages {
                                 if let Err(e) = db.mark_message_processed(&msg.id) {
                                     tracing::warn!("Failed to mark message as processed: {}", e);
@@ -3578,8 +3714,7 @@ impl Agent {
                                     .ok()
                                     .flatten()
                                     .map(|c| {
-                                        c.title.starts_with("Chat ")
-                                            || c.title == "Default chat"
+                                        c.title.starts_with("Chat ") || c.title == "Default chat"
                                     })
                                     .unwrap_or(false);
 
@@ -3587,8 +3722,7 @@ impl Agent {
                                     let title_conv_id = conversation_id.clone();
                                     let title_api_url = agentic_api_url(&llm_api_url);
                                     let title_model = llm_model.clone();
-                                    let title_api_key =
-                                        llm_api_key.clone().unwrap_or_default();
+                                    let title_api_key = llm_api_key.clone().unwrap_or_default();
                                     let title_db = self.database.clone();
                                     tokio::spawn(async move {
                                         let client = crate::llm_client::LlmClient::new(
@@ -3609,7 +3743,11 @@ impl Agent {
                                             .await
                                         {
                                             Ok(title) => {
-                                                let title = title.trim().trim_matches('"').trim_matches('\'').to_string();
+                                                let title = title
+                                                    .trim()
+                                                    .trim_matches('"')
+                                                    .trim_matches('\'')
+                                                    .to_string();
                                                 if !title.is_empty() && title.len() <= 120 {
                                                     let db_lock = title_db.read().await;
                                                     if let Some(ref db) = *db_lock {
@@ -3710,10 +3848,15 @@ impl Agent {
                     ));
                 }
                 if heat_update.tripped {
-                    trace_lines.push("Loop detector tripped: forcing yield to break repetition.".to_string());
+                    trace_lines.push(
+                        "Loop detector tripped: forcing yield to break repetition.".to_string(),
+                    );
                 }
                 for example in &heat_update.repeated_examples {
-                    trace_lines.push(format!("Repeated pattern: {}", truncate_for_event(example, 180)));
+                    trace_lines.push(format!(
+                        "Repeated pattern: {}",
+                        truncate_for_event(example, 180)
+                    ));
                 }
                 if !result.thinking_blocks.is_empty() {
                     trace_lines.push(format!(
@@ -3747,9 +3890,8 @@ impl Agent {
                     }
 
                     pending_messages.clear();
-                    continuation_hint = Some(
-                        completion_retry_hint.unwrap_or(continuation_hint_text.clone()),
-                    );
+                    continuation_hint =
+                        Some(completion_retry_hint.unwrap_or(continuation_hint_text.clone()));
                     turn += 1;
                     continue;
                 }
@@ -3759,8 +3901,7 @@ impl Agent {
                         action: "Continuing operator task in background".to_string(),
                         result: format!(
                             "[{}] handoff complete; {} tool call(s) already executed.",
-                            conversation_tag,
-                            tool_count
+                            conversation_tag, tool_count
                         ),
                     })
                     .await;
@@ -4246,6 +4387,7 @@ fn parse_concern_signals(response: &str) -> (String, Vec<ConcernSignal>) {
     (cleaned_response, signals)
 }
 
+#[cfg(test)]
 fn build_private_chat_agentic_prompt(
     new_messages: &[crate::database::ChatMessage],
     session_handoff_note: Option<&str>,
@@ -4257,6 +4399,34 @@ fn build_private_chat_agentic_prompt(
     latest_orientation: Option<&Orientation>,
     recent_action_digest: Option<&str>,
     previous_ooda_packet: Option<&str>,
+) -> String {
+    build_private_chat_agentic_prompt_with_contributions(
+        new_messages,
+        session_handoff_note,
+        concerns_priority_context,
+        working_memory_context,
+        recent_chat_context,
+        summary_snapshot,
+        continuation_hint,
+        latest_orientation,
+        recent_action_digest,
+        previous_ooda_packet,
+        &[],
+    )
+}
+
+fn build_private_chat_agentic_prompt_with_contributions(
+    new_messages: &[crate::database::ChatMessage],
+    session_handoff_note: Option<&str>,
+    concerns_priority_context: &str,
+    working_memory_context: &str,
+    recent_chat_context: &str,
+    summary_snapshot: Option<&str>,
+    continuation_hint: Option<&str>,
+    latest_orientation: Option<&Orientation>,
+    recent_action_digest: Option<&str>,
+    previous_ooda_packet: Option<&str>,
+    prompt_contributions: &[PromptContribution],
 ) -> String {
     let mut prompt = String::new();
 
@@ -4277,6 +4447,16 @@ fn build_private_chat_agentic_prompt(
 
     if !working_memory_context.trim().is_empty() {
         prompt.push_str(working_memory_context.trim());
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    if let Some(addendum) = render_prompt_slot_addendum(
+        PromptContributionSlot::EngagedContext,
+        prompt_contributions,
+        PromptContributionMergeLimits::default(),
+    ) {
+        prompt.push_str("## Plugin Context\n\n");
+        prompt.push_str(&addendum);
         prompt.push_str("\n\n---\n\n");
     }
 
@@ -4318,7 +4498,10 @@ fn build_private_chat_agentic_prompt(
     prompt.push_str("## OODA Context\n\n");
     prompt.push_str("### Observe\n");
     if let Some(orientation) = latest_orientation {
-        prompt.push_str(&format!("- user_state: {}\n", summarize_user_state(&orientation.user_state)));
+        prompt.push_str(&format!(
+            "- user_state: {}\n",
+            summarize_user_state(&orientation.user_state)
+        ));
         if let Some(salient) = orientation.salience_map.first() {
             prompt.push_str(&format!(
                 "- top_salient: {}\n",
@@ -4406,6 +4589,16 @@ fn build_private_chat_agentic_prompt(
     {
         prompt.push_str("## Autonomous Continuation Context\n\n");
         prompt.push_str(hint);
+        prompt.push_str("\n\n");
+    }
+
+    if let Some(addendum) = render_prompt_slot_addendum(
+        PromptContributionSlot::EngagedInstructions,
+        prompt_contributions,
+        PromptContributionMergeLimits::default(),
+    ) {
+        prompt.push_str("## Plugin Guidance\n\n");
+        prompt.push_str(&addendum);
         prompt.push_str("\n\n");
     }
 
@@ -4582,7 +4775,8 @@ fn fallback_chat_summary_snapshot(
             .len()
             .saturating_sub(CHAT_COMPACTION_OODA_SUMMARY_LINES);
         for packet in &ooda_packets[start_idx..] {
-            let decide = compact_ooda_stage_line(&packet.decide, CHAT_COMPACTION_OODA_LINE_MAX_CHARS);
+            let decide =
+                compact_ooda_stage_line(&packet.decide, CHAT_COMPACTION_OODA_LINE_MAX_CHARS);
             let act = compact_ooda_stage_line(&packet.act, CHAT_COMPACTION_OODA_LINE_MAX_CHARS);
             summary.push_str(&format!(
                 "- [{}] decide: {} | act: {}\n",
@@ -4737,6 +4931,7 @@ fn tool_trace_lines(tool_calls: &[ToolCallRecord]) -> Vec<String> {
 async fn run_background_chat_subtask(
     request: BackgroundSubtaskRequest,
     tool_registry: Arc<ToolRegistry>,
+    runtime_plugin_host: Arc<RuntimePluginHost>,
     event_tx: Sender<AgentEvent>,
 ) -> BackgroundSubtaskResult {
     let conversation_tag = truncate_for_event(&request.conversation_id, 12);
@@ -4770,6 +4965,7 @@ async fn run_background_chat_subtask(
         cancel_generation: Some(request.stop_generation.clone()),
         start_generation: request.stop_generation.load(Ordering::SeqCst),
     };
+    let plugin_tool_registry = tool_registry.clone();
     let agentic_loop = AgenticLoop::new(loop_config, tool_registry);
     let tool_ctx = build_tool_context_for_profile(
         &request.config_snapshot,
@@ -4863,7 +5059,41 @@ async fn run_background_chat_subtask(
             }
             note
         };
-        let user_message = build_private_chat_agentic_prompt(
+        let current_summary = if continuation_hint.is_some() {
+            "autonomous continuation".to_string()
+        } else {
+            "engaged turn".to_string()
+        };
+        let prompt_context = PromptContributionContext {
+            conversation_id: Some(request.conversation_id.clone()),
+            loop_name: Some("engaged".to_string()),
+            current_summary: Some(current_summary),
+            enabled_tools: plugin_tool_registry.list_names().await,
+        };
+        let mut prompt_contributions = runtime_plugin_host
+            .collect_prompt_contributions(&RuntimePluginPromptQuery {
+                slot: PromptContributionSlot::EngagedContext,
+                context: prompt_context.clone(),
+            })
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!("failed to collect background plugin context: {}", error);
+                Vec::new()
+            });
+        prompt_contributions.extend(
+            runtime_plugin_host
+                .collect_prompt_contributions(&RuntimePluginPromptQuery {
+                    slot: PromptContributionSlot::EngagedInstructions,
+                    context: prompt_context,
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("failed to collect background plugin guidance: {}", error);
+                    Vec::new()
+                }),
+        );
+
+        let user_message = build_private_chat_agentic_prompt_with_contributions(
             &[],
             session_handoff_note.as_deref(),
             &request.concerns_priority_context,
@@ -4874,13 +5104,12 @@ async fn run_background_chat_subtask(
             request.latest_orientation.as_ref(),
             recent_action_digest.as_deref(),
             previous_ooda_packet_context.as_deref(),
+            &prompt_contributions,
         );
         if let Some(turn_id) = turn_id.as_deref() {
-            if let Err(e) = db.set_chat_turn_prompt_bundle(
-                turn_id,
-                &user_message,
-                &request.chat_system_prompt,
-            ) {
+            if let Err(e) =
+                db.set_chat_turn_prompt_bundle(turn_id, &user_message, &request.chat_system_prompt)
+            {
                 tracing::warn!(
                     "Failed to persist background turn prompt [{}]: {}",
                     truncate_for_event(turn_id, 12),
@@ -5111,10 +5340,14 @@ async fn run_background_chat_subtask(
             heat_update.heat, heat_update.threshold, heat_update.max_similarity
         ));
         if heat_update.tripped {
-            trace_lines.push("Loop detector tripped: forcing yield to break repetition.".to_string());
+            trace_lines
+                .push("Loop detector tripped: forcing yield to break repetition.".to_string());
         }
         for example in &heat_update.repeated_examples {
-            trace_lines.push(format!("Repeated pattern: {}", truncate_for_event(example, 180)));
+            trace_lines.push(format!(
+                "Repeated pattern: {}",
+                truncate_for_event(example, 180)
+            ));
         }
         if !result.thinking_blocks.is_empty() {
             trace_lines.push(format!(
@@ -5470,7 +5703,8 @@ fn loop_signature_similarity(previous: &LoopTurnSignature, current: &LoopTurnSig
         token_jaccard_similarity(&previous.canonical_response, &current.canonical_response);
     let action_similarity =
         token_jaccard_similarity(&previous.canonical_action, &current.canonical_action);
-    let tool_similarity = token_jaccard_similarity(&previous.tool_signature, &current.tool_signature);
+    let tool_similarity =
+        token_jaccard_similarity(&previous.tool_signature, &current.tool_signature);
     let status_similarity = if previous.status == current.status {
         1.0
     } else {
@@ -5939,10 +6173,29 @@ fn looks_like_action_request(text: &str) -> bool {
         return false;
     }
     let action_words = [
-        "run ", "execute ", "build ", "test ", "install ", "create ", "write ",
-        "delete ", "move ", "rename ", "update ", "fix ", "refactor ", "deploy ",
-        "find and ", "search for", "grep ", "compile ", "generate ",
-        "can you ", "could you ", "please ", "would you ",
+        "run ",
+        "execute ",
+        "build ",
+        "test ",
+        "install ",
+        "create ",
+        "write ",
+        "delete ",
+        "move ",
+        "rename ",
+        "update ",
+        "fix ",
+        "refactor ",
+        "deploy ",
+        "find and ",
+        "search for",
+        "grep ",
+        "compile ",
+        "generate ",
+        "can you ",
+        "could you ",
+        "please ",
+        "would you ",
     ];
     action_words.iter().any(|w| lower.contains(w))
 }
@@ -6204,8 +6457,9 @@ not a checklist item
             processed: false,
             turn_id: None,
         }];
-        let prompt =
-            build_private_chat_agentic_prompt(&msgs, None, "", "", "", None, None, None, None, None);
+        let prompt = build_private_chat_agentic_prompt(
+            &msgs, None, "", "", "", None, None, None, None, None,
+        );
         assert!(prompt.contains("Please list files"));
         assert!(prompt.contains("Use tools"));
     }
@@ -6244,6 +6498,47 @@ not a checklist item
         );
         assert!(prompt.contains("Conversation Summary Snapshot"));
         assert!(prompt.contains("Ship session compaction"));
+    }
+
+    #[test]
+    fn chat_prompt_includes_plugin_context_and_guidance_blocks() {
+        let prompt = build_private_chat_agentic_prompt_with_contributions(
+            &[],
+            None,
+            "",
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[
+                PromptContribution {
+                    plugin_id: "qwen3-tts".to_string(),
+                    slot: PromptContributionSlot::EngagedContext,
+                    kind: crate::runtime_plugin_host::PromptContributionKind::Context,
+                    text: "Current voice profile leans calm and warm.".to_string(),
+                    priority: 10,
+                    max_chars: 240,
+                },
+                PromptContribution {
+                    plugin_id: "qwen3-tts".to_string(),
+                    slot: PromptContributionSlot::EngagedInstructions,
+                    kind: crate::runtime_plugin_host::PromptContributionKind::Instruction,
+                    text: "If speaking is enabled, you may call speak_text after finalizing your reply."
+                        .to_string(),
+                    priority: 20,
+                    max_chars: 240,
+                },
+            ],
+        );
+
+        assert!(prompt.contains("## Plugin Context"));
+        assert!(prompt.contains("Current voice profile leans calm and warm."));
+        assert!(prompt.contains("## Plugin Guidance"));
+        assert!(prompt.contains("speak_text"));
+        assert!(prompt.contains("[Plugin: qwen3-tts | instruction]"));
     }
 
     #[test]
@@ -6536,23 +6831,16 @@ not a checklist item
         // Handoff note must appear before concerns context.
         let note_pos = prompt.find("Handoff Note").unwrap();
         let concerns_pos = prompt.find("Concern Priority Context").unwrap();
-        assert!(note_pos < concerns_pos, "handoff note should precede concerns context");
+        assert!(
+            note_pos < concerns_pos,
+            "handoff note should precede concerns context"
+        );
     }
 
     #[test]
     fn chat_prompt_omits_handoff_section_when_none() {
-        let prompt = build_private_chat_agentic_prompt(
-            &[],
-            None,
-            "",
-            "",
-            "",
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let prompt =
+            build_private_chat_agentic_prompt(&[], None, "", "", "", None, None, None, None, None);
         assert!(!prompt.contains("Handoff Note from Last Session"));
     }
 
@@ -6591,8 +6879,7 @@ not a checklist item
                 id: "m2".to_string(),
                 conversation_id: "c1".to_string(),
                 role: "agent".to_string(),
-                content: "I inspected the workspace and found two pending TODO items."
-                    .to_string(),
+                content: "I inspected the workspace and found two pending TODO items.".to_string(),
                 created_at: now,
                 processed: true,
                 turn_id: None,

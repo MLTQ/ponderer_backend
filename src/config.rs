@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -236,6 +237,8 @@ pub struct AgentConfig {
     pub workflow_path: Option<String>,
     #[serde(default)]
     pub workflow_settings: Option<String>, // JSON string of workflow settings
+    #[serde(default)]
+    pub plugin_settings: HashMap<String, serde_json::Value>,
 
     // Character Card (optional)
     #[serde(default)]
@@ -417,6 +420,7 @@ impl Default for AgentConfig {
             comfyui: ComfyUIConfig::default(),
             workflow_path: None,
             workflow_settings: None,
+            plugin_settings: HashMap::new(),
             character_name: String::new(),
             character_description: String::new(),
             character_personality: String::new(),

@@ -220,7 +220,6 @@ impl Tool for MemoryWriteTool {
 /// The fixed working-memory key used to store the cross-session handoff note.
 pub const SESSION_HANDOFF_KEY: &str = "session-handoff";
 
-
 pub struct WriteSessionHandoffTool;
 
 impl WriteSessionHandoffTool {
@@ -365,22 +364,24 @@ impl Tool for ScratchNoteTool {
             }
             "clear" => {
                 if let Err(e) = db.set_working_memory(SCRATCHPAD_KEY, "") {
-                    return Ok(ToolOutput::Error(format!("Failed to clear scratchpad: {}", e)));
+                    return Ok(ToolOutput::Error(format!(
+                        "Failed to clear scratchpad: {}",
+                        e
+                    )));
                 }
                 Ok(ToolOutput::Json(
                     json!({ "status": "ok", "message": "Scratchpad cleared." }),
                 ))
             }
             "replace" | "append" => {
-                let content =
-                    match params.get("content").and_then(Value::as_str).map(str::trim) {
-                        Some(v) if !v.is_empty() => v,
-                        _ => {
-                            return Ok(ToolOutput::Error(
-                                "'content' is required for replace/append modes".to_string(),
-                            ))
-                        }
-                    };
+                let content = match params.get("content").and_then(Value::as_str).map(str::trim) {
+                    Some(v) if !v.is_empty() => v,
+                    _ => {
+                        return Ok(ToolOutput::Error(
+                            "'content' is required for replace/append modes".to_string(),
+                        ))
+                    }
+                };
                 let final_content = if mode == "append" {
                     let existing = db
                         .get_working_memory(SCRATCHPAD_KEY)
@@ -463,7 +464,11 @@ impl Tool for FlagUncertaintyTool {
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
-        let question = match params.get("question").and_then(Value::as_str).map(str::trim) {
+        let question = match params
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        {
             Some(v) if !v.is_empty() => v.to_string(),
             _ => {
                 return Ok(ToolOutput::Error(

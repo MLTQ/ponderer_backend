@@ -14,10 +14,12 @@ pub mod comfy;
 pub mod files;
 pub mod http;
 pub mod memory;
+pub mod runtime_plugin;
 pub mod safety;
 pub mod shell;
 pub mod skill_bridge;
 pub mod vision;
+pub mod workflow_plugin;
 
 use anyhow::Result;
 use async_trait::async_trait;

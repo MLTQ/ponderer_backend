@@ -105,10 +105,11 @@ async fn run_bot(state: Arc<ServerState>, token: String, allowed_chat_id: Option
             tracing::info!("Telegram [chat {}]: {:?}", chat_id, text);
 
             // Route into the telegram conversation.
-            match state
-                .db
-                .add_chat_message_in_conversation(TELEGRAM_CONVERSATION_ID, "operator", &text)
-            {
+            match state.db.add_chat_message_in_conversation(
+                TELEGRAM_CONVERSATION_ID,
+                "operator",
+                &text,
+            ) {
                 Ok(_) => state
                     .agent
                     .notify_operator_message_queued(TELEGRAM_CONVERSATION_ID),

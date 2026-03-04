@@ -22,6 +22,10 @@ Implements the Living Loop orientation engine: synthesizes presence, concerns, j
 - **Interacts with**: `llm_client.rs` (`generate_json`)
 - **Rationale**: Orientation should remain available even when local models are noisy or unavailable
 
+### `OrientationEngine::build_orientation_prompt_with_contributions`
+- **Does**: Appends bounded runtime-plugin context blocks to the base orientation prompt, currently via the `orientation.context` slot rendered under `## Plugin Context`.
+- **Interacts with**: `runtime_plugin_host.rs` prompt-slot types and merge helpers.
+
 ### `context_signature`
 - **Does**: Produces a stable coarse signature of orientation inputs (including desktop-observation summary digest plus recent-action / prior-OODA context digests) for fast-path skip of redundant LLM calls
 - **Interacts with**: `agent/mod.rs` loop cache (`last_orientation_signature`)
@@ -40,3 +44,4 @@ Implements the Living Loop orientation engine: synthesizes presence, concerns, j
 - Fast-path signatures are intentionally bucketed (idle/cpu/memory/time) to reduce unnecessary model calls.
 - Desktop observations are optional and only present when the runtime orientation path supplies them.
 - Orientation prompts now include explicit `Recent Action Digest` and `Previous OODA Packet` sections when available to keep orientation grounded in immediate turn history.
+- Orientation prompt assembly now has a dedicated additive plugin slot (`orientation.context`) so future runtime plugins can supply context without replacing the base orientation prompt.

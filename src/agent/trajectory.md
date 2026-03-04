@@ -13,6 +13,10 @@ Implements persona trajectory inference and snapshot capture. It analyzes histor
 - **Does**: Handles empty-history fallback, builds the trajectory prompt, calls LLM, parses structured response.
 - **Interacts with**: `parse_trajectory_response`, `extract_json`.
 
+### `TrajectoryEngine::build_trajectory_prompt_with_contributions`
+- **Does**: Extends the trajectory prompt builder with a bounded `persona_evolution.considerations` addendum section (`=== PLUGIN CONSIDERATIONS ===`) while leaving the required JSON response contract unchanged.
+- **Interacts with**: `runtime_plugin_host.rs` prompt-slot types and merge helpers.
+
 ### `capture_persona_snapshot`
 - **Does**: Prompts the LLM for current self-description/trait scores/new dimensions and returns a `PersonaSnapshot`.
 - **Interacts with**: `agent/mod.rs` snapshot cadence and persistence.
@@ -32,3 +36,4 @@ Implements persona trajectory inference and snapshot capture. It analyzes histor
 - Personality dimensions are intentionally open-ended: guiding principles seed expected keys, while LLM can propose new dimensions.
 - HTTP client initialization now uses shared panic-safe construction (`http_client::build_http_client`) for startup portability.
 - `normalize_chat_url()` (module-private) strips double-`/v1` paths: if `api_url` already ends with `/v1`, it appends `/chat/completions` directly; if it ends with `/chat/completions` it passes through unchanged; otherwise it appends `/v1/chat/completions`. Both `call_llm` and `capture_persona_snapshot` use it instead of naïve `format!("{}/v1/chat/completions", ...)` to avoid 404 errors when the configured URL already includes the API version prefix.
+- Persona trajectory prompts now have one additive plugin slot for evolution-time considerations, which lets runtime plugins influence reflection context without taking ownership of the trajectory JSON schema.

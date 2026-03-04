@@ -20,10 +20,7 @@ pub struct ScheduledJob {
 
 impl ScheduledJob {
     pub fn normalized_interval_minutes(interval_minutes: u64) -> u64 {
-        interval_minutes.clamp(
-            MIN_SCHEDULE_INTERVAL_MINUTES,
-            MAX_SCHEDULE_INTERVAL_MINUTES,
-        )
+        interval_minutes.clamp(MIN_SCHEDULE_INTERVAL_MINUTES, MAX_SCHEDULE_INTERVAL_MINUTES)
     }
 
     pub fn next_run_after(from: DateTime<Utc>, interval_minutes: u64) -> DateTime<Utc> {
@@ -31,7 +28,11 @@ impl ScheduledJob {
     }
 
     pub fn queue_message(&self) -> String {
-        format!("Scheduled job \"{}\":\n{}", self.name.trim(), self.prompt.trim())
+        format!(
+            "Scheduled job \"{}\":\n{}",
+            self.name.trim(),
+            self.prompt.trim()
+        )
     }
 }
 

@@ -128,7 +128,11 @@ impl AgenticLoop {
             .unwrap_or(false)
     }
 
-    fn cancelled_result(&self, iterations: usize, tool_calls_made: Vec<ToolCallRecord>) -> AgenticResult {
+    fn cancelled_result(
+        &self,
+        iterations: usize,
+        tool_calls_made: Vec<ToolCallRecord>,
+    ) -> AgenticResult {
         AgenticResult {
             response: Some("Stopped current turn at operator request.".to_string()),
             thinking_blocks: Vec::new(),
@@ -424,10 +428,8 @@ impl AgenticLoop {
                     // the first LLM call of a loop iteration (where the last message is
                     // from the user/system), because subsequent calls (after tool results)
                     // are producing a final text response and won't have tool_calls.
-                    let has_tool_calls = message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|tc| !tc.is_empty());
+                    let has_tool_calls =
+                        message.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
                     let last_role = messages.last().map(|m| m.role.as_str()).unwrap_or("");
                     let is_first_call = last_role == "user" || last_role == "system";
                     if has_tool_calls || tool_defs.is_empty() || !is_first_call {
@@ -443,8 +445,7 @@ impl AgenticLoop {
                         "Streaming returned no tool_calls on initial call; \
                          retrying non-streaming to check for function calls"
                     );
-                    let ns_message =
-                        self.call_llm_non_streaming(messages, tool_defs).await?;
+                    let ns_message = self.call_llm_non_streaming(messages, tool_defs).await?;
                     let ns_has_tool_calls = ns_message
                         .tool_calls
                         .as_ref()
