@@ -16,6 +16,7 @@ pub mod http;
 pub mod memory;
 pub mod runtime_plugin;
 pub mod safety;
+pub mod scheduled_jobs;
 pub mod shell;
 pub mod skill_bridge;
 pub mod vision;

@@ -26,6 +26,7 @@ Defines the shared tool abstraction (`Tool` trait), typed tool I/O (`ToolOutput`
   - `shell`, `files` for local operations
   - `http` for guarded web/API fetch
   - `memory` for persistent note search/write
+  - `scheduled_jobs` for recurring schedule CRUD inside the tool loop
   - `skill_bridge` for exposing external skill actions (Graphchan) inside the tool loop
   - `comfy` for ComfyUI generation + Graphchan publishing
   - `runtime_plugin` for proxying subprocess runtime-plugin tools into the normal tool loop

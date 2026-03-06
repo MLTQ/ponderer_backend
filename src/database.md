@@ -69,8 +69,8 @@ Provides the agent's persistent memory layer via SQLite. Stores important posts,
 - **Does**: Persist one agent turn with decision/status/error context, stored prompt payloads (`prompt_text`, `system_prompt_text`), and per-tool input/output records for replay/debug
 - **Interacts with**: `agent::process_chat_messages`, future turn history/undo/resume UX
 
-### Scheduled-job methods (`create_scheduled_job`, `list_scheduled_jobs`, `get_scheduled_job`, `update_scheduled_job`, `delete_scheduled_job`, `take_due_scheduled_jobs`)
-- **Does**: Persist recurring interval-based operator-defined jobs, bind each one to a dedicated conversation, and atomically advance due jobs when the agent claims them.
+### Scheduled-job methods (`create_scheduled_job`, `list_scheduled_jobs`, `get_scheduled_job`, `update_scheduled_job`, `delete_scheduled_job`, `next_scheduled_job_due_at`, `take_due_scheduled_jobs`)
+- **Does**: Persist recurring interval-based operator-defined jobs, bind each one to a dedicated conversation, expose earliest due timestamp lookup for sleep-capping, and atomically enqueue due-job operator messages while advancing `last_run_at`/`next_run_at`.
 - **Interacts with**: `scheduled_jobs.rs`, `server.rs` scheduled-job routes, `agent::maybe_enqueue_due_scheduled_jobs`
 
 ### `OodaTurnPacketRecord`

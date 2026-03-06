@@ -2858,13 +2858,32 @@ impl AgentDatabase {
         Ok(rows > 0)
     }
 
+    pub fn next_scheduled_job_due_at(&self) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT next_run_at
+             FROM scheduled_jobs
+             WHERE enabled = 1
+             ORDER BY next_run_at ASC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let next_run_at_raw: String = row.get(0)?;
+        let next_run_at = next_run_at_raw.parse::<DateTime<Utc>>()?;
+        Ok(Some(next_run_at))
+    }
+
     pub fn take_due_scheduled_jobs(
         &self,
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<ScheduledJob>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
             "SELECT id, name, prompt, interval_minutes, conversation_id, enabled, last_run_at, next_run_at, created_at, updated_at
              FROM scheduled_jobs
              WHERE enabled = 1 AND next_run_at <= ?1
@@ -2879,23 +2898,73 @@ impl AgentDatabase {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
+        let now_str = now.to_rfc3339();
         for job in &mut jobs {
+            let message_id = uuid::Uuid::new_v4().to_string();
             job.last_run_at = Some(now);
             job.next_run_at = ScheduledJob::next_run_after(now, job.interval_minutes);
             job.updated_at = now;
-            conn.execute(
+            tx.execute(
+                "INSERT OR IGNORE INTO chat_sessions (id, label, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    DEFAULT_CHAT_SESSION_ID,
+                    "Default session",
+                    now_str.clone(),
+                    now_str.clone()
+                ],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO chat_conversations
+                 (id, session_id, title, created_at, updated_at, runtime_state, active_turn_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                params![
+                    job.conversation_id,
+                    DEFAULT_CHAT_SESSION_ID,
+                    format!("Schedule: {}", job.name),
+                    now_str.clone(),
+                    now_str.clone(),
+                    ChatTurnPhase::Idle.as_db_str(),
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO chat_messages
+                 (id, conversation_id, role, content, created_at, processed, turn_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    message_id,
+                    job.conversation_id,
+                    "operator",
+                    job.queue_message(),
+                    now_str.clone(),
+                    0_i64,
+                    Option::<String>::None,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE chat_conversations
+                 SET runtime_state = ?2, active_turn_id = NULL, updated_at = ?3
+                 WHERE id = ?1",
+                params![
+                    job.conversation_id,
+                    ChatTurnPhase::Idle.as_db_str(),
+                    now_str.clone(),
+                ],
+            )?;
+            tx.execute(
                 "UPDATE scheduled_jobs
                  SET last_run_at = ?1, next_run_at = ?2, updated_at = ?3
                  WHERE id = ?4",
                 params![
-                    now.to_rfc3339(),
+                    now_str.clone(),
                     job.next_run_at.to_rfc3339(),
-                    now.to_rfc3339(),
+                    now_str.clone(),
                     &job.id,
                 ],
             )?;
         }
 
+        tx.commit()?;
         Ok(jobs)
     }
 
@@ -4156,6 +4225,7 @@ fn outcome_to_db(outcome: &PromotionOutcome) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration as ChronoDuration;
     use std::path::PathBuf;
 
     fn temp_db_path(name: &str) -> PathBuf {
@@ -4292,6 +4362,100 @@ mod tests {
             .find(|c| c.id == conversation.id)
             .expect("find conversation");
         assert_eq!(convo_state.runtime_state, ChatTurnPhase::Failed);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scheduled_jobs_enqueue_messages_and_advance_timestamps() {
+        let path = temp_db_path("scheduled_jobs_enqueue");
+        let db = AgentDatabase::new(&path).expect("db init");
+        let job = db
+            .create_scheduled_job("Morning plan", "Review priorities.", 15)
+            .expect("create scheduled job");
+
+        let due_at = Utc::now() - ChronoDuration::minutes(3);
+        {
+            let conn = db.lock_conn().expect("lock conn");
+            conn.execute(
+                "UPDATE scheduled_jobs SET next_run_at = ?1 WHERE id = ?2",
+                params![due_at.to_rfc3339(), &job.id],
+            )
+            .expect("set due timestamp");
+        }
+
+        let now = Utc::now();
+        let queued = db
+            .take_due_scheduled_jobs(now, 8)
+            .expect("take due scheduled jobs");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, job.id);
+        assert_eq!(queued[0].last_run_at, Some(now));
+        assert!(queued[0].next_run_at > now);
+
+        let history = db
+            .get_chat_history_for_conversation(&job.conversation_id, 8)
+            .expect("load scheduled conversation history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "operator");
+        assert!(!history[0].processed);
+        assert!(history[0]
+            .content
+            .contains("Scheduled job \"Morning plan\":\nReview priorities."));
+
+        let persisted = db
+            .get_scheduled_job(&job.id)
+            .expect("load scheduled job")
+            .expect("scheduled job exists");
+        assert_eq!(persisted.last_run_at, Some(now));
+        assert!(persisted.next_run_at > now);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn next_scheduled_job_due_at_ignores_disabled_jobs() {
+        let path = temp_db_path("scheduled_jobs_next_due");
+        let db = AgentDatabase::new(&path).expect("db init");
+
+        let job_a = db
+            .create_scheduled_job("A", "Task A", 60)
+            .expect("create job a");
+        let job_b = db
+            .create_scheduled_job("B", "Task B", 60)
+            .expect("create job b");
+
+        let later = Utc::now() + ChronoDuration::minutes(20);
+        let sooner = Utc::now() + ChronoDuration::minutes(5);
+        {
+            let conn = db.lock_conn().expect("lock conn");
+            conn.execute(
+                "UPDATE scheduled_jobs SET next_run_at = ?1 WHERE id = ?2",
+                params![later.to_rfc3339(), &job_a.id],
+            )
+            .expect("set job_a next_run");
+            conn.execute(
+                "UPDATE scheduled_jobs SET next_run_at = ?1 WHERE id = ?2",
+                params![sooner.to_rfc3339(), &job_b.id],
+            )
+            .expect("set job_b next_run");
+        }
+
+        db.update_scheduled_job(&job_b.id, None, None, None, Some(false))
+            .expect("disable job_b");
+        let next_due = db
+            .next_scheduled_job_due_at()
+            .expect("query next due")
+            .expect("job exists");
+        assert_eq!(next_due, later);
+
+        db.update_scheduled_job(&job_b.id, None, None, None, Some(true))
+            .expect("enable job_b");
+        let next_due = db
+            .next_scheduled_job_due_at()
+            .expect("query next due")
+            .expect("job exists");
+        assert_eq!(next_due, sooner);
 
         let _ = std::fs::remove_file(&path);
     }

@@ -18,7 +18,7 @@ use crate::agent::{AgentEvent, AgentRuntimeStatus};
 use crate::config::AgentConfig;
 use crate::database::{
     AgentDatabase, ChatConversation, ChatConversationSummary, ChatMessage, ChatTurn,
-    ChatTurnToolCall,
+    ChatTurnToolCall, DEFAULT_CHAT_CONVERSATION_ID,
 };
 use crate::plugin::BackendPluginManifest;
 use crate::process_registry::{ProcessInfo, ProcessRegistry};
@@ -661,11 +661,14 @@ async fn create_scheduled_job(
         ));
     }
 
-    state
+    let job = state
         .db
         .create_scheduled_job(name, prompt, body.interval_minutes)
-        .map(Json)
-        .map_err(internal_error)
+        .map_err(internal_error)?;
+    state
+        .agent
+        .notify_operator_message_queued(&job.conversation_id);
+    Ok(Json(job))
 }
 
 async fn update_scheduled_job(
@@ -689,7 +692,12 @@ async fn update_scheduled_job(
         .update_scheduled_job(&job_id, name, prompt, body.interval_minutes, body.enabled)
         .map_err(internal_error)?
     {
-        Some(job) => Ok(Json(job)),
+        Some(job) => {
+            state
+                .agent
+                .notify_operator_message_queued(&job.conversation_id);
+            Ok(Json(job))
+        }
         None => Err(not_found(format!("scheduled job '{}' not found", job_id))),
     }
 }
@@ -703,6 +711,9 @@ async fn delete_scheduled_job(
         .delete_scheduled_job(&job_id)
         .map_err(internal_error)?
     {
+        state
+            .agent
+            .notify_operator_message_queued(DEFAULT_CHAT_CONVERSATION_ID);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(not_found(format!("scheduled job '{}' not found", job_id)))

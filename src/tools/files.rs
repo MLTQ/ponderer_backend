@@ -435,9 +435,28 @@ impl Tool for PatchFileTool {
 // ============================================================================
 
 /// Resolve a path, making it absolute relative to the working directory if needed.
+///
+/// Root-level absolute paths (e.g. `/filename.md`) are redirected to the working
+/// directory — the LLM sometimes produces these when it means a bare relative path,
+/// and `/` is read-only on macOS. Paths with at least one subdirectory component
+/// (e.g. `/Users/max/file.md`) are kept as-is.
 fn resolve_path(path: &str, working_dir: &str) -> String {
     let p = std::path::Path::new(path);
     if p.is_absolute() {
+        // Count non-root components: `/file.md` has 1 (just the filename);
+        // `/Users/max/file.md` has 3. Redirect single-component root paths.
+        let depth = p
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::RootDir | std::path::Component::Prefix(_)))
+            .count();
+        if depth <= 1 {
+            // e.g. "/psychographic-profile-max.md" → "<working_dir>/psychographic-profile-max.md"
+            let name = p.file_name().unwrap_or_default();
+            return std::path::Path::new(working_dir)
+                .join(name)
+                .to_string_lossy()
+                .to_string();
+        }
         path.to_string()
     } else {
         std::path::Path::new(working_dir)
@@ -691,7 +710,23 @@ mod tests {
 
     #[test]
     fn test_resolve_path_absolute() {
+        // Multi-component absolute paths pass through unchanged.
         assert_eq!(resolve_path("/usr/bin/ls", "/tmp"), "/usr/bin/ls");
+        assert_eq!(
+            resolve_path("/Users/max/notes.md", "/tmp"),
+            "/Users/max/notes.md"
+        );
+    }
+
+    #[test]
+    fn test_resolve_path_root_level_absolute_redirected() {
+        // Single-component absolute paths (e.g. the LLM writes "/file.md") are
+        // redirected to the working directory instead of the read-only root.
+        assert_eq!(
+            resolve_path("/psychographic-profile-max.md", "/home/user"),
+            "/home/user/psychographic-profile-max.md"
+        );
+        assert_eq!(resolve_path("/notes.txt", "/tmp"), "/tmp/notes.txt");
     }
 
     #[test]

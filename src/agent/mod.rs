@@ -613,6 +613,33 @@ impl Agent {
         }
     }
 
+    async fn wait_with_schedule_awareness(&self, base_duration: Duration, label: &str) {
+        let adjusted = {
+            let db_lock = self.database.read().await;
+            match db_lock.as_ref() {
+                Some(db) => match db.next_scheduled_job_due_at() {
+                    Ok(Some(next_due_at)) => {
+                        let now = Utc::now();
+                        if next_due_at <= now {
+                            Duration::ZERO
+                        } else {
+                            let until_due = (next_due_at - now).to_std().unwrap_or(Duration::ZERO);
+                            base_duration.min(until_due)
+                        }
+                    }
+                    Ok(None) => base_duration,
+                    Err(error) => {
+                        tracing::warn!("Failed to query next scheduled-job due time: {}", error);
+                        base_duration
+                    }
+                },
+                None => base_duration,
+            }
+        };
+
+        self.wait_with_interruptible_sleep(adjusted, label).await;
+    }
+
     async fn maybe_enqueue_due_scheduled_jobs(&self) -> bool {
         let queued_jobs = {
             let db_lock = self.database.read().await;
@@ -620,32 +647,13 @@ impl Agent {
                 return false;
             };
 
-            let due_jobs = match db.take_due_scheduled_jobs(Utc::now(), 8) {
+            match db.take_due_scheduled_jobs(Utc::now(), 8) {
                 Ok(jobs) => jobs,
                 Err(error) => {
                     tracing::warn!("Failed to load due scheduled jobs: {}", error);
                     return false;
                 }
-            };
-
-            let mut queued = Vec::new();
-            for job in due_jobs {
-                match db.add_chat_message_in_conversation(
-                    &job.conversation_id,
-                    "operator",
-                    &job.queue_message(),
-                ) {
-                    Ok(_) => queued.push(job),
-                    Err(error) => tracing::warn!(
-                        "Failed to enqueue scheduled job '{}' ({}): {}",
-                        job.name,
-                        job.id,
-                        error
-                    ),
-                }
             }
-
-            queued
         };
 
         if queued_jobs.is_empty() {
@@ -742,7 +750,7 @@ impl Agent {
                 }
 
                 let tick = self.calculate_tick_duration(&config_snapshot, orientation.as_ref());
-                self.wait_with_interruptible_sleep(tick, "ambient-tick")
+                self.wait_with_schedule_awareness(tick, "ambient-tick")
                     .await;
                 continue;
             }
@@ -765,7 +773,7 @@ impl Agent {
             self.maybe_run_heartbeat().await;
 
             let poll_interval = config_snapshot.poll_interval_secs;
-            self.wait_with_interruptible_sleep(
+            self.wait_with_schedule_awareness(
                 Duration::from_secs(poll_interval),
                 "legacy-poll-interval",
             )
@@ -2718,13 +2726,17 @@ impl Agent {
             self.maybe_decay_concerns().await;
         }
 
+        let mut trace_lines: Vec<String> = Vec::new();
+        let mut journal_count = 0usize;
+
         let db_lock = self.database.read().await;
         if let Some(db) = db_lock.as_ref() {
             if let Ok(entries) = db.get_recent_journal(24) {
+                journal_count = entries.len();
                 if !entries.is_empty() {
-                    let digest = entries
-                        .iter()
-                        .take(12)
+                    let shown = entries.iter().take(12);
+                    let digest = shown
+                        .clone()
                         .map(|entry| {
                             format!(
                                 "- [{}] ({}) {}",
@@ -2740,23 +2752,69 @@ impl Agent {
                         &key,
                         &format!("Dream-cycle journal digest\n\n{}", digest),
                     );
+
+                    trace_lines.push(format!(
+                        "Journal entries reviewed: {} (showing up to 12)",
+                        journal_count
+                    ));
+                    for entry in entries.iter().take(12) {
+                        trace_lines.push(format!(
+                            "[{}] ({}) {}",
+                            entry.timestamp.format("%Y-%m-%d %H:%M"),
+                            entry.entry_type.as_db_str(),
+                            truncate_for_event(&entry.content, 300)
+                        ));
+                    }
                 }
             }
 
             if let Some(orientation) = orientation {
-                let _ = db.append_daily_activity_log(&format!(
+                let orientation_line = format!(
                     "dream cycle: disposition={}, anomalies={}, salient={}",
                     summarize_disposition(orientation.disposition),
                     orientation.anomalies.len(),
                     orientation.salience_map.len()
-                ));
+                );
+                let _ = db.append_daily_activity_log(&orientation_line);
+                trace_lines.push(orientation_line);
+                if !orientation.anomalies.is_empty() {
+                    for anomaly in orientation.anomalies.iter().take(4) {
+                        trace_lines.push(format!(
+                            "  anomaly [{:?}]: {}",
+                            anomaly.severity,
+                            truncate_for_event(&anomaly.description, 180)
+                        ));
+                    }
+                }
+                if !orientation.salience_map.is_empty() {
+                    for item in orientation.salience_map.iter().take(4) {
+                        trace_lines.push(format!(
+                            "  salient (relevance={:.2}): {}",
+                            item.relevance,
+                            truncate_for_event(&item.summary, 180)
+                        ));
+                    }
+                }
             }
             let _ = db.set_state(DREAM_LAST_RUN_STATE_KEY, &Utc::now().to_rfc3339());
         }
+        drop(db_lock);
 
+        if !trace_lines.is_empty() {
+            self.emit(AgentEvent::ReasoningTrace(trace_lines)).await;
+        }
+
+        let result_summary = if journal_count > 0 {
+            format!(
+                "Reviewed {} journal entries; updated concern salience.",
+                journal_count
+            )
+        } else {
+            "No journal entries to review; updated concern salience.".to_string()
+        };
         self.emit(AgentEvent::ActionTaken {
             action: "Dream cycle complete".to_string(),
-            result: "Consolidated recent journal and updated dormant concern state.".to_string(),
+            result: result_summary,
         })
         .await;
         self.set_state(AgentVisualState::Idle).await;
@@ -3890,6 +3948,11 @@ impl Agent {
                     }
 
                     pending_messages.clear();
+                    // Invalidate the chat context cache so the next turn reads fresh from DB,
+                    // including the agent's response just persisted above. Without this the
+                    // cached context still shows the operator's request as unanswered, which
+                    // causes the agent to re-execute the same action on every continuation turn.
+                    cached_chat_context = None;
                     continuation_hint =
                         Some(completion_retry_hint.unwrap_or(continuation_hint_text.clone()));
                     turn += 1;
@@ -5783,17 +5846,14 @@ fn parse_turn_control(response: &str, tool_call_count: usize) -> ParsedTurnContr
     };
     let block_was_present = block_json.is_some();
 
-    // When no turn_control block was emitted but tools were called, the model was
-    // actively working and likely just forgot the block. Default to Continue so we
-    // don't silently abandon in-progress work. The loop heat detector will catch
-    // genuine infinite loops.
-    let mut fallback_decision = if !block_was_present && tool_call_count > 0 {
-        TurnDecision::Continue
-    } else {
-        TurnDecision::Yield
-    };
+    // When no turn_control block was emitted, default to Yield regardless of whether
+    // tools were called. The previous default of Continue-on-tool-use caused the agent
+    // to silently loop on one-shot actions (e.g. a settings change) when it omitted the
+    // block, re-executing the same tool on every continuation turn. If the agent
+    // genuinely needs to continue multi-step work it should emit the block explicitly.
+    let mut fallback_decision = TurnDecision::Yield;
     let mut fallback_reason = if !block_was_present && tool_call_count > 0 {
-        Some("turn_control block absent after tool use — continuing".to_string())
+        Some("turn_control block absent after tool use — yielding".to_string())
     } else {
         None
     };

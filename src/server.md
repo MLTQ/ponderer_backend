@@ -59,5 +59,5 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - `GET /v1/turns/:id/prompt` returns the stored per-turn context prompt plus optional stored system prompt, enabling richer per-message context inspection in the frontend.
 - `PUT /v1/agent/pause` is preferred for explicit control; `POST /v1/agent/toggle-pause` remains for backward compatibility.
 - `POST /v1/agent/stop` requests immediate cancellation of in-flight agentic turns and aborts detached background subtasks.
-- Scheduled jobs are API-visible even without dedicated desktop UI wiring yet.
+- Scheduled-job CRUD routes now wake the agent loop immediately after create/update/delete so timing/config changes are applied without waiting for the next ambient/legacy sleep interval.
 - Process routes only expose processes started through the tracked background shell path.

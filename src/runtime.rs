@@ -197,6 +197,10 @@ fn builtin_core_manifest() -> BackendPluginManifest {
             "scratch_note".to_string(),
             "http_fetch".to_string(),
             "flag_uncertainty".to_string(),
+            "list_scheduled_jobs".to_string(),
+            "create_scheduled_job".to_string(),
+            "update_scheduled_job".to_string(),
+            "delete_scheduled_job".to_string(),
         ],
         provided_skills: Vec::new(),
         settings_tab: None,
@@ -258,6 +262,10 @@ async fn register_builtin_core_tools(
             FlagUncertaintyTool, MemorySearchTool, MemoryWriteTool, ScratchNoteTool,
             WriteSessionHandoffTool,
         },
+        scheduled_jobs::{
+            CreateScheduledJobTool, DeleteScheduledJobTool, ListScheduledJobsTool,
+            UpdateScheduledJobTool,
+        },
         shell::ShellTool,
         vision::{
             CaptureCameraSnapshotTool, CaptureScreenTool, EvaluateLocalImageTool,
@@ -301,6 +309,18 @@ async fn register_builtin_core_tools(
     tool_registry.register(Arc::new(HttpFetchTool::new())).await;
     tool_registry
         .register(Arc::new(FlagUncertaintyTool::new(event_tx)))
+        .await;
+    tool_registry
+        .register(Arc::new(ListScheduledJobsTool::new()))
+        .await;
+    tool_registry
+        .register(Arc::new(CreateScheduledJobTool::new()))
+        .await;
+    tool_registry
+        .register(Arc::new(UpdateScheduledJobTool::new()))
+        .await;
+    tool_registry
+        .register(Arc::new(DeleteScheduledJobTool::new()))
         .await;
 
     tracing::info!("Core tool registry initialized");
