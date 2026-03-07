@@ -303,7 +303,16 @@ Respond ONLY with valid JSON."#,
             .and_then(|c| c.finish_reason.clone())
             .unwrap_or_else(|| "unknown".to_string());
         let content = first
-            .map(|c| c.message.content.unwrap_or_default())
+            .map(|c| {
+                // Some CoT models (e.g. DeepSeek-R1) emit the JSON answer in `reasoning`
+                // and leave `content` empty. Fall back to `reasoning` when that happens.
+                let main = c.message.content.unwrap_or_default();
+                if main.trim().is_empty() {
+                    c.message.reasoning.unwrap_or_default()
+                } else {
+                    main
+                }
+            })
             .unwrap_or_default();
 
         if content.trim().is_empty() {
@@ -525,7 +534,16 @@ Be honest about your current state. Respond ONLY with valid JSON."#,
         .and_then(|c| c.finish_reason.clone())
         .unwrap_or_else(|| "unknown".to_string());
     let content = first
-        .map(|c| c.message.content.unwrap_or_default())
+        .map(|c| {
+            // Some CoT models (e.g. DeepSeek-R1) emit the JSON answer in `reasoning`
+            // and leave `content` empty. Fall back to `reasoning` when that happens.
+            let main = c.message.content.unwrap_or_default();
+            if main.trim().is_empty() {
+                c.message.reasoning.unwrap_or_default()
+            } else {
+                main
+            }
+        })
         .unwrap_or_default();
 
     if content.trim().is_empty() {

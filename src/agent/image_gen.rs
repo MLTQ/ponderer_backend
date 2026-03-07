@@ -88,7 +88,7 @@ impl ImageGenerator {
     pub async fn generate_prompt_from_context(
         &self,
         context: &str,
-        llm_client: &crate::agent::reasoning::ReasoningEngine,
+        _llm_client: &crate::agent::reasoning::ReasoningEngine,
     ) -> Result<String> {
         // For now, use a simple heuristic
         // TODO: Use LLM to craft better prompts from context

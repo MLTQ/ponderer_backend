@@ -28,7 +28,9 @@ use crate::agent::orientation::{
     context_signature as orientation_context_signature, DesktopObservation, Disposition,
     Orientation, OrientationContext, OrientationEngine,
 };
-use crate::config::AgentConfig;
+use crate::config::{
+    normalize_private_chat_mode, AgentConfig, PRIVATE_CHAT_MODE_AGENTIC, PRIVATE_CHAT_MODE_DIRECT,
+};
 use crate::database::{
     AgentDatabase, ChatTurnPhase, OodaTurnPacketRecord, OrientationSnapshotRecord,
 };
@@ -46,6 +48,7 @@ use crate::runtime_plugin_host::{
 };
 use crate::skills::{Skill, SkillContext, SkillEvent};
 use crate::tools::agentic::{AgenticConfig, AgenticLoop, ToolCallRecord};
+use crate::tools::memory::PRIVATE_CHAT_MODE_STATE_KEY;
 use crate::tools::vision::capture_screen_to_path;
 use crate::tools::ToolOutput;
 use crate::tools::ToolRegistry;
@@ -155,6 +158,10 @@ pub struct AgentRuntimeStatus {
     pub visual_state: AgentVisualState,
     pub actions_this_hour: u32,
     pub last_action_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the current visual state was entered (UTC).
+    pub visual_state_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Short description of what the agent is doing right now (e.g. "Calling LLM iteration 2").
+    pub current_activity: Option<String>,
 }
 
 pub struct AgentState {
@@ -163,6 +170,10 @@ pub struct AgentState {
     pub actions_this_hour: u32,
     pub last_action_time: Option<chrono::DateTime<chrono::Utc>>,
     pub processed_events: HashSet<String>,
+    /// Timestamp of the most recent visual-state transition.
+    pub visual_state_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Free-form description of what the agent is currently doing.
+    pub current_activity: Option<String>,
 }
 
 impl Default for AgentState {
@@ -173,6 +184,8 @@ impl Default for AgentState {
             actions_this_hour: 0,
             last_action_time: None,
             processed_events: HashSet::new(),
+            visual_state_since: None,
+            current_activity: None,
         }
     }
 }
@@ -189,6 +202,12 @@ struct PendingGoal {
     /// Number of failed/incomplete attempts so far.
     attempts: u32,
     _created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateChatExecutionMode {
+    Agentic,
+    Direct,
 }
 
 pub struct Agent {
@@ -225,6 +244,8 @@ impl Agent {
         config: AgentConfig,
         event_tx: Sender<AgentEvent>,
     ) -> Self {
+        let mut config = config;
+        config.private_chat_mode = normalize_private_chat_mode(&config.private_chat_mode);
         let reasoning = reasoning::ReasoningEngine::new(
             config.llm_api_url.clone(),
             config.llm_model.clone(),
@@ -280,6 +301,15 @@ impl Agent {
                 None
             }
         };
+        if let Some(ref db) = database {
+            if let Err(error) = db.set_state(PRIVATE_CHAT_MODE_STATE_KEY, &config.private_chat_mode)
+            {
+                tracing::warn!(
+                    "Failed to persist initial private chat mode state: {}",
+                    error
+                );
+            }
+        }
 
         // Initialize trajectory engine for Ludonarrative Assonantic Tracing
         let trajectory_engine = if config.enable_self_reflection {
@@ -325,6 +355,8 @@ impl Agent {
     /// Reload config and recreate reasoning engine and image generator
     pub async fn reload_config(&self, new_config: AgentConfig) {
         tracing::info!("Reloading agent configuration...");
+        let mut new_config = new_config;
+        new_config.private_chat_mode = normalize_private_chat_mode(&new_config.private_chat_mode);
 
         // Create new reasoning engine with updated config
         let new_reasoning = reasoning::ReasoningEngine::new(
@@ -391,6 +423,13 @@ impl Agent {
         *self.image_gen.write().await = new_image_gen;
         *self.trajectory_engine.write().await = new_trajectory;
         *self.last_orientation_signature.write().await = None;
+        if let Some(ref db) = *self.database.read().await {
+            if let Err(error) =
+                db.set_state(PRIVATE_CHAT_MODE_STATE_KEY, &new_config.private_chat_mode)
+            {
+                tracing::warn!("Failed to persist private chat mode state: {}", error);
+            }
+        }
         self.config_generation.fetch_add(1, Ordering::SeqCst);
         self.request_wake("config_reloaded");
 
@@ -410,6 +449,7 @@ impl Agent {
             AgentVisualState::Idle
         };
         state.visual_state = new_state.clone();
+        state.visual_state_since = Some(Utc::now());
         drop(state);
 
         let _ = self.event_tx.send(AgentEvent::StateChanged(new_state));
@@ -428,6 +468,7 @@ impl Agent {
             AgentVisualState::Idle
         };
         state.visual_state = new_state.clone();
+        state.visual_state_since = Some(Utc::now());
         drop(state);
 
         let _ = self.event_tx.send(AgentEvent::StateChanged(new_state));
@@ -441,6 +482,32 @@ impl Agent {
             visual_state: state.visual_state.clone(),
             actions_this_hour: state.actions_this_hour,
             last_action_time: state.last_action_time,
+            visual_state_since: state.visual_state_since,
+            current_activity: state.current_activity.clone(),
+        }
+    }
+
+    async fn private_chat_execution_mode(
+        &self,
+        config_snapshot: &AgentConfig,
+    ) -> PrivateChatExecutionMode {
+        let config_mode = normalize_private_chat_mode(&config_snapshot.private_chat_mode);
+        let persisted_mode = {
+            let db_lock = self.database.read().await;
+            if let Some(ref db) = *db_lock {
+                db.get_state(PRIVATE_CHAT_MODE_STATE_KEY)
+                    .ok()
+                    .flatten()
+                    .map(|value| normalize_private_chat_mode(&value))
+            } else {
+                None
+            }
+        };
+
+        match persisted_mode.as_deref().unwrap_or(config_mode.as_str()) {
+            PRIVATE_CHAT_MODE_DIRECT => PrivateChatExecutionMode::Direct,
+            PRIVATE_CHAT_MODE_AGENTIC => PrivateChatExecutionMode::Agentic,
+            _ => PrivateChatExecutionMode::Agentic,
         }
     }
 
@@ -563,9 +630,29 @@ impl Agent {
     async fn set_state(&self, visual_state: AgentVisualState) {
         let mut state = self.state.write().await;
         state.visual_state = visual_state.clone();
+        state.visual_state_since = Some(Utc::now());
+        // Clear activity description when going idle so stale text doesn't linger.
+        if matches!(
+            visual_state,
+            AgentVisualState::Idle | AgentVisualState::Paused
+        ) {
+            state.current_activity = None;
+        }
         drop(state);
 
         self.emit(AgentEvent::StateChanged(visual_state)).await;
+    }
+
+    /// Update the current-activity description and emit it as an Observation.
+    /// This surfaces in the event log AND in the Mind panel so the operator can
+    /// see what the agent is doing even while waiting for a slow LLM response.
+    async fn set_activity(&self, activity: impl Into<String>) {
+        let activity = activity.into();
+        {
+            let mut state = self.state.write().await;
+            state.current_activity = Some(activity.clone());
+        }
+        self.emit(AgentEvent::Observation(activity)).await;
     }
 
     async fn has_pending_operator_messages(&self) -> bool {
@@ -866,7 +953,7 @@ impl Agent {
                 "Beginning persona evolution cycle...".to_string(),
             ))
             .await;
-            self.set_state(AgentVisualState::Thinking).await;
+            self.set_state(AgentVisualState::Reading).await;
 
             if let Err(e) = self.run_persona_evolution().await {
                 tracing::error!("Persona evolution failed: {}", e);
@@ -963,7 +1050,7 @@ impl Agent {
             "Running autonomous self-directive cycle...".to_string(),
         ))
         .await;
-        self.set_state(AgentVisualState::Thinking).await;
+        self.set_state(AgentVisualState::Reading).await;
 
         let mut user_message = String::from(
             "This is your autonomous time — no one is asking you anything right now.\n\
@@ -1295,6 +1382,11 @@ impl Agent {
             return;
         }
 
+        // Skip heartbeat if the user just sent a message — their request takes priority.
+        if self.has_pending_operator_messages().await {
+            return;
+        }
+
         self.emit(AgentEvent::CycleStart {
             label: "💓 Heartbeat".to_string(),
         })
@@ -1303,7 +1395,7 @@ impl Agent {
             "Running autonomous heartbeat checks...".to_string(),
         ))
         .await;
-        self.set_state(AgentVisualState::Thinking).await;
+        self.set_state(AgentVisualState::Reading).await;
 
         let mut user_message = String::from(
             "You are running a scheduled heartbeat cycle for routine maintenance.\n\
@@ -2717,7 +2809,7 @@ impl Agent {
             "Starting dream cycle (ambient consolidation)...".to_string(),
         ))
         .await;
-        self.set_state(AgentVisualState::Thinking).await;
+        self.set_state(AgentVisualState::Reading).await;
 
         // Dream cycle can trigger deeper persona trajectory updates when due.
         self.maybe_evolve_persona().await;
@@ -3120,7 +3212,8 @@ impl Agent {
         let llm_api_key = config_snapshot.llm_api_key.clone();
         let system_prompt = config_snapshot.system_prompt.clone();
         let username = config_snapshot.username.clone();
-        let chat_turn_limit = configured_chat_max_autonomous_turns(&config_snapshot);
+        let configured_chat_turn_limit = configured_chat_max_autonomous_turns(&config_snapshot);
+        let configured_private_chat_mode = self.private_chat_execution_mode(&config_snapshot).await;
 
         let loop_config = AgenticConfig {
             max_iterations: configured_agentic_max_iterations(&config_snapshot),
@@ -3150,6 +3243,20 @@ impl Agent {
             CHAT_TURN_CONTROL_BLOCK_START,
             CHAT_TURN_CONTROL_BLOCK_END
         );
+        let direct_chat_system_prompt = format!(
+            "{}\n\nYou are in direct operator chat mode.\nRespond in a single pass and then yield back to the operator.\nYou may call tools when they improve correctness or save effort.\nDo not emit a turn_control block in direct mode.",
+            system_prompt
+        );
+
+        // System prompt for scheduled-job conversations: no user is present, just execute the task.
+        let scheduled_system_prompt = format!(
+            "{}\n\nYou are executing an automated scheduled task — no user is present.\nComplete the task described below using your tools. Be thorough but concise in your summary.\nDo NOT address a user or wait for input; the operator will review the result later.\nIf you detect anything worth tracking, append a concerns block:\n{}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[]}}]\n{}\nUse an empty array when there are no concern updates.\nEvery response MUST end with a turn-control JSON block:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":false,\"user_message\":\"brief task summary\",\"reason\":\"short internal rationale\"}}\n{}\nChoose decision='continue' only if you have immediate next steps to take now.\nChoose decision='yield' when the task is complete or you cannot proceed further.",
+            system_prompt,
+            CHAT_CONCERNS_BLOCK_START,
+            CHAT_CONCERNS_BLOCK_END,
+            CHAT_TURN_CONTROL_BLOCK_START,
+            CHAT_TURN_CONTROL_BLOCK_END
+        );
 
         for (conversation_id, conversation_messages) in messages_by_conversation {
             let conversation_tag = truncate_for_event(&conversation_id, 12);
@@ -3161,6 +3268,27 @@ impl Agent {
                 .await;
                 continue;
             }
+
+            // Choose system prompt based on whether this conversation was triggered by a
+            // scheduled job (no live user present) or a real operator message.
+            let is_scheduled = conversation_messages.iter().all(|m| m.role == "scheduled");
+            let active_chat_mode = if is_scheduled {
+                PrivateChatExecutionMode::Agentic
+            } else {
+                configured_private_chat_mode
+            };
+            let active_system_prompt = if is_scheduled {
+                &scheduled_system_prompt
+            } else if active_chat_mode == PrivateChatExecutionMode::Direct {
+                &direct_chat_system_prompt
+            } else {
+                &chat_system_prompt
+            };
+            let chat_turn_limit = if active_chat_mode == PrivateChatExecutionMode::Direct {
+                Some(1usize)
+            } else {
+                configured_chat_turn_limit
+            };
 
             let mut pending_messages = conversation_messages.clone();
             let mut continuation_hint: Option<String> = None;
@@ -3329,26 +3457,37 @@ impl Agent {
                     )
                     .await;
 
-                let user_message = build_private_chat_agentic_prompt_with_contributions(
-                    &pending_messages,
-                    session_handoff_note.as_deref(),
-                    &concerns_priority_context,
-                    &conversation_working_memory_context,
-                    &recent_chat_context,
-                    conversation_summary_context.as_deref(),
-                    continuation_hint.as_deref(),
-                    latest_orientation.as_ref(),
-                    recent_action_digest.as_deref(),
-                    previous_ooda_packet_context.as_deref(),
-                    &prompt_contributions,
-                );
+                let user_message = if active_chat_mode == PrivateChatExecutionMode::Direct {
+                    build_private_chat_direct_prompt_with_contributions(
+                        &pending_messages,
+                        session_handoff_note.as_deref(),
+                        &conversation_working_memory_context,
+                        &recent_chat_context,
+                        conversation_summary_context.as_deref(),
+                        &prompt_contributions,
+                    )
+                } else {
+                    build_private_chat_agentic_prompt_with_contributions(
+                        &pending_messages,
+                        session_handoff_note.as_deref(),
+                        &concerns_priority_context,
+                        &conversation_working_memory_context,
+                        &recent_chat_context,
+                        conversation_summary_context.as_deref(),
+                        continuation_hint.as_deref(),
+                        latest_orientation.as_ref(),
+                        recent_action_digest.as_deref(),
+                        previous_ooda_packet_context.as_deref(),
+                        &prompt_contributions,
+                    )
+                };
                 if let Some(turn_id) = turn_id.as_deref() {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
                         if let Err(e) = db.set_chat_turn_prompt_bundle(
                             turn_id,
                             &user_message,
-                            &chat_system_prompt,
+                            active_system_prompt,
                         ) {
                             tracing::warn!(
                                 "Failed to persist chat turn prompt [{}]: {}",
@@ -3379,12 +3518,18 @@ impl Agent {
                     });
                 };
 
+                self.set_activity(format!(
+                    "Requesting LLM (chat turn {}, conversation [{}])",
+                    format_turn_progress(turn, chat_turn_limit),
+                    conversation_tag
+                ))
+                .await;
                 let mut attempts = 0usize;
                 let result = loop {
                     attempts += 1;
                     match agentic_loop
                         .run_with_history_streaming_and_tool_events(
-                            &chat_system_prompt,
+                            active_system_prompt,
                             vec![],
                             &user_message,
                             &tool_ctx,
@@ -3395,12 +3540,19 @@ impl Agent {
                     {
                         Ok(result) => break Ok(result),
                         Err(e) if attempts < 2 => {
+                            let error_summary = truncate_for_event(&format_error_chain(&e), 220);
                             self.emit(AgentEvent::Observation(format!(
                                 "Operator task [{}] turn {} hit an error; retrying once ({})",
                                 conversation_tag,
                                 format_turn_progress(turn, chat_turn_limit),
-                                truncate_for_event(&e.to_string(), 180)
+                                error_summary
                             )))
+                            .await;
+                            self.set_activity(format!(
+                                "Retrying LLM (chat turn {}, conversation [{}])",
+                                format_turn_progress(turn, chat_turn_limit),
+                                conversation_tag
+                            ))
                             .await;
                             self.wait_with_interruptible_sleep(
                                 Duration::from_millis(900),
@@ -3414,10 +3566,11 @@ impl Agent {
                 let result = match result {
                     Ok(result) => result,
                     Err(e) => {
+                        let error_chain = format_error_chain(&e);
                         if let Some(turn_id) = turn_id.as_deref() {
                             let db_lock = self.database.read().await;
                             if let Some(ref db) = *db_lock {
-                                if let Err(db_err) = db.fail_chat_turn(turn_id, &e.to_string()) {
+                                if let Err(db_err) = db.fail_chat_turn(turn_id, &error_chain) {
                                     tracing::warn!(
                                         "Failed to persist failed chat turn: {}",
                                         db_err
@@ -3427,7 +3580,7 @@ impl Agent {
                                     "chat [{}] turn {} failed: {}",
                                     conversation_tag,
                                     turn,
-                                    truncate_for_event(&e.to_string(), 180)
+                                    truncate_for_event(&error_chain, 220)
                                 )) {
                                     tracing::warn!(
                                         "Failed to append chat failure to activity log: {}",
@@ -3438,13 +3591,13 @@ impl Agent {
                         }
                         self.emit(AgentEvent::Error(format!(
                             "Private chat turn failed [{}]: {}",
-                            conversation_tag, e
+                            conversation_tag, error_chain
                         )))
                         .await;
 
                         let fallback_response = format!(
                             "I hit an internal error while working on your request and stopped this turn. Error: {}. Send a follow-up and I will retry immediately.",
-                            truncate_for_event(&e.to_string(), 180)
+                            truncate_for_event(&error_chain, 220)
                         );
                         let fallback_chat =
                             format_chat_message_with_metadata(&fallback_response, &[], &[]);
@@ -3522,6 +3675,10 @@ impl Agent {
                     turn,
                     chat_turn_limit,
                 );
+                if active_chat_mode == PrivateChatExecutionMode::Direct {
+                    should_continue = false;
+                    should_offload_to_background = false;
+                }
 
                 let mut completion_retry_hint: Option<String> = None;
                 let mut background_subtask_spawned = false;
@@ -3571,7 +3728,8 @@ impl Agent {
                 // (b) message looks like an action request but 0 tool calls were made.
                 // Runs after operator_visible_response is finalized so we can check length.
                 // Skipped when heat detector tripped (already forcing yield) or at turn limit.
-                if !should_continue
+                if active_chat_mode == PrivateChatExecutionMode::Agentic
+                    && !should_continue
                     && !should_offload_to_background
                     && !heat_update.tripped
                     && tool_count == 0
@@ -3626,7 +3784,7 @@ impl Agent {
                             working_memory_context: conversation_working_memory_context.clone(),
                             concerns_priority_context: concerns_priority_context.clone(),
                             summary_snapshot: conversation_summary_context.clone(),
-                            chat_system_prompt: chat_system_prompt.clone(),
+                            chat_system_prompt: active_system_prompt.clone(),
                             config_snapshot: config_snapshot.clone(),
                             latest_orientation: latest_orientation.clone(),
                             stop_generation: self.stop_generation.clone(),
@@ -3889,9 +4047,14 @@ impl Agent {
                 }
 
                 let mut trace_lines = vec![format!(
-                    "Private chat [{}] turn {} via agentic loop ({} tool call(s))",
+                    "Private chat [{}] turn {} via {} mode ({} tool call(s))",
                     conversation_tag,
                     format_turn_progress(turn, chat_turn_limit),
+                    if active_chat_mode == PrivateChatExecutionMode::Direct {
+                        "direct"
+                    } else {
+                        "agentic"
+                    },
                     tool_count
                 )];
                 trace_lines.push(format!(
@@ -4476,6 +4639,88 @@ fn build_private_chat_agentic_prompt(
         previous_ooda_packet,
         &[],
     )
+}
+
+fn build_private_chat_direct_prompt_with_contributions(
+    new_messages: &[crate::database::ChatMessage],
+    session_handoff_note: Option<&str>,
+    working_memory_context: &str,
+    recent_chat_context: &str,
+    summary_snapshot: Option<&str>,
+    prompt_contributions: &[PromptContribution],
+) -> String {
+    let mut prompt = String::new();
+
+    if let Some(note) = session_handoff_note
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompt.push_str("## Your Handoff Note from Last Session\n\n");
+        prompt.push_str(note);
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    if !working_memory_context.trim().is_empty() {
+        prompt.push_str("## Working Memory\n\n");
+        prompt.push_str(&truncate_for_event(
+            working_memory_context.trim(),
+            CHAT_WORKING_MEMORY_MAX_CHARS,
+        ));
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    if !recent_chat_context.trim().is_empty() {
+        prompt.push_str("## Recent Conversation Context\n\n");
+        prompt.push_str(&truncate_for_event(recent_chat_context.trim(), 1800));
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    if let Some(summary) = summary_snapshot
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompt.push_str("## Conversation Summary Snapshot\n\n");
+        prompt.push_str(summary);
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    if let Some(addendum) = render_prompt_slot_addendum(
+        PromptContributionSlot::EngagedContext,
+        prompt_contributions,
+        PromptContributionMergeLimits::default(),
+    ) {
+        prompt.push_str("## Plugin Context\n\n");
+        prompt.push_str(&addendum);
+        prompt.push_str("\n\n---\n\n");
+    }
+
+    prompt.push_str("## New Operator Message(s)\n\n");
+    if new_messages.is_empty() {
+        prompt.push_str("- (no new operator message)\n\n");
+    } else {
+        for msg in new_messages {
+            prompt.push_str("- ");
+            prompt.push_str(msg.content.trim());
+            prompt.push('\n');
+        }
+        prompt.push('\n');
+    }
+
+    if let Some(addendum) = render_prompt_slot_addendum(
+        PromptContributionSlot::EngagedInstructions,
+        prompt_contributions,
+        PromptContributionMergeLimits::default(),
+    ) {
+        prompt.push_str("## Plugin Guidance\n\n");
+        prompt.push_str(&addendum);
+        prompt.push_str("\n\n");
+    }
+
+    prompt.push_str(
+        "Reply directly to the operator in one response. Use tools when useful, verify results, and then stop.",
+    );
+
+    prompt
 }
 
 fn build_private_chat_agentic_prompt_with_contributions(
@@ -6270,6 +6515,25 @@ fn truncate_for_event(input: &str, max_chars: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    let mut parts = Vec::new();
+    for cause in error.chain() {
+        let trimmed = cause.to_string().trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if parts.last().is_some_and(|last: &String| last == &trimmed) {
+            continue;
+        }
+        parts.push(trimmed);
+    }
+
+    if parts.is_empty() {
+        return error.to_string();
+    }
+    parts.join(" | caused by: ")
 }
 
 fn infer_media_kind_from_path(path: &str) -> String {

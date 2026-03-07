@@ -310,6 +310,7 @@ struct LoadedRuntimePlugin {
 pub struct RuntimePluginHost {
     catalog: SharedRuntimeProcessPluginCatalog,
     loaded: RwLock<HashMap<String, Arc<LoadedRuntimePlugin>>>,
+    last_tool_registry: RwLock<Option<Arc<ToolRegistry>>>,
     request_counter: AtomicU64,
 }
 
@@ -328,6 +329,7 @@ impl RuntimePluginHost {
         Self {
             catalog,
             loaded: RwLock::new(HashMap::new()),
+            last_tool_registry: RwLock::new(None),
             request_counter: AtomicU64::new(1),
         }
     }
@@ -357,6 +359,8 @@ impl RuntimePluginHost {
         config: &AgentConfig,
         tool_registry: Arc<ToolRegistry>,
     ) -> Result<()> {
+        *self.last_tool_registry.write().await = Some(tool_registry.clone());
+
         let loaded_ids = self.loaded.read().await.keys().cloned().collect::<Vec<_>>();
         for plugin_id in loaded_ids {
             let should_keep = self
@@ -385,6 +389,9 @@ impl RuntimePluginHost {
                         plugin_id,
                         error
                     );
+                    if Self::is_transport_error(&error) {
+                        self.deactivate_failed_plugin(&plugin_id).await;
+                    }
                 }
                 continue;
             }
@@ -405,7 +412,7 @@ impl RuntimePluginHost {
     }
 
     pub async fn dispatch_event(
-        &self,
+        self: &Arc<Self>,
         event: &RuntimePluginLifecycleEvent,
     ) -> Result<Vec<RuntimePluginEventEffect>> {
         let plugins = self
@@ -449,6 +456,9 @@ impl RuntimePluginHost {
                         event.wire_name(),
                         error
                     );
+                    if Self::is_transport_error(&error) {
+                        self.deactivate_failed_plugin(plugin.bundle.id()).await;
+                    }
                 }
             }
         }
@@ -456,7 +466,7 @@ impl RuntimePluginHost {
     }
 
     pub async fn collect_prompt_contributions(
-        &self,
+        self: &Arc<Self>,
         query: &RuntimePluginPromptQuery,
     ) -> Result<Vec<PromptContribution>> {
         let plugins = self
@@ -502,6 +512,9 @@ impl RuntimePluginHost {
                         query.slot.wire_name(),
                         error
                     );
+                    if Self::is_transport_error(&error) {
+                        self.deactivate_failed_plugin(plugin.bundle.id()).await;
+                    }
                 }
             }
         }
@@ -509,7 +522,7 @@ impl RuntimePluginHost {
     }
 
     pub async fn invoke_tool(
-        &self,
+        self: &Arc<Self>,
         plugin_id: &str,
         tool_name: &str,
         arguments: Value,
@@ -536,7 +549,7 @@ impl RuntimePluginHost {
         }
 
         let mut client = plugin.client.lock().await;
-        let result = self
+        let call_result = self
             .call_plugin::<RuntimePluginToolResult>(
                 &mut client,
                 "plugin.invoke_tool",
@@ -545,7 +558,23 @@ impl RuntimePluginHost {
                     arguments,
                 })?,
             )
-            .await?;
+            .await;
+        drop(client);
+        let result = match call_result {
+            Ok(result) => result,
+            Err(error) => {
+                if Self::is_transport_error(&error) {
+                    self.deactivate_failed_plugin(plugin_id).await;
+                    anyhow::bail!(
+                        "Runtime plugin '{}' became unavailable while running '{}': {}",
+                        plugin_id,
+                        tool_name,
+                        error
+                    );
+                }
+                return Err(error);
+            }
+        };
         Ok(convert_tool_result(result))
     }
 
@@ -696,6 +725,22 @@ impl RuntimePluginHost {
         }
     }
 
+    async fn deactivate_failed_plugin(&self, plugin_id: &str) {
+        let tool_registry = self.last_tool_registry.read().await.clone();
+        if let Some(tool_registry) = tool_registry {
+            self.stop_plugin(plugin_id, tool_registry).await;
+            return;
+        }
+
+        let removed = self.loaded.write().await.remove(plugin_id);
+        let Some(plugin) = removed else {
+            return;
+        };
+
+        let mut client = plugin.client.lock().await;
+        let _ = client.child.kill().await;
+    }
+
     async fn call_plugin<T: DeserializeOwned>(
         &self,
         client: &mut RuntimePluginClient,
@@ -723,15 +768,56 @@ impl RuntimePluginHost {
         };
 
         let line = serde_json::to_string(&request)?;
-        client.stdin.write_all(line.as_bytes()).await?;
-        client.stdin.write_all(b"\n").await?;
-        client.stdin.flush().await?;
+        if let Err(error) = client.stdin.write_all(line.as_bytes()).await {
+            if let Ok(Some(status)) = client.child.try_wait() {
+                anyhow::bail!(
+                    "Runtime plugin process exited ({}) while sending '{}': {}",
+                    status,
+                    method,
+                    error
+                );
+            }
+            return Err(error).with_context(|| {
+                format!("Failed to write runtime plugin request for '{}'", method)
+            });
+        }
+        if let Err(error) = client.stdin.write_all(b"\n").await {
+            if let Ok(Some(status)) = client.child.try_wait() {
+                anyhow::bail!(
+                    "Runtime plugin process exited ({}) while sending '{}': {}",
+                    status,
+                    method,
+                    error
+                );
+            }
+            return Err(error).with_context(|| {
+                format!("Failed to write runtime plugin request for '{}'", method)
+            });
+        }
+        client
+            .stdin
+            .flush()
+            .await
+            .with_context(|| format!("Failed to flush runtime plugin request for '{}'", method))?;
 
         let mut ignored_non_json = 0usize;
         let response: RuntimePluginRpcResponse = loop {
             let mut response_line = String::new();
-            let bytes_read = client.stdout.read_line(&mut response_line).await?;
+            let bytes_read = client
+                .stdout
+                .read_line(&mut response_line)
+                .await
+                .with_context(|| {
+                    format!("Failed to read runtime plugin response for '{}'", method)
+                })?;
             if bytes_read == 0 {
+                if let Ok(Some(status)) = client.child.try_wait() {
+                    anyhow::bail!(
+                        "Runtime plugin process exited ({}) while waiting for '{}'",
+                        status,
+                        method
+                    );
+                }
                 anyhow::bail!(
                     "Runtime plugin process closed stdout while waiting for '{}'",
                     method
@@ -777,6 +863,17 @@ impl RuntimePluginHost {
         }
 
         Ok(response.result.unwrap_or(Value::Null))
+    }
+
+    fn is_transport_error(error: &anyhow::Error) -> bool {
+        let message = format!("{error:#}").to_lowercase();
+        message.contains("broken pipe")
+            || message.contains("closed stdout")
+            || message.contains("failed to write runtime plugin request")
+            || message.contains("failed to flush runtime plugin request")
+            || message.contains("failed to read runtime plugin response")
+            || message.contains("process exited")
+            || message.contains("connection reset by peer")
     }
 }
 

@@ -24,6 +24,7 @@ Hosts subprocess-backed runtime plugins. It owns the JSON-RPC-over-stdio transpo
 ### `RuntimePluginHost`
 - **Does**: Discovers enabled runtime bundles, launches subprocesses, performs handshake/configure calls, registers proxy tools, dispatches lifecycle events, collects prompt contributions, and forwards tool invocations.
 - **Interacts with**: `runtime.rs`, `runtime_process_plugin.rs`, `tools/runtime_plugin.rs`, and `agent/mod.rs`.
+- **Rationale**: Caches the last seen `ToolRegistry` so transport failures can deactivate a dead plugin and deregister stale proxy tools instead of repeatedly surfacing broken-pipe errors.
 
 ### Runtime tool result types
 - **Does**: `RuntimePluginToolInvocation`, `RuntimePluginToolResult`, and related enums define the narrow bridge between subprocess RPC and `ToolOutput`.
@@ -46,3 +47,4 @@ Hosts subprocess-backed runtime plugins. It owns the JSON-RPC-over-stdio transpo
 - Tool proxies are only registered for plugins that return full `tools` manifests in the handshake; legacy `capabilities.tools` names alone are used for metadata only.
 - The stdio transport now tolerates a bounded amount of non-JSON stdout noise before the first valid RPC response, which helps when third-party runtimes emit banners or environment chatter during startup.
 - Runtime plugins should be initialized from a long-lived Tokio runtime (the dedicated agent loop runtime) so plugin stdio/process resources are polled on the same runtime for their full lifetime.
+- Transport-layer plugin failures (broken pipe, closed stdout, process exit) now deactivate that plugin instance immediately, preventing stale stdio handles from producing repeated broken-pipe tool errors.

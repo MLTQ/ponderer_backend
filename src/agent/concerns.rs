@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -508,6 +508,7 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration as ChronoDuration;
     use tempfile::TempDir;
 
     fn temp_db() -> (TempDir, AgentDatabase) {

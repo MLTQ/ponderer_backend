@@ -3,6 +3,7 @@
 //! - `search_memory`: query persisted working memory entries.
 //! - `write_memory`: create or update a working-memory note.
 //! - `write_session_handoff`: write a cross-session continuity note injected at the top of next-session context.
+//! - `private_chat_mode`: inspect/set/toggle runtime private-chat mode (`agentic` vs `direct`).
 //! - `scratch_note`: read/write/append/clear a task-scoped scratchpad (ephemeral, cleared when task is done).
 //! - `flag_uncertainty`: non-blocking heads-up to the operator before acting under uncertainty.
 
@@ -11,7 +12,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::agent::AgentEvent;
-use crate::config::AgentConfig;
+use crate::config::{
+    normalize_private_chat_mode, AgentConfig, PRIVATE_CHAT_MODE_AGENTIC, PRIVATE_CHAT_MODE_DIRECT,
+};
 use crate::database::AgentDatabase;
 
 use super::{Tool, ToolCategory, ToolContext, ToolOutput};
@@ -208,7 +211,7 @@ impl Tool for MemoryWriteTool {
             "status": "ok",
             "key": key,
             "mode": mode,
-            "content": final_content,
+            "bytes_written": final_content.len(),
         })))
     }
 
@@ -219,6 +222,7 @@ impl Tool for MemoryWriteTool {
 
 /// The fixed working-memory key used to store the cross-session handoff note.
 pub const SESSION_HANDOFF_KEY: &str = "session-handoff";
+pub const PRIVATE_CHAT_MODE_STATE_KEY: &str = "private-chat-mode";
 
 pub struct WriteSessionHandoffTool;
 
@@ -280,6 +284,134 @@ impl Tool for WriteSessionHandoffTool {
         Ok(ToolOutput::Json(json!({
             "status": "ok",
             "message": "Handoff note saved. It will be injected at the top of your context when you return.",
+        })))
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Memory
+    }
+}
+
+pub struct PrivateChatModeTool;
+
+impl PrivateChatModeTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for PrivateChatModeTool {
+    fn name(&self) -> &str {
+        "private_chat_mode"
+    }
+
+    fn description(&self) -> &str {
+        "Get or change private-chat execution mode. \
+         Modes: 'agentic' (multi-turn autonomous continuation) or 'direct' (single-turn reply with optional tool use)."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["get", "set", "toggle"],
+                    "description": "Operation to perform. Defaults to 'get'."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["agentic", "direct"],
+                    "description": "Required for action='set'."
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let action = params
+            .get("action")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("get")
+            .to_ascii_lowercase();
+
+        let db = match open_database() {
+            Ok(db) => db,
+            Err(error) => return Ok(ToolOutput::Error(error.to_string())),
+        };
+
+        let current_mode = db
+            .get_state(PRIVATE_CHAT_MODE_STATE_KEY)
+            .ok()
+            .flatten()
+            .map(|value| normalize_private_chat_mode(&value))
+            .unwrap_or_else(|| normalize_private_chat_mode(&AgentConfig::load().private_chat_mode));
+
+        if action == "get" {
+            return Ok(ToolOutput::Json(json!({
+                "status": "ok",
+                "mode": current_mode,
+            })));
+        }
+
+        let target_mode = if action == "toggle" {
+            if current_mode == PRIVATE_CHAT_MODE_DIRECT {
+                PRIVATE_CHAT_MODE_AGENTIC.to_string()
+            } else {
+                PRIVATE_CHAT_MODE_DIRECT.to_string()
+            }
+        } else if action == "set" {
+            let Some(mode) = params.get("mode").and_then(Value::as_str) else {
+                return Ok(ToolOutput::Error(
+                    "Missing required 'mode' parameter for action='set'.".to_string(),
+                ));
+            };
+            let normalized = normalize_private_chat_mode(mode);
+            if normalized != mode.trim().to_ascii_lowercase() {
+                return Ok(ToolOutput::Error(
+                    "Invalid 'mode' parameter. Use 'agentic' or 'direct'.".to_string(),
+                ));
+            }
+            normalized
+        } else {
+            return Ok(ToolOutput::Error(
+                "Invalid 'action' parameter. Use 'get', 'set', or 'toggle'.".to_string(),
+            ));
+        };
+
+        if let Err(error) = db.set_state(PRIVATE_CHAT_MODE_STATE_KEY, &target_mode) {
+            return Ok(ToolOutput::Error(format!(
+                "Failed to update private chat mode state: {}",
+                error
+            )));
+        }
+
+        let mut persisted = false;
+        let mut persist_error: Option<String> = None;
+        let mut config = AgentConfig::load();
+        config.private_chat_mode = target_mode.clone();
+        match config.save() {
+            Ok(_) => persisted = true,
+            Err(error) => persist_error = Some(error.to_string()),
+        }
+
+        if let Err(error) = db.append_daily_activity_log(&format!(
+            "private_chat_mode action='{}' from='{}' to='{}'",
+            action, current_mode, target_mode
+        )) {
+            tracing::warn!("Failed to append private-chat-mode activity log: {}", error);
+        }
+
+        Ok(ToolOutput::Json(json!({
+            "status": "ok",
+            "action": action,
+            "previous_mode": current_mode,
+            "mode": target_mode,
+            "persisted_to_config": persisted,
+            "persist_error": persist_error,
         })))
     }
 

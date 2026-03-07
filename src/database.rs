@@ -2934,7 +2934,7 @@ impl AgentDatabase {
                 params![
                     message_id,
                     job.conversation_id,
-                    "operator",
+                    "scheduled",
                     job.queue_message(),
                     now_str.clone(),
                     0_i64,
@@ -3592,7 +3592,7 @@ impl AgentDatabase {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, role, content, created_at, processed, turn_id FROM chat_messages
-             WHERE role = 'operator' AND processed = 0
+             WHERE role IN ('operator', 'scheduled') AND processed = 0
              ORDER BY created_at ASC",
         )?;
 

@@ -447,7 +447,12 @@ fn resolve_path(path: &str, working_dir: &str) -> String {
         // `/Users/max/file.md` has 3. Redirect single-component root paths.
         let depth = p
             .components()
-            .filter(|c| !matches!(c, std::path::Component::RootDir | std::path::Component::Prefix(_)))
+            .filter(|c| {
+                !matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Prefix(_)
+                )
+            })
             .count();
         if depth <= 1 {
             // e.g. "/psychographic-profile-max.md" → "<working_dir>/psychographic-profile-max.md"

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::agent::{AgentEvent, AgentRuntimeStatus};
-use crate::config::AgentConfig;
+use crate::config::{normalize_private_chat_mode, AgentConfig};
 use crate::database::{
     AgentDatabase, ChatConversation, ChatConversationSummary, ChatMessage, ChatTurn,
     ChatTurnToolCall, DEFAULT_CHAT_CONVERSATION_ID,
@@ -425,6 +425,8 @@ async fn update_config(
     State(state): State<Arc<ServerState>>,
     Json(new_config): Json<AgentConfig>,
 ) -> Result<Json<AgentConfig>, (StatusCode, String)> {
+    let mut new_config = new_config;
+    new_config.private_chat_mode = normalize_private_chat_mode(&new_config.private_chat_mode);
     if let Err(error) = new_config.save() {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,

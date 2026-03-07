@@ -194,6 +194,7 @@ fn builtin_core_manifest() -> BackendPluginManifest {
             "search_memory".to_string(),
             "write_memory".to_string(),
             "write_session_handoff".to_string(),
+            "private_chat_mode".to_string(),
             "scratch_note".to_string(),
             "http_fetch".to_string(),
             "flag_uncertainty".to_string(),
@@ -259,8 +260,8 @@ async fn register_builtin_core_tools(
         files::{ListDirectoryTool, PatchFileTool, ReadFileTool, WriteFileTool},
         http::HttpFetchTool,
         memory::{
-            FlagUncertaintyTool, MemorySearchTool, MemoryWriteTool, ScratchNoteTool,
-            WriteSessionHandoffTool,
+            FlagUncertaintyTool, MemorySearchTool, MemoryWriteTool, PrivateChatModeTool,
+            ScratchNoteTool, WriteSessionHandoffTool,
         },
         scheduled_jobs::{
             CreateScheduledJobTool, DeleteScheduledJobTool, ListScheduledJobsTool,
@@ -302,6 +303,9 @@ async fn register_builtin_core_tools(
         .await;
     tool_registry
         .register(Arc::new(WriteSessionHandoffTool::new()))
+        .await;
+    tool_registry
+        .register(Arc::new(PrivateChatModeTool::new()))
         .await;
     tool_registry
         .register(Arc::new(ScratchNoteTool::new()))

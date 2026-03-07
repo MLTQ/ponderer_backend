@@ -28,7 +28,7 @@ Provides backend-only runtime bootstrap for Ponderer. This is the non-UI assembl
 ### Built-in registration groups
 - **Does**: Registers built-ins in capability groups: core tools, ComfyUI integration (including the generic `run_workflow_plugin` tool), and OrbWeaver integration.
 - **Interacts with**: tool modules under `tools/`, `workflow_plugin.rs`, shared runtime services such as `process_registry.rs`, and plugin manifests exposed to the frontend.
-- **Notes**: Core tools now include schedule-management tools (`list_scheduled_jobs`, `create_scheduled_job`, `update_scheduled_job`, `delete_scheduled_job`) so the agent can manage recurring jobs directly.
+- **Notes**: Core tools include schedule-management tools (`list_scheduled_jobs`, `create_scheduled_job`, `update_scheduled_job`, `delete_scheduled_job`) and `private_chat_mode` for runtime chat-mode control (`agentic` vs `direct`).
 
 ### Workflow plugin discovery
 - **Does**: Scans the filesystem for data-only Comfy workflow plugin bundles and appends their manifests to `/v1/plugins`.

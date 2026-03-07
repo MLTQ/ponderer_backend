@@ -7,6 +7,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+pub const PRIVATE_CHAT_MODE_AGENTIC: &str = "agentic";
+pub const PRIVATE_CHAT_MODE_DIRECT: &str = "direct";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RespondTo {
     #[serde(rename = "type")]
@@ -159,6 +162,8 @@ pub struct AgentConfig {
     pub max_chat_autonomous_turns: u32,
     #[serde(default = "default_max_background_subtask_turns")]
     pub max_background_subtask_turns: u32,
+    #[serde(default = "default_private_chat_mode")]
+    pub private_chat_mode: String,
     #[serde(default)]
     pub disable_chat_turn_limit: bool,
     #[serde(default)]
@@ -317,8 +322,12 @@ fn default_max_background_subtask_turns() -> u32 {
     8
 }
 
+fn default_private_chat_mode() -> String {
+    PRIVATE_CHAT_MODE_AGENTIC.to_string()
+}
+
 fn default_loop_heat_threshold() -> u32 {
-    20
+    6
 }
 
 fn default_loop_similarity_threshold() -> f32 {
@@ -383,6 +392,7 @@ impl Default for AgentConfig {
             disable_tool_iteration_limit: false,
             max_chat_autonomous_turns: default_max_chat_autonomous_turns(),
             max_background_subtask_turns: default_max_background_subtask_turns(),
+            private_chat_mode: default_private_chat_mode(),
             disable_chat_turn_limit: true,
             disable_background_subtask_turn_limit: true,
             loop_heat_threshold: default_loop_heat_threshold(),
@@ -468,6 +478,8 @@ impl AgentConfig {
             if let Ok(contents) = fs::read_to_string(&path) {
                 match toml::from_str::<AgentConfig>(&contents) {
                     Ok(mut config) => {
+                        config.private_chat_mode =
+                            normalize_private_chat_mode(&config.private_chat_mode);
                         config.normalize_portable_paths();
                         tracing::info!("Loaded config from {:?}", path);
                         return config;
@@ -548,6 +560,10 @@ impl AgentConfig {
             if let Ok(turns) = limit.parse() {
                 config.max_background_subtask_turns = turns;
             }
+        }
+
+        if let Ok(mode) = env::var("AGENT_PRIVATE_CHAT_MODE") {
+            config.private_chat_mode = normalize_private_chat_mode(&mode);
         }
 
         if let Ok(disabled) = env::var("AGENT_DISABLE_CHAT_TURN_LIMIT") {
@@ -776,6 +792,13 @@ impl AgentConfig {
             }
         }
         clone
+    }
+}
+
+pub fn normalize_private_chat_mode(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        PRIVATE_CHAT_MODE_DIRECT => PRIVATE_CHAT_MODE_DIRECT.to_string(),
+        _ => PRIVATE_CHAT_MODE_AGENTIC.to_string(),
     }
 }
 

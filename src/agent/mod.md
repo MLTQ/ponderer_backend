@@ -73,9 +73,9 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Rationale**: Keeps long-lived concern memory fresh without spamming low-value updates
 
 ### `process_chat_messages`
-- **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, emits per-tool progress updates, ingests structured concern signals (`[concerns]...[/concerns]`), and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol. Foreground turn caps are optional safety rails; if enabled and exhausted while work can still continue, it offloads to a detached background subtask. It also runs deterministic loop-heat detection on per-turn signatures (action + response + tool set), forces a loop-break yield when repetitive similarity heat reaches configured threshold, persists per-turn user+system prompt payloads for UI inspection, stores a structured OODA packet per completed autonomous turn, retries one transient agentic error, and writes an operator-visible fallback failure message on terminal turn failure.
+- **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, emits per-tool progress updates, ingests structured concern signals (`[concerns]...[/concerns]`), and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol. In `direct` mode it runs a single-turn pass (still tool-capable) and suppresses continuation/offload. Foreground turn caps are optional safety rails; if enabled and exhausted while work can still continue, it offloads to a detached background subtask. It also runs deterministic loop-heat detection on per-turn signatures (action + response + tool set), forces a loop-break yield when repetitive similarity heat reaches configured threshold, persists per-turn user+system prompt payloads for UI inspection, stores a structured OODA packet per completed autonomous turn, retries one transient agentic error, and writes an operator-visible fallback failure message on terminal turn failure.
 - **Interacts with**: `database::chat_messages`, `database::chat_conversations`, `database::chat_turns`, `database::chat_turn_tool_calls`, `tools::agentic::AgenticLoop::run_with_history_streaming_and_tool_events`, `ToolRegistry`
-- **Rationale**: Uses continuation hints (not synthetic operator messages) for multi-turn autonomy, scopes private-chat tools away from Graphchan posting, compacts long sessions through persisted summary snapshots, and only persists yielded assistant replies while allowing long tasks to continue asynchronously.
+- **Rationale**: Uses continuation hints (not synthetic operator messages) for multi-turn autonomy, supports a configurable low-latency direct mode, scopes private-chat tools away from Graphchan posting, compacts long sessions through persisted summary snapshots, and only persists yielded assistant replies while allowing long tasks to continue asynchronously.
 
 ### `spawn_background_subtask` / `run_background_chat_subtask` / `reap_finished_background_subtasks`
 - **Does**: Starts one detached private-chat worker per conversation, keeps subtask uniqueness per thread, executes additional autonomous turns with the same capability profile/prompt format, and reports completion/failure back through `AgentEvent`s.
@@ -95,7 +95,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `runtime_plugin_host.rs`, `tools::ToolRegistry`.
 
 ### `reload_config`
-- **Does**: Rebuilds the LLM-facing engines from the saved config, bumps a config-generation marker, and wakes the loop so runtime-plugin config is reapplied from the loop runtime instead of the API runtime.
+- **Does**: Rebuilds the LLM-facing engines from the saved config, syncs private-chat mode into DB-backed runtime state, bumps a config-generation marker, and wakes the loop so runtime-plugin config is reapplied from the loop runtime instead of the API runtime.
 - **Interacts with**: `runtime_plugin_host.rs`, `tools::ToolRegistry`, `agent::{reasoning,orientation,journal,trajectory}`.
 
 ### `calculate_tick_duration` / `should_dream` / `run_dream_cycle`
@@ -137,6 +137,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - Due scheduled jobs are claimed and enqueued atomically in SQLite at loop start, then processed by the normal chat/tool loop; run timestamps advance only when enqueue succeeds.
 - Sleep windows are schedule-aware (`next_scheduled_job_due_at`), so ambient/legacy waits are capped by the earliest enabled job due time instead of drifting behind long poll intervals.
 - Private chat continuation now also requires meaningful forward progress signals (`tool_count > 0` or `status=still_working`) before another autonomous turn is allowed.
+- Private-chat execution mode is runtime-switchable: `agentic` (multi-turn continuation) or `direct` (single-turn response). Scheduled-job conversations always remain agentic.
 - When private-chat continuation is still justified at the turn cap, work is handed off to a per-conversation background subtask runner instead of forcing an immediate stop.
 - Foreground and background autonomous chat turns now maintain a deterministic loop-heat counter from signature similarity (response text + turn-control action + tool set). When heat crosses configured threshold, continuation/offload is blocked and the agent yields with a loop-break message.
 - Agentic tool-loop iteration limits are now settings-driven (`max_tool_iterations` with optional unbounded mode) instead of hardcoded per loop invocation.
