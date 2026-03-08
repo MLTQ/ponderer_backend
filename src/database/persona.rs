@@ -1,0 +1,367 @@
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use rusqlite::params;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use super::AgentDatabase;
+
+/// A snapshot of the agent's persona at a point in time.
+/// This is the core data structure for "Ludonarrative Assonantic Tracing" -
+/// tracking how the agent's personality evolves and inferring its trajectory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaSnapshot {
+    pub id: String,
+    pub captured_at: DateTime<Utc>,
+
+    /// Dynamic personality dimensions - keyed by principle/dimension name, value 0.0-1.0
+    /// These are derived from the agent's guiding_principles config, but the LLM
+    /// can also define additional dimensions during reflection.
+    /// This allows researchers to study arbitrary personality axes.
+    pub traits: PersonaTraits,
+
+    // The system prompt at this point
+    pub system_prompt: String,
+
+    // What triggered this snapshot (reflection, significant_interaction, manual, etc.)
+    pub trigger: String,
+
+    // LLM-generated self-description at this moment
+    pub self_description: String,
+
+    // Inferred trajectory - where is this persona heading?
+    // This is the key to Ludonarrative Assonantic Tracing
+    pub inferred_trajectory: Option<String>,
+
+    // Notable experiences that shaped this snapshot
+    pub formative_experiences: Vec<String>,
+}
+
+/// Dynamic personality traits - a flexible map of dimension names to scores.
+///
+/// Unlike fixed personality models (Big Five, MBTI, etc.), this allows:
+/// 1. Agents to define their own axes via guiding_principles config
+/// 2. LLMs to introduce new dimensions during self-reflection
+/// 3. Researchers to study arbitrary personality dimensions
+///
+/// Each value is a 0.0-1.0 score representing where the agent falls on that dimension.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PersonaTraits {
+    /// Map of dimension name -> score (0.0 to 1.0)
+    /// e.g., {"helpful": 0.8, "curious": 0.9, "nietzschean": 0.6}
+    pub dimensions: HashMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReflectionRecord {
+    pub id: String,
+    pub reflected_at: DateTime<Utc>,
+    pub old_prompt: String,
+    pub new_prompt: String,
+    pub reasoning: String,
+    pub guiding_principles: String, // JSON array
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CharacterCard {
+    pub id: String,
+    pub imported_at: DateTime<Utc>,
+    pub format: String,         // "tavernai_v2", "wpp", "boostyle"
+    pub original_data: String,  // Raw JSON/text of original card
+    pub derived_prompt: String, // System prompt derived from card
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
+impl AgentDatabase {
+    /// Save a reflection record
+    pub fn save_reflection(&self, reflection: &ReflectionRecord) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO reflection_history (id, reflected_at, old_prompt, new_prompt, reasoning, guiding_principles)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                reflection.id,
+                reflection.reflected_at.to_rfc3339(),
+                reflection.old_prompt,
+                reflection.new_prompt,
+                reflection.reasoning,
+                reflection.guiding_principles
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get reflection history
+    pub fn get_reflection_history(&self, limit: usize) -> Result<Vec<ReflectionRecord>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, reflected_at, old_prompt, new_prompt, reasoning, guiding_principles
+             FROM reflection_history
+             ORDER BY reflected_at DESC
+             LIMIT ?1",
+        )?;
+
+        let reflections = stmt
+            .query_map([limit], |row| {
+                Ok(ReflectionRecord {
+                    id: row.get(0)?,
+                    reflected_at: row.get::<_, String>(1)?.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    old_prompt: row.get(2)?,
+                    new_prompt: row.get(3)?,
+                    reasoning: row.get(4)?,
+                    guiding_principles: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(reflections)
+    }
+
+    /// Get current system prompt
+    pub fn get_current_system_prompt(&self) -> Result<Option<String>> {
+        self.get_state("current_system_prompt")
+    }
+
+    /// Set current system prompt
+    pub fn set_current_system_prompt(&self, prompt: &str) -> Result<()> {
+        self.set_state("current_system_prompt", prompt)
+    }
+
+    /// Get last reflection time
+    pub fn get_last_reflection_time(&self) -> Result<Option<DateTime<Utc>>> {
+        if let Some(time_str) = self.get_state("last_reflection_time")? {
+            let time: DateTime<Utc> = time_str
+                .parse()
+                .context("Failed to parse reflection time")?;
+            Ok(Some(time))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Set last reflection time
+    pub fn set_last_reflection_time(&self, time: DateTime<Utc>) -> Result<()> {
+        self.set_state("last_reflection_time", &time.to_rfc3339())
+    }
+
+    /// Save a character card (only keeps one at a time)
+    pub fn save_character_card(&self, card: &CharacterCard) -> Result<()> {
+        let conn = self.lock_conn()?;
+        // Delete any existing character card
+        conn.execute("DELETE FROM character_cards", [])?;
+
+        // Insert the new one
+        conn.execute(
+            "INSERT INTO character_cards (id, imported_at, format, original_data, derived_prompt, name, description)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                card.id,
+                card.imported_at.to_rfc3339(),
+                card.format,
+                card.original_data,
+                card.derived_prompt,
+                card.name,
+                card.description
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get the current character card (if any)
+    pub fn get_character_card(&self) -> Result<Option<CharacterCard>> {
+        let conn = self.lock_conn()?;
+        let result = conn.query_row(
+            "SELECT id, imported_at, format, original_data, derived_prompt, name, description
+             FROM character_cards
+             ORDER BY imported_at DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok(CharacterCard {
+                    id: row.get(0)?,
+                    imported_at: row.get::<_, String>(1)?.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    format: row.get(2)?,
+                    original_data: row.get(3)?,
+                    derived_prompt: row.get(4)?,
+                    name: row.get(5)?,
+                    description: row.get(6)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(card) => Ok(Some(card)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete the current character card
+    pub fn delete_character_card(&self) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute("DELETE FROM character_cards", [])?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Persona History - Ludonarrative Assonantic Tracing
+    // ========================================================================
+
+    /// Save a persona snapshot
+    pub fn save_persona_snapshot(&self, snapshot: &PersonaSnapshot) -> Result<()> {
+        let traits_json = serde_json::to_string(&snapshot.traits)
+            .context("Failed to serialize persona traits")?;
+        let experiences_json = serde_json::to_string(&snapshot.formative_experiences)
+            .context("Failed to serialize formative experiences")?;
+
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO persona_history (id, captured_at, traits_json, system_prompt, trigger, self_description, inferred_trajectory, formative_experiences_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                snapshot.id,
+                snapshot.captured_at.to_rfc3339(),
+                traits_json,
+                snapshot.system_prompt,
+                snapshot.trigger,
+                snapshot.self_description,
+                snapshot.inferred_trajectory,
+                experiences_json
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get the most recent persona snapshots
+    pub fn get_persona_history(&self, limit: usize) -> Result<Vec<PersonaSnapshot>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, captured_at, traits_json, system_prompt, trigger, self_description, inferred_trajectory, formative_experiences_json
+             FROM persona_history
+             ORDER BY captured_at DESC
+             LIMIT ?1",
+        )?;
+
+        let snapshots = stmt
+            .query_map([limit], |row| {
+                let traits_json: String = row.get(2)?;
+                let experiences_json: String = row.get(7)?;
+
+                Ok(PersonaSnapshot {
+                    id: row.get(0)?,
+                    captured_at: row.get::<_, String>(1)?.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    traits: serde_json::from_str(&traits_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    system_prompt: row.get(3)?,
+                    trigger: row.get(4)?,
+                    self_description: row.get(5)?,
+                    inferred_trajectory: row.get(6)?,
+                    formative_experiences: serde_json::from_str(&experiences_json).map_err(
+                        |e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        },
+                    )?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(snapshots)
+    }
+
+    /// Get persona snapshots within a date range
+    pub fn get_persona_history_range(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<PersonaSnapshot>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, captured_at, traits_json, system_prompt, trigger, self_description, inferred_trajectory, formative_experiences_json
+             FROM persona_history
+             WHERE captured_at >= ?1 AND captured_at <= ?2
+             ORDER BY captured_at ASC",
+        )?;
+
+        let snapshots = stmt
+            .query_map([from.to_rfc3339(), to.to_rfc3339()], |row| {
+                let traits_json: String = row.get(2)?;
+                let experiences_json: String = row.get(7)?;
+
+                Ok(PersonaSnapshot {
+                    id: row.get(0)?,
+                    captured_at: row.get::<_, String>(1)?.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    traits: serde_json::from_str(&traits_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    system_prompt: row.get(3)?,
+                    trigger: row.get(4)?,
+                    self_description: row.get(5)?,
+                    inferred_trajectory: row.get(6)?,
+                    formative_experiences: serde_json::from_str(&experiences_json).map_err(
+                        |e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        },
+                    )?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(snapshots)
+    }
+
+    /// Get the most recent persona snapshot
+    pub fn get_latest_persona(&self) -> Result<Option<PersonaSnapshot>> {
+        let snapshots = self.get_persona_history(1)?;
+        Ok(snapshots.into_iter().next())
+    }
+
+    /// Count total persona snapshots
+    pub fn count_persona_snapshots(&self) -> Result<usize> {
+        let conn = self.lock_conn()?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM persona_history", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+}

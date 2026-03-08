@@ -1,117 +1,37 @@
-# database.rs
+# database/ (module)
 
 ## Purpose
-Provides the agent's persistent memory layer via SQLite. Stores important posts, reflection history, persona snapshots (for personality evolution tracking), private chat sessions/conversations/turns/messages, per-turn tool call lineage, recurring scheduled jobs, Living Loop foundation records (journal, concerns, orientation snapshots, pending thoughts), and key-value state. Working-memory CRUD routes through a versioned `MemoryBackend` abstraction while preserving the existing KV behavior (`kv_v1`).
+Provides the agent's persistent memory layer via SQLite. The `database` module is split into focused submodules, each handling a distinct domain. All submodules implement methods on the shared `AgentDatabase` struct defined in `mod.rs`.
+
+## Module structure
+
+```
+src/database/
+  mod.rs            - AgentDatabase struct, Connection handling, ensure_schema, migrations, schema helpers, get_state/set_state, tests
+  chat.rs           - ChatSession, ChatConversation, ChatConversationSummary, ChatMessage, ChatTurn, ChatTurnToolCall, ChatTurnPhase, OodaTurnPacketRecord, all chat/OODA methods
+  concerns.rs       - Concern methods (save_concern, get_concern, get_active_concerns, update_concern_salience, touch_concern, etc.)
+  helpers.rs        - Private helper functions (short_conversation_tag, filter_activity_log_for_conversation, summarize_chat_message_for_context, extract_tagged_blocks, summarize_*_blocks, compact_whitespace, truncate_for_db_digest, outcome_to_db)
+  journal.rs        - Journal methods (add_journal_entry, get_recent_journal, get_journal_for_context, search_journal)
+  memory.rs         - Working memory CRUD, memory design version, archive/eval/promotion methods
+  orientation.rs    - OrientationSnapshotRecord, PendingThoughtRecord, orientation snapshot and pending thought methods
+  persona.rs        - PersonaSnapshot, PersonaTraits, CharacterCard, ReflectionRecord, all persona/character/reflection methods
+  posts.rs          - ImportantPost and all important post methods
+  scheduled_jobs.rs - ScheduledJob methods (create, list, get, update, delete, next_due_at, take_due)
+```
+
+Each `.rs` file has a companion `.md` with detailed component documentation.
 
 ## Components
 
-### `AgentDatabase`
-- **Does**: Wraps a `Mutex<rusqlite::Connection>`, delegates working-memory CRUD to `MemoryBackend`, and provides typed CRUD methods for all tables
+### `AgentDatabase` (mod.rs)
+- **Does**: Wraps a `Mutex<rusqlite::Connection>`, delegates working-memory CRUD to `MemoryBackend`, and provides typed CRUD methods for all tables via the submodule `impl` blocks
 - **Interacts with**: `main.rs` (instantiated), `agent::Agent` (reads/writes memories), `ui::app::AgentApp` (displays data), `memory::KvMemoryBackend` (default backend), `memory::MemoryMigrationRegistry` (upgrade scaffolding)
 
-### `ImportantPost`
-- **Does**: Records a forum post the agent found significant, with `importance_score` (0.0-1.0) and `why_important` explanation
-- **Interacts with**: `agent::reasoning` (marks posts), UI persona/memory views
+### Schema management (mod.rs)
+- `ensure_schema` — creates all tables and indexes using `CREATE TABLE IF NOT EXISTS`; applies manual column migrations via `PRAGMA table_info` checks
+- `get_state` / `set_state` — generic key-value store backed by `agent_state` table
 
-### `PersonaSnapshot`
-- **Does**: Captures the agent's personality state at a point in time, including dynamic `PersonaTraits` dimensions, system prompt, trigger, self-description, and inferred trajectory
-- **Rationale**: Core data structure for "Ludonarrative Assonantic Tracing" -- tracking personality evolution over time
-
-### `PersonaTraits`
-- **Does**: Flexible `HashMap<String, f64>` mapping dimension names to 0.0-1.0 scores
-- **Rationale**: Avoids fixed personality models; agents define their own axes via `guiding_principles` or LLM self-reflection
-
-### `ReflectionRecord`
-- **Does**: Logs each self-reflection event with old/new system prompts, reasoning, and guiding principles
-
-### `WorkingMemoryEntry`
-- **Does**: Key-value scratchpad entries the agent can read/write between sessions
-- **Interacts with**: `memory::MemoryBackend` contract, `get_working_memory_context()` (global) and `get_working_memory_context_for_conversation()` (chat-scoped) format entries for LLM context injection
-
-### Working-memory search/log methods (`search_working_memory`, `append_daily_activity_log`)
-- **Does**: Performs ranked text search over persisted memory entries and appends timestamped daily activity lines into date-keyed memory notes
-- **Interacts with**: `tools::memory::{search_memory, write_memory}`, `agent::process_chat_messages` automatic conversation logging
-
-### `get_memory_design_version` / `set_memory_design_version`
-- **Does**: Persists and reads active memory design metadata from `agent_state` (`memory_design_id`, `memory_schema_version`)
-- **Interacts with**: `memory::MemoryDesignVersion`, startup initialization in `AgentDatabase::new`
-
-### `apply_memory_migration`
-- **Does**: Applies a direct migration via `MemoryMigrationRegistry` and updates persisted memory design metadata
-- **Interacts with**: Future scheduled upgrade flow (ALMA-lite memory evolution loop)
-
-### Memory Archive Methods (`save_memory_design_archive_entry`, `save_memory_eval_run`, `save_memory_promotion_decision`, `evaluate_and_record_memory_promotion`)
-- **Does**: Persists memory design versions, eval reports, and policy decisions into dedicated archive tables
-- **Interacts with**: `memory::archive` policy evaluator + record types, `memory::eval::MemoryEvalReport`
-- **Rationale**: Makes promotion outcomes auditable/reproducible and ensures rollback target is always persisted
-
-### `ChatMessage`
-- **Does**: Private operator-agent chat messages with `conversation_id` routing, `processed` unread tracking, and optional `turn_id` linkage for agent replies
-- **Interacts with**: UI chat panel, `agent::Agent` poll loop
-
-### `ChatTurnPhase`
-- **Does**: Encodes persisted lifecycle states shared across conversations and turns (`idle`, `processing`, `completed`, `awaiting_approval`, `failed`)
-- **Interacts with**: `chat_conversations.runtime_state`, `chat_turns.phase_state`, `agent::process_chat_messages`
-
-### `ChatSession`
-- **Does**: Top-level container grouping conversation threads for long-running desktop usage
-- **Interacts with**: `chat_conversations.session_id`, default bootstrap row (`default_session`)
-
-### `ChatConversation`
-- **Does**: Conversation-level metadata (`id`, `session_id`, `title`, timestamps, runtime state, active turn pointer, message stats) used by the UI for multi-chat selection and status display
-- **Interacts with**: `ui::app` conversation picker/status label, `chat_messages` and `chat_turns` via `conversation_id`
-
-### `ChatConversationSummary`
-- **Does**: Stores compacted long-context snapshot text per conversation plus coverage count (`summarized_message_count`) and update timestamp
-- **Interacts with**: `agent::process_chat_messages` summary refresh/compaction prompt injection
-
-### `ChatTurn` / `ChatTurnToolCall`
-- **Does**: Persist one agent turn with decision/status/error context, stored prompt payloads (`prompt_text`, `system_prompt_text`), and per-tool input/output records for replay/debug
-- **Interacts with**: `agent::process_chat_messages`, future turn history/undo/resume UX
-
-### Scheduled-job methods (`create_scheduled_job`, `list_scheduled_jobs`, `get_scheduled_job`, `update_scheduled_job`, `delete_scheduled_job`, `next_scheduled_job_due_at`, `take_due_scheduled_jobs`)
-- **Does**: Persist recurring interval-based operator-defined jobs, bind each one to a dedicated conversation, expose earliest due timestamp lookup for sleep-capping, and atomically enqueue due-job operator messages while advancing `last_run_at`/`next_run_at`.
-- **Interacts with**: `scheduled_jobs.rs`, `server.rs` scheduled-job routes, `agent::maybe_enqueue_due_scheduled_jobs`
-
-### `OodaTurnPacketRecord`
-- **Does**: Persists per-turn OODA summaries (`observe`, `orient`, `decide`, `act`) linked to conversation/turn IDs
-- **Interacts with**: `agent/mod.rs` autonomous private-chat loops and orientation context hydration
-
-### `OrientationSnapshotRecord` / `PendingThoughtRecord`
-- **Does**: Typed records for stored orientation snapshots and queued pending-thought items
-- **Interacts with**: Future ambient/orientation loop surfaces and LL debugging views
-
-### Chat lifecycle methods (`begin_chat_turn`, `record_chat_turn_tool_call`, `complete_chat_turn`, `fail_chat_turn`, `list_chat_turns_for_conversation`, `list_chat_turn_tool_calls`)
-- **Does**: Implements persisted turn state transitions and tool-call lineage for each conversation thread
-- **Interacts with**: `agent::process_chat_messages` autonomous turn loop, diagnostics/recovery tooling
-
-### Turn prompt methods (`set_chat_turn_prompt_bundle`, `get_chat_turn_prompt_bundle`, `get_chat_turn_prompt`)
-- **Does**: Stores and retrieves exact user/system prompt payloads that produced a turn so UI diagnostics can show “what context and system instruction generated this reply”
-- **Interacts with**: `agent::process_chat_messages`, `server.rs` prompt inspection route, frontend prompt inspector
-
-### OODA/action digest methods (`save_ooda_turn_packet`, `get_latest_ooda_turn_packet`, `get_latest_ooda_turn_packet_for_conversation`, `get_recent_ooda_turn_packets_for_conversation_before`, `get_recent_action_digest`, `get_recent_action_digest_for_conversation`)
-- **Does**: Stores structured OODA packets per completed turn, serves bounded packet windows before a compaction cutoff, and emits deterministic high-signal summaries of recent turn phase/decision/tool usage plus compact reply/error previews
-- **Interacts with**: `agent::maybe_update_orientation`, private-chat prompt assembly, and conversation-compaction summary generation
-
-### Chat conversation methods (`create_chat_conversation`, `list_chat_conversations`, `get_chat_conversation`, `add_chat_message_in_conversation`, `add_chat_message_in_turn`, `get_chat_history_for_conversation`, `get_chat_context_for_conversation`)
-- **Does**: Creates/lists/fetches conversation threads, writes messages (optionally bound to a turn), and returns thread-scoped history/context; chat context formatting strips raw metadata blocks (`tool_calls`, `thinking`, `media`, `turn_control`, `concerns`) into compact summaries
-- **Interacts with**: `ui::app::AgentApp` new-chat/switch-chat actions, `agent::process_chat_messages` per-conversation prompt building
-
-### Chat compaction methods (`count_chat_messages_for_conversation`, `get_chat_history_slice_for_conversation`, `upsert_chat_conversation_summary`, `get_chat_conversation_summary`)
-- **Does**: Supports long-session context compaction by counting messages, loading older windows, and persisting summary snapshots
-- **Interacts with**: `agent::maybe_refresh_conversation_compaction_summary` before private-chat tool loop turns
-
-### Living Loop foundation methods
-- **Does**: Adds additive CRUD for:
-  - Journal (`add_journal_entry`, `get_recent_journal`, `get_journal_for_context`, `search_journal`)
-  - Concerns (`save_concern`, `get_concern`, `get_active_concerns`, `get_all_concerns`, `update_concern_salience`, `touch_concern`)
-  - Orientation snapshots (`save_orientation_snapshot`, `get_recent_orientations`)
-  - Pending thought queue (`queue_pending_thought`, `get_unsurfaced_thoughts`, `mark_thought_surfaced`, `dismiss_thought`)
-- **Interacts with**: `agent::{journal, concerns}` type models and future Living Loop ambient/disposition logic
-
-### `CharacterCard` (DB model)
-- **Does**: Stores imported character card metadata (format, raw data, derived prompt)
-- **Rationale**: Only one card kept at a time (previous deleted on import)
+See each submodule's `.md` file for detailed component documentation.
 
 ## Contracts
 
