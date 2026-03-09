@@ -1,7 +1,6 @@
 pub mod actions;
 pub mod capability_profiles;
 pub mod concerns;
-pub mod image_gen;
 pub mod journal;
 pub mod orientation;
 pub mod reasoning;
@@ -17,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, RwLock};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 use crate::agent::capability_profiles::{build_tool_context_for_profile, AgentCapabilityProfile};
 use crate::agent::concerns::{ConcernSignal, ConcernsManager};
@@ -86,6 +85,12 @@ const ACTION_DIGEST_TURN_LIMIT: usize = 12;
 const ACTION_DIGEST_MAX_CHARS: usize = 1400;
 const OODA_PACKET_CONTEXT_MAX_CHARS: usize = 1400;
 const CHAT_WORKING_MEMORY_MAX_CHARS: usize = 2200;
+const PROMPT_CONTRIBUTION_TIMEOUT_MS: u64 = 350;
+const ORIENTATION_MODEL_TIMEOUT_SECS: u64 = 8;
+const ORIENTATION_VISION_TIMEOUT_SECS: u64 = 8;
+const DIRECT_CHAT_MAX_TOOL_ITERATIONS: usize = 4;
+const SCHEDULED_CHAT_MAX_TURNS: usize = 2;
+const SCHEDULED_CHAT_MAX_TOOL_ITERATIONS: usize = 6;
 static ORIENTATION_SCREEN_CAPTURE_FAILURE_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize)]
@@ -218,7 +223,6 @@ pub struct Agent {
     state: Arc<RwLock<AgentState>>,
     event_tx: Sender<AgentEvent>,
     reasoning: Arc<RwLock<reasoning::ReasoningEngine>>,
-    image_gen: Arc<RwLock<Option<image_gen::ImageGenerator>>>,
     database: Arc<RwLock<Option<AgentDatabase>>>,
     trajectory_engine: Arc<RwLock<Option<trajectory::TrajectoryEngine>>>,
     orientation_engine: Arc<RwLock<OrientationEngine>>,
@@ -262,30 +266,6 @@ impl Agent {
             config.llm_model.clone(),
             config.llm_api_key.clone(),
         );
-
-        // Initialize image generator if workflow is configured
-        let image_gen = if config.enable_image_generation {
-            if let Some(ref workflow_json) = config.workflow_settings {
-                match serde_json::from_str::<crate::comfy_workflow::ComfyWorkflow>(workflow_json) {
-                    Ok(workflow) => {
-                        tracing::info!("Image generation enabled with workflow: {}", workflow.name);
-                        Some(image_gen::ImageGenerator::new(
-                            config.comfyui.api_url.clone(),
-                            Some(workflow),
-                        ))
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to load workflow: {}", e);
-                        None
-                    }
-                }
-            } else {
-                tracing::warn!("Image generation enabled but no workflow configured");
-                None
-            }
-        } else {
-            None
-        };
 
         // Initialize database for memory and persona tracking
         let database = match AgentDatabase::new(&config.database_path) {
@@ -335,7 +315,6 @@ impl Agent {
             state: Arc::new(RwLock::new(AgentState::default())),
             event_tx,
             reasoning: Arc::new(RwLock::new(reasoning)),
-            image_gen: Arc::new(RwLock::new(image_gen)),
             database: Arc::new(RwLock::new(database)),
             trajectory_engine: Arc::new(RwLock::new(trajectory_engine)),
             orientation_engine: Arc::new(RwLock::new(orientation_engine)),
@@ -376,30 +355,6 @@ impl Agent {
             new_config.llm_api_key.clone(),
         );
 
-        // Recreate image generator if needed
-        let new_image_gen = if new_config.enable_image_generation {
-            if let Some(ref workflow_json) = new_config.workflow_settings {
-                match serde_json::from_str::<crate::comfy_workflow::ComfyWorkflow>(workflow_json) {
-                    Ok(workflow) => {
-                        tracing::info!("Image generation enabled with workflow: {}", workflow.name);
-                        Some(image_gen::ImageGenerator::new(
-                            new_config.comfyui.api_url.clone(),
-                            Some(workflow),
-                        ))
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to load workflow: {}", e);
-                        None
-                    }
-                }
-            } else {
-                tracing::warn!("Image generation enabled but no workflow configured");
-                None
-            }
-        } else {
-            None
-        };
-
         // Recreate trajectory engine if self-reflection settings changed
         let new_trajectory = if new_config.enable_self_reflection {
             let model = new_config
@@ -420,7 +375,6 @@ impl Agent {
         *self.reasoning.write().await = new_reasoning;
         *self.orientation_engine.write().await = new_orientation;
         *self.journal_engine.write().await = new_journal;
-        *self.image_gen.write().await = new_image_gen;
         *self.trajectory_engine.write().await = new_trajectory;
         *self.last_orientation_signature.write().await = None;
         if let Some(ref db) = *self.database.read().await {
@@ -575,13 +529,15 @@ impl Agent {
         context: PromptContributionContext,
     ) -> Vec<PromptContribution> {
         let query = RuntimePluginPromptQuery { slot, context };
-        match self
-            .runtime_plugin_host
-            .collect_prompt_contributions(&query)
-            .await
-        {
-            Ok(items) => items,
-            Err(error) => {
+        let collected = timeout(
+            Duration::from_millis(PROMPT_CONTRIBUTION_TIMEOUT_MS),
+            self.runtime_plugin_host
+                .collect_prompt_contributions(&query),
+        )
+        .await;
+        match collected {
+            Ok(Ok(items)) => items,
+            Ok(Err(error)) => {
                 tracing::warn!(
                     "Runtime plugin prompt contribution collection failed for slot '{}': {}",
                     slot.wire_name(),
@@ -589,6 +545,66 @@ impl Agent {
                 );
                 Vec::new()
             }
+            Err(_) => {
+                tracing::warn!(
+                    "Runtime plugin prompt contribution collection timed out for slot '{}'",
+                    slot.wire_name()
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    async fn direct_chat_summary_snapshot(&self, conversation_id: &str) -> Option<String> {
+        let db_lock = self.database.read().await;
+        let db = db_lock.as_ref()?;
+        let summary = db
+            .get_chat_conversation_summary(conversation_id)
+            .ok()
+            .flatten()?;
+        let text = summary.summary_text.trim();
+        if text.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "{}\n\n_Covers approximately {} earlier message(s)._",
+            text, summary.summarized_message_count
+        ))
+    }
+
+    fn chat_loop_max_iterations(
+        &self,
+        config_snapshot: &AgentConfig,
+        mode: PrivateChatExecutionMode,
+    ) -> Option<usize> {
+        match mode {
+            PrivateChatExecutionMode::Agentic => configured_agentic_max_iterations(config_snapshot),
+            PrivateChatExecutionMode::Direct => {
+                let configured = configured_agentic_max_iterations(config_snapshot)
+                    .unwrap_or(DIRECT_CHAT_MAX_TOOL_ITERATIONS);
+                Some(configured.min(DIRECT_CHAT_MAX_TOOL_ITERATIONS).max(1))
+            }
+        }
+    }
+
+    fn chat_loop_config(
+        &self,
+        config_snapshot: &AgentConfig,
+        llm_api_url: &str,
+        llm_model: &str,
+        llm_api_key: Option<&str>,
+        mode: PrivateChatExecutionMode,
+    ) -> AgenticConfig {
+        AgenticConfig {
+            max_iterations: self.chat_loop_max_iterations(config_snapshot, mode),
+            api_url: agentic_api_url(llm_api_url),
+            model: llm_model.to_string(),
+            api_key: llm_api_key.map(str::to_string),
+            temperature: 0.35,
+            max_tokens: 2048,
+            cancel_generation: Some(self.stop_generation.clone()),
+            start_generation: self.stop_generation.load(Ordering::SeqCst),
         }
     }
 
@@ -1917,15 +1933,27 @@ impl Agent {
 
         let orientation = {
             let engine = self.orientation_engine.read().await;
-            match engine.orient(context).await {
-                Ok(value) => value,
-                Err(error) => {
+            match timeout(
+                Duration::from_secs(ORIENTATION_MODEL_TIMEOUT_SECS),
+                engine.orient(context),
+            )
+            .await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => {
                     tracing::warn!("Orientation update failed: {}", error);
                     self.emit(AgentEvent::Error(format!(
                         "Orientation update failed: {}",
                         error
                     )))
                     .await;
+                    return None;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Orientation update timed out after {}s",
+                        ORIENTATION_MODEL_TIMEOUT_SECS
+                    );
                     return None;
                 }
             }
@@ -2045,17 +2073,26 @@ impl Agent {
             config.llm_api_key.clone().unwrap_or_default(),
             config.llm_model.clone(),
         );
-        let evaluation = match llm_client
-            .evaluate_image(
+        let evaluation = match timeout(
+            Duration::from_secs(ORIENTATION_VISION_TIMEOUT_SECS),
+            llm_client.evaluate_image(
                 &image_bytes,
                 "Summarize what is visible on this desktop screenshot. Focus on probable user activity and immediate intent.",
                 "This is a private orientation pass for a desktop companion agent. Keep summary concise and factual.",
-            )
-            .await
+            ),
+        )
+        .await
         {
-            Ok(result) => result,
-            Err(error) => {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
                 tracing::warn!("Orientation screenshot evaluation failed: {}", error);
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Orientation screenshot evaluation timed out after {}s",
+                    ORIENTATION_VISION_TIMEOUT_SECS
+                );
                 return None;
             }
         };
@@ -3247,13 +3284,24 @@ impl Agent {
                 messages_by_conversation.push((conversation_id, vec![msg]));
             }
         }
-        // Process conversations with the most recently active messages first.
-        // This ensures the conversation the operator is currently using gets
-        // attended to before older scheduled-job or background conversations.
+        // Process operator conversations before scheduled-only conversations,
+        // then newest-first within each bucket.
         messages_by_conversation.sort_by(|(_, a_msgs), (_, b_msgs)| {
-            let a_latest = a_msgs.iter().map(|m| m.created_at).max().unwrap_or_default();
-            let b_latest = b_msgs.iter().map(|m| m.created_at).max().unwrap_or_default();
-            b_latest.cmp(&a_latest) // descending: newest first
+            let a_has_operator = a_msgs.iter().any(|m| m.role == "operator");
+            let b_has_operator = b_msgs.iter().any(|m| m.role == "operator");
+            let a_latest = a_msgs
+                .iter()
+                .map(|m| m.created_at)
+                .max()
+                .unwrap_or_default();
+            let b_latest = b_msgs
+                .iter()
+                .map(|m| m.created_at)
+                .max()
+                .unwrap_or_default();
+            b_has_operator
+                .cmp(&a_has_operator)
+                .then_with(|| b_latest.cmp(&a_latest))
         });
 
         let total_messages = messages_by_conversation
@@ -3289,17 +3337,6 @@ impl Agent {
         let configured_chat_turn_limit = configured_chat_max_autonomous_turns(&config_snapshot);
         let configured_private_chat_mode = self.private_chat_execution_mode(&config_snapshot).await;
 
-        let loop_config = AgenticConfig {
-            max_iterations: configured_agentic_max_iterations(&config_snapshot),
-            api_url: agentic_api_url(&llm_api_url),
-            model: llm_model.clone(),
-            api_key: llm_api_key.clone(),
-            temperature: 0.35,
-            max_tokens: 2048,
-            cancel_generation: Some(self.stop_generation.clone()),
-            start_generation: self.stop_generation.load(Ordering::SeqCst),
-        };
-        let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
         let tool_ctx = build_tool_context_for_profile(
             &config_snapshot,
             AgentCapabilityProfile::PrivateChat,
@@ -3358,11 +3395,24 @@ impl Agent {
             } else {
                 &chat_system_prompt
             };
-            let chat_turn_limit = if active_chat_mode == PrivateChatExecutionMode::Direct {
+            let chat_turn_limit = if is_scheduled {
+                Some(SCHEDULED_CHAT_MAX_TURNS)
+            } else if active_chat_mode == PrivateChatExecutionMode::Direct {
                 Some(1usize)
             } else {
                 configured_chat_turn_limit
             };
+            let mut loop_config = self.chat_loop_config(
+                &config_snapshot,
+                &llm_api_url,
+                &llm_model,
+                llm_api_key.as_deref(),
+                active_chat_mode,
+            );
+            if is_scheduled {
+                loop_config.max_iterations = Some(SCHEDULED_CHAT_MAX_TOOL_ITERATIONS);
+            }
+            let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
 
             let mut pending_messages = conversation_messages.clone();
             let mut continuation_hint: Option<String> = None;
@@ -3401,15 +3451,19 @@ impl Agent {
                     String::new()
                 }
             };
-            let conversation_summary_context = self
-                .maybe_refresh_conversation_compaction_summary(
-                    &conversation_id,
-                    &llm_api_url,
-                    &llm_model,
-                    llm_api_key.as_deref(),
-                    &system_prompt,
-                )
-                .await;
+            let conversation_summary_context =
+                if active_chat_mode == PrivateChatExecutionMode::Direct {
+                    self.direct_chat_summary_snapshot(&conversation_id).await
+                } else {
+                    self.maybe_refresh_conversation_compaction_summary(
+                        &conversation_id,
+                        &llm_api_url,
+                        &llm_model,
+                        llm_api_key.as_deref(),
+                        &system_prompt,
+                    )
+                    .await
+                };
 
             let mut turn = 1usize;
             // Cache the DB-fetched chat context so intermediate messages written
@@ -3523,13 +3577,17 @@ impl Agent {
                     }
                 };
 
-                let prompt_contributions = self
-                    .collect_engaged_prompt_contributions(
-                        &conversation_id,
-                        !pending_messages.is_empty(),
-                        continuation_hint.is_some(),
-                    )
-                    .await;
+                let prompt_contributions =
+                    if active_chat_mode == PrivateChatExecutionMode::Direct || is_scheduled {
+                        Vec::new()
+                    } else {
+                        self.collect_engaged_prompt_contributions(
+                            &conversation_id,
+                            !pending_messages.is_empty(),
+                            continuation_hint.is_some(),
+                        )
+                        .await
+                    };
 
                 let user_message = if active_chat_mode == PrivateChatExecutionMode::Direct {
                     build_private_chat_direct_prompt_with_contributions(
@@ -6999,7 +7057,7 @@ not a checklist item
     #[test]
     fn chat_message_format_includes_media_block_when_tool_returns_media_json() {
         let calls = vec![ToolCallRecord {
-            tool_name: "generate_comfy_media".to_string(),
+            tool_name: "image_orb_generate".to_string(),
             arguments: serde_json::json!({"prompt": "hi"}),
             output: ToolOutput::Json(serde_json::json!({
                 "media": [

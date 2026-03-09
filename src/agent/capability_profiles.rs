@@ -84,8 +84,6 @@ fn default_policy(profile: AgentCapabilityProfile) -> ToolCapabilityPolicy {
                 "patch_file".to_string(),
                 "shell".to_string(),
                 "write_memory".to_string(),
-                "generate_comfy_media".to_string(),
-                "run_workflow_plugin".to_string(),
                 "publish_media_to_chat".to_string(),
             ],
         },

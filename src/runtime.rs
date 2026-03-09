@@ -15,7 +15,6 @@ use crate::runtime_plugin_host::RuntimePluginHost;
 use crate::runtime_process_plugin::RuntimeProcessPluginCatalog;
 use crate::skills::Skill;
 use crate::tools::ToolRegistry;
-use crate::workflow_plugin::{SharedWorkflowPluginCatalog, WorkflowPluginCatalog};
 
 pub struct BackendRuntime {
     pub config: AgentConfig,
@@ -23,7 +22,6 @@ pub struct BackendRuntime {
     pub tool_registry: Arc<ToolRegistry>,
     pub process_registry: Arc<ProcessRegistry>,
     pub runtime_plugin_host: Arc<RuntimePluginHost>,
-    pub workflow_plugins: SharedWorkflowPluginCatalog,
     pub ui_database: Option<Arc<AgentDatabase>>,
     pub plugin_manifests: Vec<BackendPluginManifest>,
 }
@@ -65,7 +63,6 @@ impl BackendRuntimeBuilder {
         let runtime_plugin_host = Arc::new(RuntimePluginHost::with_catalog(
             runtime_process_plugins.clone(),
         ));
-        let workflow_plugins = Arc::new(WorkflowPluginCatalog::discover()?);
 
         let init_rt = tokio::runtime::Runtime::new()?;
         init_rt.block_on(register_builtin_core_tools(
@@ -73,18 +70,9 @@ impl BackendRuntimeBuilder {
             process_registry.clone(),
             self.event_tx.clone(),
         ))?;
-        init_rt.block_on(register_builtin_comfy_tools(
-            tool_registry.clone(),
-            workflow_plugins.clone(),
-        ))?;
         init_rt.block_on(register_builtin_orbweaver_tools(tool_registry.clone()))?;
 
-        let mut manifests = vec![
-            builtin_core_manifest(),
-            builtin_comfy_manifest(),
-            builtin_orbweaver_manifest(),
-        ];
-        manifests.extend(workflow_plugins.manifests());
+        let mut manifests = vec![builtin_core_manifest(), builtin_orbweaver_manifest()];
         manifests.extend(runtime_process_plugins.manifests());
         for plugin in self.plugins {
             let manifest = plugin.manifest();
@@ -130,7 +118,6 @@ impl BackendRuntimeBuilder {
             tool_registry,
             process_registry,
             runtime_plugin_host,
-            workflow_plugins,
             ui_database,
             plugin_manifests: manifests,
         })
@@ -205,27 +192,6 @@ fn builtin_core_manifest() -> BackendPluginManifest {
         ],
         provided_skills: Vec::new(),
         settings_tab: None,
-        settings_schema: None,
-    }
-}
-
-fn builtin_comfy_manifest() -> BackendPluginManifest {
-    BackendPluginManifest {
-        id: "builtin.comfy".to_string(),
-        kind: BackendPluginKind::Builtin,
-        name: "ComfyUI".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        description: "Built-in ComfyUI transport and legacy workflow tooling.".to_string(),
-        provided_tools: vec![
-            "generate_comfy_media".to_string(),
-            "run_workflow_plugin".to_string(),
-        ],
-        provided_skills: Vec::new(),
-        settings_tab: Some(PluginSettingsTabManifest {
-            id: "skill.comfy".to_string(),
-            title: "ComfyUI".to_string(),
-            order: 200,
-        }),
         settings_schema: None,
     }
 }
@@ -328,22 +294,6 @@ async fn register_builtin_core_tools(
         .await;
 
     tracing::info!("Core tool registry initialized");
-    Ok(())
-}
-
-async fn register_builtin_comfy_tools(
-    tool_registry: Arc<ToolRegistry>,
-    workflow_plugins: SharedWorkflowPluginCatalog,
-) -> Result<()> {
-    use crate::tools::{comfy::GenerateComfyMediaTool, workflow_plugin::RunWorkflowPluginTool};
-
-    tool_registry
-        .register(Arc::new(GenerateComfyMediaTool::new()))
-        .await;
-    tool_registry
-        .register(Arc::new(RunWorkflowPluginTool::new(workflow_plugins)))
-        .await;
-    tracing::info!("ComfyUI plugin tools initialized");
     Ok(())
 }
 

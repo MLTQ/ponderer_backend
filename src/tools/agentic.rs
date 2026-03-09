@@ -430,9 +430,15 @@ impl AgenticLoop {
                     // are producing a final text response and won't have tool_calls.
                     let has_tool_calls =
                         message.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
+                    let has_visible_text = message
+                        .content
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|text| !text.is_empty());
                     let last_role = messages.last().map(|m| m.role.as_str()).unwrap_or("");
                     let is_first_call = last_role == "user" || last_role == "system";
-                    if has_tool_calls || tool_defs.is_empty() || !is_first_call {
+                    if has_tool_calls || has_visible_text || tool_defs.is_empty() || !is_first_call
+                    {
                         return Ok(message);
                     }
                     // Streaming returned no tool_calls on the initial user-facing call.

@@ -48,3 +48,4 @@ Hosts subprocess-backed runtime plugins. It owns the JSON-RPC-over-stdio transpo
 - The stdio transport now tolerates a bounded amount of non-JSON stdout noise before the first valid RPC response, which helps when third-party runtimes emit banners or environment chatter during startup.
 - Runtime plugins should be initialized from a long-lived Tokio runtime (the dedicated agent loop runtime) so plugin stdio/process resources are polled on the same runtime for their full lifetime.
 - Transport-layer plugin failures (broken pipe, closed stdout, process exit) now deactivate that plugin instance immediately, preventing stale stdio handles from producing repeated broken-pipe tool errors.
+- Plugin subprocess `stderr` is now piped into structured tracing logs (`target=runtime_plugin_stderr`) instead of being discarded, which makes model/runtime failures diagnosable without changing plugin transport behavior.

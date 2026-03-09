@@ -6,7 +6,10 @@ use crate::memory::archive::{
     MemoryPromotionDecisionRecord, MemoryPromotionPolicy, PromotionMetricsSnapshot,
     PromotionOutcome,
 };
-use crate::memory::{MemoryDesignVersion, WorkingMemoryEntry, MEMORY_DESIGN_STATE_KEY, MEMORY_SCHEMA_VERSION_STATE_KEY};
+use crate::memory::{
+    MemoryDesignVersion, WorkingMemoryEntry, MEMORY_DESIGN_STATE_KEY,
+    MEMORY_SCHEMA_VERSION_STATE_KEY,
+};
 
 use super::helpers::{
     filter_activity_log_for_conversation, outcome_to_db, short_conversation_tag,

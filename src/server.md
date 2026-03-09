@@ -14,7 +14,7 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - **Interacts with**: all route handlers and auth middleware.
 
 ### REST handlers (`/v1/...`)
-- **Does**: Provide CRUD-like operations for config/conversations/messages, scheduled jobs, process inspection, turn/tool-call/prompt inspection, plugin manifest discovery, pause/status/stop controls, and tool session-approval grants. Config updates normalize private-chat mode before save/reload. Message enqueue also triggers an immediate agent wake signal.
+- **Does**: Provide CRUD-like operations for config/conversations/messages, scheduled jobs, process inspection, turn/tool-call/prompt inspection, plugin manifest discovery, pause/status/stop controls, direct private-chat-mode get/set control, and tool session-approval grants. Config updates normalize private-chat mode before save/reload. Message enqueue also triggers an immediate agent wake signal.
 - **Interacts with**: `database.rs` chat + scheduled-job APIs, `process_registry.rs`, `plugin.rs` manifests, and `agent` runtime control methods.
 
 ### Scheduled-job routes (`/v1/scheduled-jobs`)
@@ -58,6 +58,7 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - Conversation-scoped handlers guard against missing conversation IDs with explicit `404` responses.
 - `GET /v1/turns/:id/prompt` returns the stored per-turn context prompt plus optional stored system prompt, enabling richer per-message context inspection in the frontend.
 - `PUT /v1/agent/pause` is preferred for explicit control; `POST /v1/agent/toggle-pause` remains for backward compatibility.
+- `GET/PUT /v1/agent/private-chat-mode` provides a narrow API for top-level Direct/Agentic toggles without requiring full config round-trips.
 - `POST /v1/agent/stop` requests immediate cancellation of in-flight agentic turns and aborts detached background subtasks.
 - Scheduled-job CRUD routes now wake the agent loop immediately after create/update/delete so timing/config changes are applied without waiting for the next ambient/legacy sleep interval.
 - Config updates sanitize `private_chat_mode` (`agentic` or `direct`) before persisting and reloading runtime state.

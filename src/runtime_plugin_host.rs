@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::AgentConfig;
@@ -595,7 +595,7 @@ impl RuntimePluginHost {
             .current_dir(&launch.working_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         let mut child = process
             .spawn()
@@ -608,6 +608,11 @@ impl RuntimePluginHost {
             .stdout
             .take()
             .context("Runtime plugin child is missing stdout pipe")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Runtime plugin child is missing stderr pipe")?;
+        Self::spawn_plugin_stderr_logger(bundle.id().to_string(), stderr);
         let mut client = RuntimePluginClient {
             child,
             stdin,
@@ -643,6 +648,38 @@ impl RuntimePluginHost {
         let mut client = plugin.client.lock().await;
         self.configure_client(&mut client, &plugin.bundle, config)
             .await
+    }
+
+    fn spawn_plugin_stderr_logger(plugin_id: String, stderr: ChildStderr) {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        tracing::info!(
+                            target: "runtime_plugin_stderr",
+                            plugin_id = %plugin_id,
+                            "{}",
+                            trimmed
+                        );
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "runtime_plugin_stderr",
+                            plugin_id = %plugin_id,
+                            "Stopped reading plugin stderr: {}",
+                            error
+                        );
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     async fn configure_client(

@@ -58,7 +58,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `Skill::poll`, `tools::agentic::AgenticLoop`, `ToolRegistry` (notably `graphchan_skill`), `AgentDatabase` memory/chat helpers
 
 ### `maybe_update_orientation`
-- **Does**: Samples presence + context, optionally captures/evaluates a desktop screenshot (when screen-capture opt-in is enabled), injects recent action digest + previous OODA packet context, computes a coarse signature, skips redundant orientation calls when unchanged, and otherwise runs orientation synthesis and persists snapshot records
+- **Does**: Samples presence + context, optionally captures/evaluates a desktop screenshot (when screen-capture opt-in is enabled), injects recent action digest + previous OODA packet context, computes a coarse signature, skips redundant orientation calls when unchanged, and otherwise runs orientation synthesis and persists snapshot records. Orientation/vision LLM calls are time-bounded so ambient work cannot stall engaged chat responsiveness indefinitely.
 - **Interacts with**: `presence/mod.rs` (`PresenceMonitor`), `tools/vision.rs` (`capture_screen_to_path`), `llm_client.rs` (`evaluate_image`), `agent/orientation.rs` (`OrientationEngine`, `OrientationContext`), `database.rs` (`save_orientation_snapshot`), `AgentEvent::OrientationUpdate`
 - **Rationale**: Adds situational awareness without changing existing action behavior in phase 2
 
@@ -73,7 +73,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Rationale**: Keeps long-lived concern memory fresh without spamming low-value updates
 
 ### `process_chat_messages`
-- **Does**: Handles unread operator chat messages by conversation thread, streams live token output during each LLM call, emits per-tool progress updates, ingests structured concern signals (`[concerns]...[/concerns]`), and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol. In `direct` mode it runs a single-turn pass (still tool-capable) and suppresses continuation/offload. Foreground turn caps are optional safety rails; if enabled and exhausted while work can still continue, it offloads to a detached background subtask. It also runs deterministic loop-heat detection on per-turn signatures (action + response + tool set), forces a loop-break yield when repetitive similarity heat reaches configured threshold, persists per-turn user+system prompt payloads for UI inspection, stores a structured OODA packet per completed autonomous turn, retries one transient agentic error, and writes an operator-visible fallback failure message on terminal turn failure.
+- **Does**: Handles unread operator chat messages by conversation thread, prioritizes operator conversations ahead of scheduled-only queues, streams live token output during each LLM call, emits per-tool progress updates, ingests structured concern signals (`[concerns]...[/concerns]`), and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol. In `direct` mode it runs a single-turn pass (still tool-capable), suppresses continuation/offload, disables runtime-plugin prompt addenda for latency, uses existing compacted summaries without triggering a refresh LLM call, and applies a strict direct-mode tool-iteration cap even when global tool-iteration limits are disabled. Scheduled-job conversations also skip plugin prompt addenda and use hard caps for chat turns + tool iterations so unattended work cannot monopolize the engaged loop. Foreground turn caps are optional safety rails; if enabled and exhausted while work can still continue, it offloads to a detached background subtask. It also runs deterministic loop-heat detection on per-turn signatures (action + response + tool set), forces a loop-break yield when repetitive similarity heat reaches configured threshold, persists per-turn user+system prompt payloads for UI inspection, stores a structured OODA packet per completed autonomous turn, retries one transient agentic error, and writes an operator-visible fallback failure message on terminal turn failure.
 - **Interacts with**: `database::chat_messages`, `database::chat_conversations`, `database::chat_turns`, `database::chat_turn_tool_calls`, `tools::agentic::AgenticLoop::run_with_history_streaming_and_tool_events`, `ToolRegistry`
 - **Rationale**: Uses continuation hints (not synthetic operator messages) for multi-turn autonomy, supports a configurable low-latency direct mode, scopes private-chat tools away from Graphchan posting, compacts long sessions through persisted summary snapshots, and only persists yielded assistant replies while allowing long tasks to continue asynchronously.
 
@@ -91,7 +91,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `agent::trajectory`, `database::persona_history`, `runtime_plugin_host.rs`, reflection timestamps in `agent_state`
 
 ### `collect_prompt_slot_contributions` / `collect_engaged_prompt_contributions`
-- **Does**: Queries the shared runtime plugin host for prompt-slot addenda, constructs the engaged-loop query context (conversation ID, loop label, summary, enabled tools), and degrades to an empty contribution set on plugin-host errors.
+- **Does**: Queries the shared runtime plugin host for prompt-slot addenda, constructs the engaged-loop query context (conversation ID, loop label, summary, enabled tools), and degrades to an empty contribution set on plugin-host errors or timeout to protect chat latency.
 - **Interacts with**: `runtime_plugin_host.rs`, `tools::ToolRegistry`.
 
 ### `reload_config`
@@ -123,7 +123,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 | `agent/capability_profiles.rs` | Loop context policies are resolved centrally and applied consistently across heartbeat, skill events, and private chat | Bypassing policy resolver or changing profile semantics |
 | `memory/eval.rs` | Replay evaluation functions remain deterministic and serializable | Breaking report schema or candidate IDs |
 | `ui/chat.rs` | Embedded chat-metadata delimiters remain stable (`[tool_calls]`, `[thinking]`, `[media]`, `[turn_control]`) | Changing envelope formats without parser update |
-| `tools/comfy.rs` | Tool JSON with `media` arrays is transformed into chat-visible media payloads | Changing media extraction shape in formatter |
+| `tools/*` | Tool JSON with `media` arrays is transformed into chat-visible media payloads | Changing media extraction shape in formatter |
 | `server.rs` | Explicit pause/status controls remain available (`set_paused`, `runtime_status`) for REST API control; `grant_session_tool_approval` is exposed via `POST /v1/agent/tools/:name/approve` | Removing pause/status/approval methods or changing returned status shape |
 
 ## Notes

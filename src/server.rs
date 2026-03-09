@@ -24,6 +24,7 @@ use crate::plugin::BackendPluginManifest;
 use crate::process_registry::{ProcessInfo, ProcessRegistry};
 use crate::runtime::BackendRuntime;
 use crate::scheduled_jobs::ScheduledJob;
+use crate::tools::memory::PRIVATE_CHAT_MODE_STATE_KEY;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -96,6 +97,11 @@ struct SetPauseRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct SetPrivateChatModeRequest {
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateScheduledJobRequest {
     name: String,
     prompt: String,
@@ -119,6 +125,11 @@ struct SendMessageResponse {
 #[derive(Debug, Serialize)]
 struct PauseStateResponse {
     paused: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PrivateChatModeResponse {
+    mode: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,6 +219,10 @@ pub async fn serve_backend(
         .route("/processes/:id", get(get_process))
         .route("/processes/:id/stop", post(stop_process))
         .route("/agent/status", get(get_agent_status))
+        .route(
+            "/agent/private-chat-mode",
+            get(get_private_chat_mode).put(set_private_chat_mode),
+        )
         .route("/agent/pause", put(set_pause))
         .route("/agent/toggle-pause", post(toggle_pause))
         .route("/agent/stop", post(stop_agent_turn))
@@ -757,6 +772,52 @@ async fn get_agent_status(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<AgentRuntimeStatus>, (StatusCode, String)> {
     Ok(Json(state.agent.runtime_status().await))
+}
+
+async fn get_private_chat_mode(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<PrivateChatModeResponse>, (StatusCode, String)> {
+    let config_mode = {
+        let cfg = state.config.read().await;
+        normalize_private_chat_mode(&cfg.private_chat_mode)
+    };
+    let mode = state
+        .db
+        .get_state(PRIVATE_CHAT_MODE_STATE_KEY)
+        .map_err(internal_error)?
+        .map(|value| normalize_private_chat_mode(&value))
+        .unwrap_or(config_mode);
+
+    Ok(Json(PrivateChatModeResponse { mode }))
+}
+
+async fn set_private_chat_mode(
+    State(state): State<Arc<ServerState>>,
+    Json(body): Json<SetPrivateChatModeRequest>,
+) -> Result<Json<PrivateChatModeResponse>, (StatusCode, String)> {
+    let normalized = normalize_private_chat_mode(&body.mode);
+    if normalized != body.mode.trim().to_ascii_lowercase() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "mode must be 'agentic' or 'direct'".to_string(),
+        ));
+    }
+
+    state
+        .db
+        .set_state(PRIVATE_CHAT_MODE_STATE_KEY, &normalized)
+        .map_err(internal_error)?;
+
+    let mut config = state.config.read().await.clone();
+    config.private_chat_mode = normalized.clone();
+    config.save().map_err(internal_error)?;
+    state.agent.reload_config(config.clone()).await;
+    {
+        let mut guard = state.config.write().await;
+        *guard = config;
+    }
+
+    Ok(Json(PrivateChatModeResponse { mode: normalized }))
 }
 
 async fn set_pause(

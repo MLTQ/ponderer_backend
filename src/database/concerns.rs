@@ -10,8 +10,10 @@ impl AgentDatabase {
     pub fn save_concern(&self, concern: &Concern) -> Result<()> {
         let concern_type_json = serde_json::to_string(&concern.concern_type)
             .map_err(|e| anyhow::anyhow!("Failed to serialize concern type: {}", e))?;
-        let related_keys_json = serde_json::to_string(&concern.related_memory_keys)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize concern related memory keys: {}", e))?;
+        let related_keys_json =
+            serde_json::to_string(&concern.related_memory_keys).map_err(|e| {
+                anyhow::anyhow!("Failed to serialize concern related memory keys: {}", e)
+            })?;
         let context_json = serde_json::to_string(&concern.context)
             .map_err(|e| anyhow::anyhow!("Failed to serialize concern context: {}", e))?;
 
