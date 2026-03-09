@@ -5,3 +5,5 @@ target/
 
 plugins/
 ponderer_backend
+
+.beads/
