@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -104,6 +105,271 @@ pub struct ToolCallRecord {
     pub output: ToolOutput,
 }
 
+/// Per-token-ish metrics emitted while streaming assistant text.
+///
+/// When the provider exposes true token logprobs we forward them directly.
+/// Otherwise `text` is derived from a lightweight local tokenizer over the
+/// streamed text deltas so the UI still gets a novelty trace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingTokenMetric {
+    pub text: String,
+    pub logprob: Option<f32>,
+    pub entropy: Option<f32>,
+    pub novelty: f32,
+}
+
+/// Incremental streaming update pushed to the caller.
+#[derive(Debug, Clone)]
+pub struct StreamingUpdate {
+    pub content: String,
+    pub done: bool,
+    pub token_metrics: Vec<StreamingTokenMetric>,
+}
+
+#[derive(Debug, Clone)]
+struct TokenEmission {
+    text: String,
+    logprob: Option<f32>,
+    entropy: Option<f32>,
+}
+
+#[derive(Debug, Default)]
+struct TokenNoveltyTracker {
+    pending_fragment: String,
+    total_tokens: u64,
+    token_counts: HashMap<String, u64>,
+    bigram_counts: HashMap<String, u64>,
+    previous_token: Option<String>,
+}
+
+impl TokenNoveltyTracker {
+    fn ingest_text_fragment(&mut self, fragment: &str) -> Vec<StreamingTokenMetric> {
+        self.tokenize_fragment(fragment)
+            .into_iter()
+            .map(|text| {
+                self.score_token(TokenEmission {
+                    text,
+                    logprob: None,
+                    entropy: None,
+                })
+            })
+            .collect()
+    }
+
+    fn ingest_provider_tokens(
+        &mut self,
+        tokens: Vec<TokenEmission>,
+    ) -> Vec<StreamingTokenMetric> {
+        tokens.into_iter().map(|token| self.score_token(token)).collect()
+    }
+
+    fn finish_pending(&mut self) -> Vec<StreamingTokenMetric> {
+        if self.pending_fragment.trim().is_empty() {
+            self.pending_fragment.clear();
+            return Vec::new();
+        }
+
+        let text = std::mem::take(&mut self.pending_fragment);
+        vec![self.score_token(TokenEmission {
+            text,
+            logprob: None,
+            entropy: None,
+        })]
+    }
+
+    fn tokenize_fragment(&mut self, fragment: &str) -> Vec<String> {
+        let mut combined = String::new();
+        combined.push_str(&self.pending_fragment);
+        combined.push_str(fragment);
+        self.pending_fragment.clear();
+
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        for ch in combined.chars() {
+            if is_metric_word_char(ch) {
+                current.push(ch);
+                continue;
+            }
+
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+
+            if !ch.is_whitespace() {
+                tokens.push(ch.to_string());
+            }
+        }
+
+        if !current.is_empty() {
+            if combined
+                .chars()
+                .last()
+                .is_some_and(is_metric_word_char)
+            {
+                self.pending_fragment = current;
+            } else {
+                tokens.push(current);
+            }
+        }
+
+        tokens
+    }
+
+    fn score_token(&mut self, token: TokenEmission) -> StreamingTokenMetric {
+        let normalized = normalize_metric_token(&token.text);
+        let seen_count = self.token_counts.get(&normalized).copied().unwrap_or(0) as f32;
+        let total = self.total_tokens as f32;
+        let vocab = self.token_counts.len() as f32 + 1.0;
+        let smoothed_probability = (seen_count + 1.0) / (total + vocab);
+        let frequency_novelty = (-smoothed_probability.ln() / 5.5).clamp(0.0, 1.0);
+
+        let bigram_novelty = if let Some(previous) = self.previous_token.as_ref() {
+            let key = bigram_key(previous, &normalized);
+            let count = self.bigram_counts.get(&key).copied().unwrap_or(0) as f32;
+            if count == 0.0 {
+                1.0
+            } else {
+                (1.0 / (count + 1.0)).clamp(0.0, 1.0)
+            }
+        } else {
+            0.55
+        };
+
+        let surprisal_score = token
+            .logprob
+            .map(|value| (-value / 5.0).clamp(0.0, 1.0))
+            .unwrap_or(frequency_novelty);
+        let entropy_score = token
+            .entropy
+            .map(|value| (value / 1.75).clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        let repeat_penalty = self
+            .previous_token
+            .as_ref()
+            .filter(|previous| *previous == &normalized)
+            .map(|_| 0.28)
+            .unwrap_or(0.0);
+
+        let novelty = (0.5 * frequency_novelty
+            + 0.3 * surprisal_score
+            + 0.15 * bigram_novelty
+            + 0.05 * entropy_score
+            - repeat_penalty)
+            .clamp(0.0, 1.25);
+
+        self.total_tokens += 1;
+        *self.token_counts.entry(normalized.clone()).or_default() += 1;
+        if let Some(previous) = self.previous_token.replace(normalized.clone()) {
+            *self
+                .bigram_counts
+                .entry(bigram_key(&previous, &normalized))
+                .or_default() += 1;
+        }
+
+        StreamingTokenMetric {
+            text: token.text,
+            logprob: token.logprob,
+            entropy: token.entropy,
+            novelty,
+        }
+    }
+}
+
+fn is_metric_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '\'' | '-')
+}
+
+fn normalize_metric_token(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.chars().any(char::is_alphanumeric) {
+        trimmed.to_ascii_lowercase()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn bigram_key(previous: &str, current: &str) -> String {
+    format!("{previous}\u{1f}{current}")
+}
+
+fn approx_entropy_from_top_logprobs(value: Option<&serde_json::Value>) -> Option<f32> {
+    let mut logprobs = Vec::new();
+    for entry in value?.as_array()? {
+        let Some(logprob) = entry.get("logprob").and_then(|item| item.as_f64()) else {
+            continue;
+        };
+        logprobs.push(logprob as f32);
+    }
+
+    if logprobs.len() < 2 {
+        return None;
+    }
+
+    let max_logprob = logprobs
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut weights = Vec::with_capacity(logprobs.len());
+    let mut normalizer = 0.0f32;
+    for logprob in logprobs {
+        let weight = (logprob - max_logprob).exp();
+        normalizer += weight;
+        weights.push(weight);
+    }
+    if normalizer <= 0.0 {
+        return None;
+    }
+
+    let entropy = weights
+        .into_iter()
+        .map(|weight| {
+            let probability = weight / normalizer;
+            -probability * probability.ln()
+        })
+        .sum::<f32>();
+    Some(entropy)
+}
+
+fn parse_logprob_tokens(choice: &serde_json::Value) -> Vec<TokenEmission> {
+    choice
+        .get("logprobs")
+        .and_then(|logprobs| logprobs.get("content"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let text = item.get("token").and_then(|value| value.as_str())?.trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    Some(TokenEmission {
+                        text: text.to_string(),
+                        logprob: item
+                            .get("logprob")
+                            .and_then(|value| value.as_f64())
+                            .map(|value| value as f32),
+                        entropy: approx_entropy_from_top_logprobs(item.get("top_logprobs")),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn logprob_request_unsupported(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    (lower.contains("logprobs") || lower.contains("top_logprobs"))
+        && (lower.contains("unsupported")
+            || lower.contains("unknown")
+            || lower.contains("invalid")
+            || lower.contains("unexpected")
+            || lower.contains("extra inputs"))
+}
+
 /// The agentic loop executor
 pub struct AgenticLoop {
     config: AgenticConfig,
@@ -184,7 +450,7 @@ impl AgenticLoop {
         history: Vec<Message>,
         user_message: &str,
         tool_ctx: &ToolContext,
-        on_text_stream: &dyn Fn(&str, bool),
+        on_text_stream: &dyn Fn(&StreamingUpdate),
     ) -> Result<AgenticResult> {
         self.run_with_history_streaming_and_tool_events(
             system_prompt,
@@ -204,7 +470,7 @@ impl AgenticLoop {
         history: Vec<Message>,
         user_message: &str,
         tool_ctx: &ToolContext,
-        on_text_stream: &dyn Fn(&str, bool),
+        on_text_stream: &dyn Fn(&StreamingUpdate),
         on_tool_event: Option<&dyn Fn(&ToolCallRecord)>,
     ) -> Result<AgenticResult> {
         self.run_with_history_internal(
@@ -224,7 +490,7 @@ impl AgenticLoop {
         history: Vec<Message>,
         user_message: &str,
         tool_ctx: &ToolContext,
-        on_text_stream: Option<&dyn Fn(&str, bool)>,
+        on_text_stream: Option<&dyn Fn(&StreamingUpdate)>,
         on_tool_event: Option<&dyn Fn(&ToolCallRecord)>,
     ) -> Result<AgenticResult> {
         // Build initial messages
@@ -278,7 +544,11 @@ impl AgenticLoop {
             // Call LLM
             tracing::debug!("Agentic loop iteration {} — calling LLM", iterations);
             if let Some(callback) = on_text_stream {
-                callback("", false);
+                callback(&StreamingUpdate {
+                    content: String::new(),
+                    done: false,
+                    token_metrics: Vec::new(),
+                });
             }
             let llm_response = self
                 .call_llm(&messages, &tool_defs, on_text_stream)
@@ -385,7 +655,11 @@ impl AgenticLoop {
 
                     // Continue loop — LLM will see tool results
                     if let Some(callback) = on_text_stream {
-                        callback("", true);
+                        callback(&StreamingUpdate {
+                            content: String::new(),
+                            done: true,
+                            token_metrics: Vec::new(),
+                        });
                     }
                     continue;
                 }
@@ -415,7 +689,7 @@ impl AgenticLoop {
         &self,
         messages: &[Message],
         tool_defs: &[ToolDef],
-        on_text_stream: Option<&dyn Fn(&str, bool)>,
+        on_text_stream: Option<&dyn Fn(&StreamingUpdate)>,
     ) -> Result<Message> {
         if on_text_stream.is_some() {
             match self
@@ -479,7 +753,14 @@ impl AgenticLoop {
         if let Some(callback) = on_text_stream {
             if let Some(content) = message.content.as_deref() {
                 if !content.is_empty() {
-                    callback(content, true);
+                    let mut tracker = TokenNoveltyTracker::default();
+                    let mut token_metrics = tracker.ingest_text_fragment(content);
+                    token_metrics.extend(tracker.finish_pending());
+                    callback(&StreamingUpdate {
+                        content: content.to_string(),
+                        done: true,
+                        token_metrics,
+                    });
                 }
             }
         }
@@ -557,7 +838,7 @@ impl AgenticLoop {
         &self,
         messages: &[Message],
         tool_defs: &[ToolDef],
-        on_text_stream: Option<&dyn Fn(&str, bool)>,
+        on_text_stream: Option<&dyn Fn(&StreamingUpdate)>,
     ) -> Result<Message> {
         #[derive(Debug, Clone, Default)]
         struct ToolCallAccumulator {
@@ -584,28 +865,30 @@ impl AgenticLoop {
             body["tools"] = serde_json::to_value(tool_defs)?;
         }
 
-        let mut req = self.client.post(&url).json(&body);
-        if let Some(ref key) = self.config.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
-        }
+        let mut body_with_metrics = body.clone();
+        body_with_metrics["logprobs"] = serde_json::json!(true);
+        body_with_metrics["top_logprobs"] = serde_json::json!(5);
 
-        let mut response = req
-            .send()
-            .await
-            .context("Failed to send streaming LLM request")?;
+        let mut response = match self.send_streaming_request(&url, &body_with_metrics).await {
+            Ok(response) => response,
+            Err(error) if logprob_request_unsupported(&error.to_string()) => {
+                tracing::debug!(
+                    "Streaming provider rejected logprob request; retrying without token logprobs: {}",
+                    error
+                );
+                self.send_streaming_request(&url, &body).await?
+            }
+            Err(error) => return Err(error),
+        };
         if self.is_cancelled() {
             return Ok(self.cancelled_message());
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Streaming LLM API error {}: {}", status, body);
         }
 
         let mut content = String::new();
         let mut tool_calls: Vec<ToolCallAccumulator> = Vec::new();
         let mut line_buffer = String::new();
         let mut saw_done = false;
+        let mut novelty_tracker = TokenNoveltyTracker::default();
 
         while let Some(chunk) = response
             .chunk()
@@ -614,7 +897,11 @@ impl AgenticLoop {
         {
             if self.is_cancelled() {
                 if let Some(callback) = on_text_stream {
-                    callback("", true);
+                    callback(&StreamingUpdate {
+                        content: String::new(),
+                        done: true,
+                        token_metrics: Vec::new(),
+                    });
                 }
                 return Ok(self.cancelled_message());
             }
@@ -645,10 +932,29 @@ impl AgenticLoop {
                     continue;
                 };
 
+                let token_metrics = parse_logprob_tokens(choice);
                 if let Some(delta_content) = choice["delta"]["content"].as_str() {
                     content.push_str(delta_content);
+                    let token_metrics = if token_metrics.is_empty() {
+                        novelty_tracker.ingest_text_fragment(delta_content)
+                    } else {
+                        novelty_tracker.ingest_provider_tokens(token_metrics)
+                    };
                     if let Some(callback) = on_text_stream {
-                        callback(&content, false);
+                        callback(&StreamingUpdate {
+                            content: content.clone(),
+                            done: false,
+                            token_metrics,
+                        });
+                    }
+                } else if !token_metrics.is_empty() {
+                    let token_metrics = novelty_tracker.ingest_provider_tokens(token_metrics);
+                    if let Some(callback) = on_text_stream {
+                        callback(&StreamingUpdate {
+                            content: content.clone(),
+                            done: false,
+                            token_metrics,
+                        });
                     }
                 }
 
@@ -694,10 +1000,13 @@ impl AgenticLoop {
             }
         }
 
+        let final_token_metrics = novelty_tracker.finish_pending();
         if let Some(callback) = on_text_stream {
-            if !content.is_empty() {
-                callback(&content, true);
-            }
+            callback(&StreamingUpdate {
+                content: content.clone(),
+                done: true,
+                token_metrics: final_token_metrics,
+            });
         }
 
         let parsed_tool_calls = tool_calls
@@ -745,6 +1054,29 @@ impl AgenticLoop {
             },
             tool_call_id: None,
         })
+    }
+
+    async fn send_streaming_request(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        let mut req = self.client.post(url).json(body);
+        if let Some(ref key) = self.config.api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let response = req
+            .send()
+            .await
+            .context("Failed to send streaming LLM request")?;
+        if response.status().is_success() {
+            return Ok(response);
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Streaming LLM API error {}: {}", status, body);
     }
 }
 

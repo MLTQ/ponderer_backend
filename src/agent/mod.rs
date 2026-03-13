@@ -46,7 +46,9 @@ use crate::runtime_plugin_host::{
     RuntimePluginLifecycleEvent, RuntimePluginPromptQuery,
 };
 use crate::skills::{Skill, SkillContext, SkillEvent};
-use crate::tools::agentic::{AgenticConfig, AgenticLoop, ToolCallRecord};
+use crate::tools::agentic::{
+    AgenticConfig, AgenticLoop, StreamingTokenMetric, StreamingUpdate, ToolCallRecord,
+};
 use crate::tools::memory::PRIVATE_CHAT_MODE_STATE_KEY;
 use crate::tools::vision::capture_screen_to_path;
 use crate::tools::ToolOutput;
@@ -118,6 +120,11 @@ pub enum AgentEvent {
         conversation_id: String,
         content: String,
         done: bool,
+    },
+    TokenMetrics {
+        conversation_id: String,
+        clear: bool,
+        samples: Vec<StreamingTokenMetric>,
     },
     /// Emitted once per operator-visible reply with the clean, stripped response text.
     /// Use this (not ChatStreaming) to relay finished replies to external channels (e.g. Telegram).
@@ -3631,12 +3638,22 @@ impl Agent {
                 }
                 let event_tx = self.event_tx.clone();
                 let stream_conversation_id = conversation_id.clone();
-                let stream_callback = move |content: &str, done: bool| {
+                let stream_started = Arc::new(AtomicBool::new(false));
+                let metrics_started = Arc::clone(&stream_started);
+                let stream_callback = move |update: &StreamingUpdate| {
                     let _ = event_tx.send(AgentEvent::ChatStreaming {
                         conversation_id: stream_conversation_id.clone(),
-                        content: content.to_string(),
-                        done,
+                        content: update.content.clone(),
+                        done: update.done,
                     });
+                    if !update.token_metrics.is_empty() {
+                        let clear = !metrics_started.swap(true, Ordering::SeqCst);
+                        let _ = event_tx.send(AgentEvent::TokenMetrics {
+                            conversation_id: stream_conversation_id.clone(),
+                            clear,
+                            samples: update.token_metrics.clone(),
+                        });
+                    }
                 };
                 let tool_event_tx = self.event_tx.clone();
                 let tool_event_conversation_id = conversation_id.clone();
@@ -5560,12 +5577,22 @@ async fn run_background_chat_subtask(
 
         let stream_tx = event_tx.clone();
         let stream_conversation_id = request.conversation_id.clone();
-        let stream_callback = move |content: &str, done: bool| {
+        let stream_started = Arc::new(AtomicBool::new(false));
+        let metrics_started = Arc::clone(&stream_started);
+        let stream_callback = move |update: &StreamingUpdate| {
             let _ = stream_tx.send(AgentEvent::ChatStreaming {
                 conversation_id: stream_conversation_id.clone(),
-                content: content.to_string(),
-                done,
+                content: update.content.clone(),
+                done: update.done,
             });
+            if !update.token_metrics.is_empty() {
+                let clear = !metrics_started.swap(true, Ordering::SeqCst);
+                let _ = stream_tx.send(AgentEvent::TokenMetrics {
+                    conversation_id: stream_conversation_id.clone(),
+                    clear,
+                    samples: update.token_metrics.clone(),
+                });
+            }
         };
         let tool_event_tx = event_tx.clone();
         let tool_event_conversation_id = request.conversation_id.clone();

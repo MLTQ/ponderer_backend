@@ -293,6 +293,18 @@ fn map_agent_event(event: AgentEvent) -> ApiEventEnvelope {
                 "done": done
             }),
         ),
+        AgentEvent::TokenMetrics {
+            conversation_id,
+            clear,
+            samples,
+        } => envelope(
+            "token_metrics",
+            serde_json::json!({
+                "conversation_id": conversation_id,
+                "clear": clear,
+                "samples": samples
+            }),
+        ),
         AgentEvent::ActionTaken { action, result } => envelope(
             "action_taken",
             serde_json::json!({

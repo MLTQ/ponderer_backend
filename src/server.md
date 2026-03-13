@@ -32,6 +32,10 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 ### `cycle_start` WS event
 - **Does**: Emitted by `map_agent_event` whenever the backend fires `AgentEvent::CycleStart { label }`. Carries a `label` string (e.g. `"💬 Engaged"`, `"🌿 Ambient"`) that the frontend uses to group activity-log events into collapsible turn groups.
 
+### `token_metrics` WS event
+- **Does**: Broadcasts live token novelty samples for the current streamed reply (`conversation_id`, `clear`, `samples[]` with `text`, optional `logprob`/`entropy`, and `novelty`).
+- **Interacts with**: `tools/agentic.rs` streaming callbacks and the desktop token monitor UI.
+
 ### WS handlers (`/v1/ws/events`)
 - **Does**: Broadcasts serialized `ApiEventEnvelope` events (timestamped) to connected clients.
 - **Interacts with**: `spawn_event_bridge`, `map_agent_event`, backend frontend/event consumers.
@@ -55,6 +59,7 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - Runtime-process plugins are initialized by `Agent::run_loop` on the dedicated agent runtime thread so plugin stdio/process handles and tool execution share one Tokio runtime context.
 - Message enqueue validates non-empty content and returns the created `message_id`.
 - Message enqueue (`POST /v1/conversations/:id/messages`) now nudges the agent runtime to wake immediately instead of waiting for the next ambient/poll sleep interval.
+- The WS stream now includes `token_metrics` alongside `chat_streaming`, allowing clients to render per-token-ish novelty traces without polling.
 - Conversation-scoped handlers guard against missing conversation IDs with explicit `404` responses.
 - `GET /v1/turns/:id/prompt` returns the stored per-turn context prompt plus optional stored system prompt, enabling richer per-message context inspection in the frontend.
 - `PUT /v1/agent/pause` is preferred for explicit control; `POST /v1/agent/toggle-pause` remains for backward compatibility.
