@@ -90,7 +90,6 @@ const CHAT_WORKING_MEMORY_MAX_CHARS: usize = 2200;
 const PROMPT_CONTRIBUTION_TIMEOUT_MS: u64 = 350;
 const ORIENTATION_MODEL_TIMEOUT_SECS: u64 = 8;
 const ORIENTATION_VISION_TIMEOUT_SECS: u64 = 8;
-const DIRECT_CHAT_MAX_TOOL_ITERATIONS: usize = 4;
 const SCHEDULED_CHAT_MAX_TURNS: usize = 2;
 const SCHEDULED_CHAT_MAX_TOOL_ITERATIONS: usize = 6;
 static ORIENTATION_SCREEN_CAPTURE_FAILURE_WARNED: AtomicBool = AtomicBool::new(false);
@@ -581,17 +580,12 @@ impl Agent {
     }
 
     fn chat_loop_max_iterations(
-        &self,
         config_snapshot: &AgentConfig,
         mode: PrivateChatExecutionMode,
     ) -> Option<usize> {
         match mode {
             PrivateChatExecutionMode::Agentic => configured_agentic_max_iterations(config_snapshot),
-            PrivateChatExecutionMode::Direct => {
-                let configured = configured_agentic_max_iterations(config_snapshot)
-                    .unwrap_or(DIRECT_CHAT_MAX_TOOL_ITERATIONS);
-                Some(configured.min(DIRECT_CHAT_MAX_TOOL_ITERATIONS).max(1))
-            }
+            PrivateChatExecutionMode::Direct => configured_agentic_max_iterations(config_snapshot),
         }
     }
 
@@ -604,7 +598,7 @@ impl Agent {
         mode: PrivateChatExecutionMode,
     ) -> AgenticConfig {
         AgenticConfig {
-            max_iterations: self.chat_loop_max_iterations(config_snapshot, mode),
+            max_iterations: Self::chat_loop_max_iterations(config_snapshot, mode),
             api_url: agentic_api_url(llm_api_url),
             model: llm_model.to_string(),
             api_key: llm_api_key.map(str::to_string),
@@ -6848,6 +6842,28 @@ not a checklist item
         cfg.max_tool_iterations = 27;
         cfg.disable_tool_iteration_limit = true;
         assert_eq!(configured_agentic_max_iterations(&cfg), None);
+    }
+
+    #[test]
+    fn direct_chat_uses_configured_agentic_iteration_limit() {
+        let mut cfg = AgentConfig::default();
+        cfg.max_tool_iterations = 50;
+        cfg.disable_tool_iteration_limit = false;
+        assert_eq!(
+            Agent::chat_loop_max_iterations(&cfg, PrivateChatExecutionMode::Direct),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn direct_chat_disables_iteration_limit_when_configured() {
+        let mut cfg = AgentConfig::default();
+        cfg.max_tool_iterations = 50;
+        cfg.disable_tool_iteration_limit = true;
+        assert_eq!(
+            Agent::chat_loop_max_iterations(&cfg, PrivateChatExecutionMode::Direct),
+            None
+        );
     }
 
     #[test]
