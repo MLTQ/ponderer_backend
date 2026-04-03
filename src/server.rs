@@ -35,6 +35,7 @@ pub struct ServerState {
     pub process_registry: Arc<ProcessRegistry>,
     pub plugin_manifests: Vec<BackendPluginManifest>,
     pub ws_events: broadcast::Sender<ApiEventEnvelope>,
+    pub telegram_bot: Arc<crate::telegram::TelegramBotManager>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +161,7 @@ pub async fn serve_backend(
         .clone()
         .ok_or_else(|| anyhow!("Backend database unavailable"))?;
     let (ws_events, _) = broadcast::channel(512);
+    let telegram_bot = Arc::new(crate::telegram::TelegramBotManager::new());
 
     let state = Arc::new(ServerState {
         agent: runtime.agent.clone(),
@@ -169,10 +171,12 @@ pub async fn serve_backend(
         process_registry: runtime.process_registry.clone(),
         plugin_manifests: runtime.plugin_manifests.clone(),
         ws_events: ws_events.clone(),
+        telegram_bot: telegram_bot.clone(),
     });
 
     spawn_event_bridge(event_rx, ws_events);
-    crate::telegram::spawn_telegram_bot(
+    telegram_bot
+        .reconfigure(
         state.clone(),
         runtime
             .config
@@ -180,7 +184,8 @@ pub async fn serve_backend(
             .clone()
             .unwrap_or_default(),
         runtime.config.telegram_chat_id,
-    );
+    )
+    .await;
     runtime.spawn_agent_loop();
 
     let protected = Router::new()
@@ -465,6 +470,14 @@ async fn update_config(
         let mut guard = state.config.write().await;
         *guard = new_config.clone();
     }
+    state
+        .telegram_bot
+        .reconfigure(
+            state.clone(),
+            new_config.telegram_bot_token.clone().unwrap_or_default(),
+            new_config.telegram_chat_id,
+        )
+        .await;
     Ok(Json(new_config))
 }
 

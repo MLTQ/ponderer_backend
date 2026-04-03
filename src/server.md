@@ -10,11 +10,11 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - **Interacts with**: `runtime.rs` (`BackendRuntime`), `agent/mod.rs` (`AgentEvent`), `database.rs` (`AgentDatabase` chat APIs).
 
 ### `ServerState`
-- **Does**: Shared application state containing agent handle, DB handle, auth token, mutable config snapshot, shared process registry, plugin manifests, and WS broadcaster.
-- **Interacts with**: all route handlers and auth middleware.
+- **Does**: Shared application state containing agent handle, DB handle, auth token, mutable config snapshot, shared process registry, plugin manifests, WS broadcaster, and the Telegram bot manager.
+- **Interacts with**: all route handlers, auth middleware, and `telegram.rs`.
 
 ### REST handlers (`/v1/...`)
-- **Does**: Provide CRUD-like operations for config/conversations/messages, scheduled jobs, process inspection, turn/tool-call/prompt inspection, plugin manifest discovery, pause/status/stop controls, direct private-chat-mode get/set control, and tool session-approval grants. Config updates normalize private-chat mode before save/reload. Message enqueue also triggers an immediate agent wake signal.
+- **Does**: Provide CRUD-like operations for config/conversations/messages, scheduled jobs, process inspection, turn/tool-call/prompt inspection, plugin manifest discovery, pause/status/stop controls, direct private-chat-mode get/set control, and tool session-approval grants. Config updates normalize private-chat mode before save/reload and also reconfigure Telegram runtime state. Message enqueue also triggers an immediate agent wake signal.
 - **Interacts with**: `database.rs` chat + scheduled-job APIs, `process_registry.rs`, `plugin.rs` manifests, and `agent` runtime control methods.
 
 ### Scheduled-job routes (`/v1/scheduled-jobs`)
@@ -67,4 +67,5 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - `POST /v1/agent/stop` requests immediate cancellation of in-flight agentic turns and aborts detached background subtasks.
 - Scheduled-job CRUD routes now wake the agent loop immediately after create/update/delete so timing/config changes are applied without waiting for the next ambient/legacy sleep interval.
 - Config updates sanitize `private_chat_mode` (`agentic` or `direct`) before persisting and reloading runtime state.
+- Config updates now also start/stop/restart the Telegram bot task when the Telegram token or authorized chat ID changes, so Telegram settings no longer require a backend restart to take effect.
 - Process routes only expose processes started through the tracked background shell path.

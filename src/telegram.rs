@@ -11,7 +11,8 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
+use tokio::task::JoinHandle;
 
 use crate::database::TELEGRAM_CONVERSATION_ID;
 use crate::server::{ApiEventEnvelope, ServerState};
@@ -22,6 +23,8 @@ use crate::server::{ApiEventEnvelope, ServerState};
 struct TelegramResponse<T> {
     ok: bool,
     result: Option<T>,
+    description: Option<String>,
+    error_code: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -43,22 +46,70 @@ struct TelegramChat {
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
-/// Spawn the Telegram bot task.
-/// `token` should be the bot token from config (or env var fallback via `AgentConfig::from_env`).
-/// Does nothing if `token` is empty.
-pub fn spawn_telegram_bot(state: Arc<ServerState>, token: String, allowed_chat_id: Option<i64>) {
-    let token = token.trim().to_string();
-    if token.is_empty() {
-        return;
+pub struct TelegramBotManager {
+    task: Mutex<Option<TelegramBotTask>>,
+}
+
+struct TelegramBotTask {
+    token: String,
+    allowed_chat_id: Option<i64>,
+    join: JoinHandle<()>,
+}
+
+impl TelegramBotTask {
+    fn matches(&self, token: &str, allowed_chat_id: Option<i64>) -> bool {
+        self.token == token && self.allowed_chat_id == allowed_chat_id
+    }
+}
+
+impl TelegramBotManager {
+    pub fn new() -> Self {
+        Self {
+            task: Mutex::new(None),
+        }
     }
 
-    tokio::spawn(async move {
-        tracing::info!(
-            "Telegram bot active (allowed_chat_id: {:?})",
-            allowed_chat_id
-        );
-        run_bot(state, token, allowed_chat_id).await;
-    });
+    /// Start, stop, or restart the Telegram bot task to match the latest config.
+    pub async fn reconfigure(
+        &self,
+        state: Arc<ServerState>,
+        token: String,
+        allowed_chat_id: Option<i64>,
+    ) {
+        let token = token.trim().to_string();
+        let mut guard = self.task.lock().await;
+
+        if let Some(current) = guard.as_ref() {
+            if current.matches(&token, allowed_chat_id) {
+                return;
+            }
+        }
+
+        if let Some(existing) = guard.take() {
+            existing.join.abort();
+            tracing::info!("Telegram bot task stopped for reconfiguration");
+        }
+
+        if token.is_empty() {
+            tracing::info!("Telegram bot disabled");
+            return;
+        }
+
+        let task_token = token.clone();
+        let join = tokio::spawn(async move {
+            tracing::info!(
+                "Telegram bot active (allowed_chat_id: {:?})",
+                allowed_chat_id
+            );
+            run_bot(state, task_token, allowed_chat_id).await;
+        });
+
+        *guard = Some(TelegramBotTask {
+            token,
+            allowed_chat_id,
+            join,
+        });
+    }
 }
 
 // ─── Bot loop ─────────────────────────────────────────────────────────────────
@@ -152,17 +203,45 @@ async fn poll_updates(
         }
     };
 
-    let body: TelegramResponse<Vec<Update>> = match resp.json().await {
+    let status = resp.status();
+    let raw_body = match resp.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!("Telegram getUpdates body read error: {}", e);
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            return None;
+        }
+    };
+
+    if !status.is_success() {
+        tracing::warn!(
+            "Telegram getUpdates failed: HTTP {} body={}",
+            status,
+            truncate_log_text(&raw_body, 800)
+        );
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        return None;
+    }
+
+    let body: TelegramResponse<Vec<Update>> = match serde_json::from_str(&raw_body) {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!("Telegram getUpdates parse error: {}", e);
+            tracing::warn!(
+                "Telegram getUpdates parse error: {} body={}",
+                e,
+                truncate_log_text(&raw_body, 800)
+            );
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             return None;
         }
     };
 
     if !body.ok {
-        tracing::warn!("Telegram API returned ok=false");
+        tracing::warn!(
+            "Telegram getUpdates returned ok=false (error_code={:?}, description={:?})",
+            body.error_code,
+            body.description
+        );
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
         return None;
     }
@@ -226,12 +305,8 @@ async fn wait_for_reply(
 
 async fn send_message(client: &reqwest::Client, api_base: &str, chat_id: i64, text: &str) {
     // Telegram enforces a 4096-character limit per message.
-    const MAX_LEN: usize = 4096;
-    let text = if text.len() > MAX_LEN {
-        &text[..MAX_LEN]
-    } else {
-        text
-    };
+    const MAX_LEN_CHARS: usize = 4096;
+    let text = truncate_telegram_text(text, MAX_LEN_CHARS);
 
     let url = format!("{}/sendMessage", api_base);
     let payload = serde_json::json!({ "chat_id": chat_id, "text": text });
@@ -241,10 +316,53 @@ async fn send_message(client: &reqwest::Client, api_base: &str, chat_id: i64, te
             tracing::debug!("Telegram: sent reply to chat {}", chat_id);
         }
         Ok(r) => {
-            tracing::warn!("Telegram sendMessage failed: HTTP {}", r.status());
+            let status = r.status();
+            let body = r
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable response body>".to_string());
+            tracing::warn!(
+                "Telegram sendMessage failed: HTTP {} body={}",
+                status,
+                truncate_log_text(&body, 800)
+            );
         }
         Err(e) => {
             tracing::error!("Telegram sendMessage error: {}", e);
         }
+    }
+}
+
+fn truncate_telegram_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect()
+}
+
+fn truncate_log_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars).collect();
+    truncated.push_str("…");
+    truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_telegram_text_keeps_utf8_boundaries() {
+        let input = "🙂".repeat(5000);
+        let truncated = truncate_telegram_text(&input, 4096);
+        assert_eq!(truncated.chars().count(), 4096);
+    }
+
+    #[test]
+    fn truncate_log_text_adds_suffix_when_trimmed() {
+        let truncated = truncate_log_text("abcdef", 3);
+        assert_eq!(truncated, "abc…");
     }
 }
