@@ -19,7 +19,7 @@ Defines the shared tool abstraction (`Tool` trait), typed tool I/O (`ToolOutput`
 - **Rationale**: A replacement plugin must not inherit authority by reusing an approved tool name and effect policy. Registration and approval state share one lock, and both replacement and deregistration clear the old grant atomically.
 
 ### `ToolContext`
-- **Does**: Carries execution metadata (`working_directory`, `username`, optional `conversation_id`, `autonomous`), tool-scope controls (`allowed_tools`, `disallowed_tools`), and an optional process-shared `ToolInvocationRateLimit` for outward side effects.
+- **Does**: Carries execution metadata (`working_directory`, `username`, optional `conversation_id`, `autonomous`), the explicitly scoped `auto_approve_local` Loose-mode flag, tool-scope controls (`allowed_tools`, `disallowed_tools`), and an optional process-shared `ToolInvocationRateLimit` for outward side effects.
 - **Interacts with**: `ToolRegistry::tool_definitions_for_context`, `ToolRegistry::execute_call`, `tools/agentic.rs`
 
 ### `ToolInvocationRateLimit`
@@ -48,6 +48,7 @@ Defines the shared tool abstraction (`Tool` trait), typed tool I/O (`ToolOutput`
 
 ## Notes
 - Approval checks happen at registry execution time, not inside each tool.
+- `auto_approve_local` bypasses only `Autonomous` approval on filesystem/shell categories or tools declaring exclusively known local filesystem/process/draft effects; `Always`, unknown, network-write, identity/secrets, and semantic outbound actions retain host gates and quotas.
 - Semantic effect minimums are resolved in `effect_policy.rs`; a plugin's `requires_approval = false` cannot override a host minimum.
 - Session approvals (`grant_session_approval`) override the matching effect-policy gate only for the exact registered fingerprint; unknown tools are not pre-approved, every replacement/deregistration invalidates the grant even when the contract is unchanged, and grants are not persisted across restarts.
 - Tool availability can now be restricted per run context before the model sees function defs and again at execution time.

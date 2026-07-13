@@ -142,6 +142,7 @@ mod tests {
             username: "Ponderer".to_string(),
             conversation_id: None,
             autonomous: true,
+            auto_approve_local: false,
             allowed_tools: None,
             disallowed_tools: Vec::new(),
             outbound_action_rate_limit: None,

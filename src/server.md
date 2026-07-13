@@ -19,7 +19,7 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - **Notes**: Both states use HTTP 200 so an attached desktop treats a degraded-but-serving backend as the existing process rather than launching a duplicate. Authentication still applies in required mode.
 
 ### REST handlers (`/v1/...`)
-- **Does**: Provide CRUD-like operations for config/conversations/messages, scheduled jobs, process inspection, turn/tool-call/prompt inspection, plugin manifest discovery, pause/status/stop controls, direct private-chat-mode get/set control, and tool session-approval grants. Config updates normalize private-chat mode before save/reload and also reconfigure Telegram runtime state. Message enqueue also triggers an immediate agent wake signal.
+- **Does**: Provide CRUD-like operations for config/conversations/messages, scheduled jobs, process inspection, turn/tool-call/prompt inspection, plugin manifest discovery, pause/status/stop controls, explicit Loose-mode arming/disarming, direct private-chat-mode get/set control, and tool session-approval grants. Config updates normalize private-chat mode before save/reload and also reconfigure Telegram runtime state. Message enqueue also triggers an immediate agent wake signal.
 - **Interacts with**: `database.rs` chat + scheduled-job APIs, `process_registry.rs`, canonical `plugin_contract` manifests, and `agent` runtime control methods.
 
 ### Plugin routes (`/v1/plugins`, `/v1/plugins/status`)
@@ -77,8 +77,10 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - `PUT /v1/agent/pause` is preferred for explicit control; `POST /v1/agent/toggle-pause` remains for backward compatibility.
 - `GET/PUT /v1/agent/private-chat-mode` provides a narrow API for top-level Direct/Agentic toggles without requiring full config round-trips.
 - `POST /v1/agent/stop` requests immediate cancellation of in-flight agentic turns and aborts detached background subtasks.
+- `PUT /v1/agent/loose-mode` is the narrow deliberate arm/disarm surface. Arming enables the required ambient loop and unpauses cognition; disarming persists first and cancels the active generation so Loose work cannot immediately resume.
 - Scheduled-job CRUD routes now wake the agent loop immediately after create/update/delete so timing/config changes are applied without waiting for the next ambient/legacy sleep interval.
 - Config updates sanitize `private_chat_mode` (`agentic` or `direct`) before persisting and reloading runtime state.
+- Full config updates enforce the same Loose-mode lifecycle as the narrow route: armed Loose mode implies Ambient, newly armed cognition unpauses, and a settings-driven disarm cancels the active generation.
 - Config updates now also start/stop/restart the Telegram bot task when the Telegram token or authorized chat ID changes, so Telegram settings no longer require a backend restart to take effect.
 - Process routes only expose processes started through the tracked background shell path.
 - Websocket generation telemetry uses `generation_started`, `generation_metrics`, and `generation_finished` envelopes with a stable generation ID, typed source, optional conversation ID, and terminal outcome.

@@ -104,6 +104,11 @@ struct SetPauseRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct SetLooseModeRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct SetPrivateChatModeRequest {
     mode: String,
 }
@@ -132,6 +137,11 @@ struct SendMessageResponse {
 #[derive(Debug, Serialize)]
 struct PauseStateResponse {
     paused: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LooseModeResponse {
+    enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,6 +253,7 @@ pub async fn serve_backend(
             get(get_private_chat_mode).put(set_private_chat_mode),
         )
         .route("/agent/pause", put(set_pause))
+        .route("/agent/loose-mode", put(set_loose_mode))
         .route("/agent/toggle-pause", post(toggle_pause))
         .route("/agent/stop", post(stop_agent_turn))
         .route("/agent/tools/:tool_name/approve", post(approve_tool))
@@ -545,6 +556,10 @@ async fn update_config(
 ) -> Result<Json<AgentConfig>, (StatusCode, String)> {
     let mut new_config = new_config;
     new_config.private_chat_mode = normalize_private_chat_mode(&new_config.private_chat_mode);
+    if new_config.loose_mode {
+        new_config.enable_ambient_loop = true;
+    }
+    let previous_loose_mode = state.config.read().await.loose_mode;
     if let Err(error) = new_config.save() {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -555,6 +570,13 @@ async fn update_config(
     {
         let mut guard = state.config.write().await;
         *guard = new_config.clone();
+    }
+    if previous_loose_mode != new_config.loose_mode {
+        if new_config.loose_mode {
+            state.agent.set_paused(false).await;
+        } else {
+            state.agent.request_stop().await;
+        }
     }
     state
         .telegram_bot
@@ -937,6 +959,34 @@ async fn set_pause(
 ) -> Result<Json<PauseStateResponse>, (StatusCode, String)> {
     let paused = state.agent.set_paused(body.paused).await;
     Ok(Json(PauseStateResponse { paused }))
+}
+
+async fn set_loose_mode(
+    State(state): State<Arc<ServerState>>,
+    Json(body): Json<SetLooseModeRequest>,
+) -> Result<Json<LooseModeResponse>, (StatusCode, String)> {
+    let mut config = state.config.read().await.clone();
+    config.loose_mode = body.enabled;
+    if body.enabled {
+        // Loose mode is built on the Living Loop; arming it makes that dependency explicit.
+        config.enable_ambient_loop = true;
+    }
+    config.save().map_err(internal_error)?;
+    state.agent.reload_config(config.clone()).await;
+    {
+        let mut guard = state.config.write().await;
+        *guard = config;
+    }
+    if body.enabled {
+        state.agent.set_paused(false).await;
+    } else {
+        // Persist and apply disarm before cancellation so the next loop generation
+        // cannot immediately resume Loose work.
+        state.agent.request_stop().await;
+    }
+    Ok(Json(LooseModeResponse {
+        enabled: body.enabled,
+    }))
 }
 
 async fn toggle_pause(

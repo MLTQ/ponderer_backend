@@ -98,6 +98,9 @@ pub struct ToolContext {
     pub conversation_id: Option<String>,
     /// Whether the tool is running in autonomous mode (vs interactive with user present)
     pub autonomous: bool,
+    /// Armed Loose mode may bypass `Autonomous` approval for host-classified
+    /// local filesystem/process effects. `Always` and outbound effects remain gated.
+    pub auto_approve_local: bool,
     /// If set, only these tool names are callable in this context (case-insensitive)
     pub allowed_tools: Option<Vec<String>>,
     /// Tool names that are not callable in this context (case-insensitive)
@@ -510,7 +513,7 @@ impl ToolRegistry {
             };
         }
 
-        let (tool, effect_policy, session_ok) = {
+        let (tool, category, effect_policy, session_ok) = {
             let state = self.state.read().await;
             let Some(registered) = state.tools.get(&call.name) else {
                 return ToolCallResult {
@@ -524,13 +527,29 @@ impl ToolRegistry {
                 .is_some_and(|approved| approved == &registered.authorization_fingerprint);
             (
                 Arc::clone(&registered.tool),
+                registered.tool.category(),
                 registered.effect_policy.clone(),
                 session_ok,
             )
         };
 
         // Check the host minimum (skip only if the user granted a session approval).
-        if effect_policy.requires_approval(ctx.autonomous) && !session_ok {
+        let has_only_local_effects = !effect_policy.effects.is_empty()
+            && effect_policy.effects.iter().all(|effect| {
+                matches!(
+                    effect.as_str(),
+                    effect_policy::EFFECT_FILESYSTEM_READ
+                        | effect_policy::EFFECT_FILESYSTEM_WRITE
+                        | effect_policy::EFFECT_PROCESS_EXECUTE
+                        | effect_policy::EFFECT_PLUGIN_DRAFT_WRITE
+                )
+            });
+        let loose_local_ok = ctx.auto_approve_local
+            && effect_policy.approval == ToolApprovalMinimum::Autonomous
+            && !effect_policy.is_outbound_action()
+            && (matches!(category, ToolCategory::FileSystem | ToolCategory::Shell)
+                || has_only_local_effects);
+        if effect_policy.requires_approval(ctx.autonomous) && !session_ok && !loose_local_ok {
             let scope = match effect_policy.approval {
                 ToolApprovalMinimum::Always => "for this effect",
                 ToolApprovalMinimum::Autonomous => "in autonomous mode",
@@ -756,6 +775,7 @@ mod tests {
             username: "test".to_string(),
             conversation_id: None,
             autonomous: false,
+            auto_approve_local: false,
             allowed_tools: None,
             disallowed_tools: Vec::new(),
             outbound_action_rate_limit: None,
@@ -838,6 +858,63 @@ mod tests {
         ctx.autonomous = false;
         let result = registry.execute_call(&call, &ctx).await;
         assert!(result.output.is_success());
+    }
+
+    #[tokio::test]
+    async fn loose_context_auto_approves_local_but_not_outbound_effects() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(DangerousTool)).await;
+        registry
+            .register(Arc::new(SemanticPublishTool::new(
+                effect_policy::EFFECT_EXTERNAL_PUBLISH,
+            )))
+            .await;
+        registry
+            .register(Arc::new(SemanticPublishTool::new(
+                effect_policy::EFFECT_FILESYSTEM_WRITE,
+            )))
+            .await;
+        let mut ctx = test_ctx();
+        ctx.autonomous = true;
+        ctx.auto_approve_local = true;
+
+        let local = registry
+            .execute_call(
+                &ToolCall {
+                    name: "dangerous".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                &ctx,
+            )
+            .await;
+        assert!(local.output.is_success());
+
+        let semantic_local = registry
+            .execute_call(
+                &ToolCall {
+                    name: "semantic_publish".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                &ctx,
+            )
+            .await;
+        assert!(semantic_local.output.is_success());
+
+        registry
+            .register(Arc::new(SemanticPublishTool::new(
+                effect_policy::EFFECT_EXTERNAL_PUBLISH,
+            )))
+            .await;
+        let outward = registry
+            .execute_call(
+                &ToolCall {
+                    name: "semantic_publish".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                &ctx,
+            )
+            .await;
+        assert!(matches!(outward.output, ToolOutput::NeedsApproval { .. }));
     }
 
     #[tokio::test]

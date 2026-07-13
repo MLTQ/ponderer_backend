@@ -15,6 +15,7 @@ pub enum IntentionOrigin {
     ExternalEvent,
     Heartbeat,
     Dream,
+    SelfAuthored,
     System,
 }
 
@@ -27,6 +28,7 @@ impl IntentionOrigin {
             Self::ExternalEvent => "external_event",
             Self::Heartbeat => "heartbeat",
             Self::Dream => "dream",
+            Self::SelfAuthored => "self_authored",
             Self::System => "system",
         }
     }
@@ -39,6 +41,7 @@ impl IntentionOrigin {
             "external_event" => Some(Self::ExternalEvent),
             "heartbeat" => Some(Self::Heartbeat),
             "dream" => Some(Self::Dream),
+            "self_authored" => Some(Self::SelfAuthored),
             "system" => Some(Self::System),
             _ => None,
         }

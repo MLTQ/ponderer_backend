@@ -7,6 +7,7 @@ pub enum AgentCapabilityProfile {
     Scheduled,
     Background,
     SelfDirected,
+    Loose,
     SkillEvents,
     Heartbeat,
     Ambient,
@@ -16,6 +17,7 @@ pub enum AgentCapabilityProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCapabilityPolicy {
     pub autonomous: bool,
+    pub auto_approve_local: bool,
     pub allowed_tools: Option<Vec<String>>,
     pub disallowed_tools: Vec<String>,
 }
@@ -27,6 +29,7 @@ impl ToolCapabilityPolicy {
             username,
             conversation_id: None,
             autonomous: self.autonomous,
+            auto_approve_local: self.auto_approve_local,
             allowed_tools: self.allowed_tools,
             disallowed_tools: self.disallowed_tools,
             outbound_action_rate_limit: None,
@@ -55,6 +58,7 @@ pub fn resolve_capability_policy(
         AgentCapabilityProfile::Scheduled => &config.scheduled,
         AgentCapabilityProfile::Background => &config.background,
         AgentCapabilityProfile::SelfDirected => &config.self_directed,
+        AgentCapabilityProfile::Loose => &config.loose,
         AgentCapabilityProfile::SkillEvents => &config.skill_events,
         AgentCapabilityProfile::Heartbeat => &config.heartbeat,
         AgentCapabilityProfile::Ambient => &config.ambient,
@@ -67,6 +71,7 @@ fn default_policy(profile: AgentCapabilityProfile) -> ToolCapabilityPolicy {
     match profile {
         AgentCapabilityProfile::PrivateChat => ToolCapabilityPolicy {
             autonomous: false,
+            auto_approve_local: false,
             allowed_tools: None,
             // Interactive requests may use installed tools; semantic effect policy
             // still supplies host minimums for sensitive operations.
@@ -76,21 +81,31 @@ fn default_policy(profile: AgentCapabilityProfile) -> ToolCapabilityPolicy {
         | AgentCapabilityProfile::Background
         | AgentCapabilityProfile::SelfDirected => ToolCapabilityPolicy {
             autonomous: true,
+            auto_approve_local: false,
+            allowed_tools: None,
+            disallowed_tools: Vec::new(),
+        },
+        AgentCapabilityProfile::Loose => ToolCapabilityPolicy {
+            autonomous: true,
+            auto_approve_local: true,
             allowed_tools: None,
             disallowed_tools: Vec::new(),
         },
         AgentCapabilityProfile::SkillEvents => ToolCapabilityPolicy {
             autonomous: true,
+            auto_approve_local: false,
             allowed_tools: None,
             disallowed_tools: Vec::new(),
         },
         AgentCapabilityProfile::Heartbeat => ToolCapabilityPolicy {
             autonomous: true,
+            auto_approve_local: false,
             allowed_tools: None,
             disallowed_tools: vec![],
         },
         AgentCapabilityProfile::Ambient => ToolCapabilityPolicy {
             autonomous: true,
+            auto_approve_local: false,
             allowed_tools: None,
             // Destructive file/shell ops and media generation remain off in ambient mode.
             disallowed_tools: vec![
@@ -103,6 +118,7 @@ fn default_policy(profile: AgentCapabilityProfile) -> ToolCapabilityPolicy {
         },
         AgentCapabilityProfile::Dream => ToolCapabilityPolicy {
             autonomous: true,
+            auto_approve_local: false,
             allowed_tools: Some(vec![
                 "search_memory".to_string(),
                 "write_memory".to_string(),
@@ -228,6 +244,17 @@ mod tests {
     }
 
     #[test]
+    fn loose_profile_is_broad_autonomous_and_locally_self_authorizing() {
+        let cfg = AgentConfig::default();
+        let policy =
+            resolve_capability_policy(AgentCapabilityProfile::Loose, &cfg.capability_profiles);
+        assert!(policy.autonomous);
+        assert!(policy.auto_approve_local);
+        assert!(policy.allowed_tools.is_none());
+        assert!(policy.disallowed_tools.is_empty());
+    }
+
+    #[test]
     fn ambient_profile_is_read_oriented_by_default() {
         let cfg = AgentConfig::default();
         let policy =
@@ -292,6 +319,7 @@ mod tests {
         );
 
         assert!(ctx.autonomous);
+        assert!(!ctx.auto_approve_local);
         assert_eq!(ctx.allowed_tools, Some(vec!["external_reply".to_string()]));
         assert_eq!(ctx.disallowed_tools, Vec::<String>::new());
     }

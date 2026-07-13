@@ -46,6 +46,8 @@ pub struct CapabilityProfileConfig {
     #[serde(default)]
     pub self_directed: CapabilityProfileOverride,
     #[serde(default)]
+    pub loose: CapabilityProfileOverride,
+    #[serde(default)]
     pub skill_events: CapabilityProfileOverride,
     #[serde(default)]
     pub heartbeat: CapabilityProfileOverride,
@@ -100,6 +102,15 @@ pub struct AgentConfig {
     pub loop_heat_cooldown: u32,
     #[serde(default = "default_enabled")]
     pub enable_ambient_loop: bool,
+    /// Explicitly armed dedicated-machine autonomy. Each episode remains bounded.
+    #[serde(default)]
+    pub loose_mode: bool,
+    #[serde(default = "default_loose_episode_interval_secs")]
+    pub loose_episode_interval_secs: u64,
+    #[serde(default = "default_loose_max_consecutive_episodes")]
+    pub loose_max_consecutive_episodes: u32,
+    #[serde(default = "default_loose_cooldown_secs")]
+    pub loose_cooldown_secs: u64,
     #[serde(default = "default_ambient_min_interval_secs")]
     pub ambient_min_interval_secs: u64,
     #[serde(default = "default_enabled")]
@@ -252,8 +263,26 @@ fn default_ambient_min_interval_secs() -> u64 {
     30
 }
 
+fn default_loose_episode_interval_secs() -> u64 {
+    2
+}
+
+fn default_loose_max_consecutive_episodes() -> u32 {
+    8
+}
+
+fn default_loose_cooldown_secs() -> u64 {
+    300
+}
+
 fn default_enabled() -> bool {
     true
+}
+
+fn parse_env_bool(value: &str) -> bool {
+    value.eq_ignore_ascii_case("1")
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
 }
 
 fn default_journal_min_interval_secs() -> u64 {
@@ -309,6 +338,10 @@ impl Default for AgentConfig {
             loop_signature_window: default_loop_signature_window(),
             loop_heat_cooldown: default_loop_heat_cooldown(),
             enable_ambient_loop: true,
+            loose_mode: false,
+            loose_episode_interval_secs: default_loose_episode_interval_secs(),
+            loose_max_consecutive_episodes: default_loose_max_consecutive_episodes(),
+            loose_cooldown_secs: default_loose_cooldown_secs(),
             ambient_min_interval_secs: default_ambient_min_interval_secs(),
             enable_journal: true,
             journal_min_interval_secs: default_journal_min_interval_secs(),
@@ -512,6 +545,28 @@ impl AgentConfig {
                 || enabled.eq_ignore_ascii_case("true")
                 || enabled.eq_ignore_ascii_case("yes");
             config.enable_ambient_loop = enabled;
+        }
+
+        if let Ok(enabled) = env::var("AGENT_LOOSE_MODE") {
+            config.loose_mode = parse_env_bool(&enabled);
+        }
+
+        if let Ok(interval) = env::var("AGENT_LOOSE_EPISODE_INTERVAL_SECS") {
+            if let Ok(seconds) = interval.parse() {
+                config.loose_episode_interval_secs = seconds;
+            }
+        }
+
+        if let Ok(limit) = env::var("AGENT_LOOSE_MAX_CONSECUTIVE_EPISODES") {
+            if let Ok(episodes) = limit.parse() {
+                config.loose_max_consecutive_episodes = episodes;
+            }
+        }
+
+        if let Ok(cooldown) = env::var("AGENT_LOOSE_COOLDOWN_SECS") {
+            if let Ok(seconds) = cooldown.parse() {
+                config.loose_cooldown_secs = seconds;
+            }
         }
 
         if let Ok(interval) = env::var("AGENT_AMBIENT_MIN_INTERVAL_SECS") {
@@ -736,6 +791,8 @@ mod tests {
         assert!(config.enable_journal);
         assert!(config.enable_concerns);
         assert!(config.enable_dream_cycle);
+        assert!(!config.loose_mode);
+        assert_eq!(config.loose_max_consecutive_episodes, 8);
         assert!(!config.enable_screen_capture_in_loop);
         assert!(!config.enable_camera_capture_tool);
         assert!(!config.enable_self_reflection);
@@ -748,5 +805,6 @@ mod tests {
         assert!(config.enable_journal);
         assert!(config.enable_concerns);
         assert!(config.enable_dream_cycle);
+        assert!(!config.loose_mode);
     }
 }

@@ -1,7 +1,7 @@
 # config.rs
 
 ## Purpose
-Defines all configuration for the Ponderer agent, including LLM connection, identity, polling behavior, agentic loop iteration controls, private-chat execution mode (`agentic` vs `direct`) and autonomous turn budgets, deterministic loop-breaker heat controls, living-loop toggles, heartbeat scheduling, per-loop tool capability profiles, plugin-owned settings blobs, screen/camera privacy gates, character card fields, and self-reflection settings. Supports loading from TOML files with environment variable fallback.
+Defines all configuration for the Ponderer agent, including LLM connection, identity, polling behavior, agentic loop iteration controls, private-chat execution mode (`agentic` vs `direct`) and autonomous turn budgets, deterministic loop-breaker heat controls, explicitly armed Loose mode and its episode cadence, living-loop toggles, heartbeat scheduling, per-loop tool capability profiles, plugin-owned settings blobs, screen/camera privacy gates, character card fields, and self-reflection settings. Supports loading from TOML files with environment variable fallback.
 
 ## Components
 
@@ -26,7 +26,7 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - **Interacts with**: `agent::reasoning` for deciding whether to reply
 
 ### `CapabilityProfileConfig` / `CapabilityProfileOverride`
-- **Does**: Declares optional per-loop tool policy overrides (`private_chat`, `scheduled`, `background`, `self_directed`, `skill_events`, `heartbeat`, `ambient`, `dream`) for allowlist/denylist replacement
+- **Does**: Declares optional per-loop tool policy overrides (`private_chat`, `scheduled`, `background`, `self_directed`, `loose`, `skill_events`, `heartbeat`, `ambient`, `dream`) for allowlist/denylist replacement
 - **Interacts with**: `agent::capability_profiles` policy resolver used by loop-level `ToolContext` construction
 
 ### `normalize_private_chat_mode`
@@ -60,5 +60,6 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - Memory evolution defaults: disabled, 24-hour interval, built-in replay trace set.
 - Capability profile overrides default to empty, so loop policies fall back to code-defined defaults.
 - Unattended scheduled, background, and self-directed profiles are independently configurable and always resolve to autonomous execution semantics.
+- Loose mode defaults off and is deliberately armed. Its default cadence permits eight immediate bounded episodes, then applies a five-minute cooldown before the same durable project continues.
 - Screen and camera capture tools default to disabled and must be explicitly enabled in settings.
 - Integration-specific legacy TOML keys are ignored during deserialization; their replacements live in plugin settings schemas.

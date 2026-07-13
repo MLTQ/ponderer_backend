@@ -1,7 +1,7 @@
 # capability_profiles.rs
 
 ## Purpose
-Defines explicit tool-capability profiles for interactive and unattended agent contexts (`private_chat`, `scheduled`, `background`, `self_directed`, `skill_events`, `heartbeat`, `ambient`, `dream`) and resolves config overrides into executable `ToolContext` policies.
+Defines explicit tool-capability profiles for interactive and unattended agent contexts (`private_chat`, `scheduled`, `background`, `self_directed`, `loose`, `skill_events`, `heartbeat`, `ambient`, `dream`) and resolves config overrides into executable `ToolContext` policies.
 
 ## Components
 
@@ -11,7 +11,7 @@ Defines explicit tool-capability profiles for interactive and unattended agent c
 - **Rationale**: Scheduled jobs, detached work, and self-directed work are separate autonomous profiles so none can inherit interactive authority or another loop's overrides.
 
 ### `ToolCapabilityPolicy`
-- **Does**: Holds resolved policy values (`autonomous`, allowlist, denylist) before conversion to `ToolContext`
+- **Does**: Holds resolved policy values (`autonomous`, `auto_approve_local`, allowlist, denylist) before conversion to `ToolContext`
 - **Interacts with**: `tools/mod.rs` runtime gating via `ToolContext::allows_tool`
 
 ### `resolve_capability_policy`
@@ -45,4 +45,5 @@ Defines explicit tool-capability profiles for interactive and unattended agent c
 - Profiles never hardcode domain plugin names. Outward and sensitive authority is
   derived from each tool's declared effects.
 - `scheduled`, `background`, and `self_directed` default to `autonomous=true`; approval-required tools remain blocked until the operator grants approval.
+- `loose` remains autonomous for provenance and quotas but auto-approves host-classified local filesystem/process effects. Always-gated identity/secrets effects and outbound publication remain gated.
 - Capability-built `ToolContext` values start without telemetry; `Agent` attaches the source-appropriate observer when a concrete run is created.

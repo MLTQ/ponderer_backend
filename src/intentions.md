@@ -10,7 +10,7 @@ An intention starts `pending`, is atomically `claimed` by one worker, and is rel
 
 ## Identity and provenance
 
-`IntentionOrigin` records why work entered the queue. `source_reference` gives the producer a stable idempotency key within an origin, and `related_concern_ids` links the work to the agent's existing concern model. Descriptive text is trimmed, related ids are normalized, and priority is constrained to `0.0..=1.0`.
+`IntentionOrigin` records why work entered the queue. `SelfAuthored` identifies a goal explicitly proposed and adopted during armed Loose mode, rather than merely inferred from prior reflection. `source_reference` gives the producer a stable idempotency key within an origin, and `related_concern_ids` links the work to the agent's existing concern model. Descriptive text is trimmed, related ids are normalized, and priority is constrained to `0.0..=1.0`.
 
 ## Update contract
 

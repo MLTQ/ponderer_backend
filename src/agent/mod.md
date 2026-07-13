@@ -14,6 +14,11 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: database CRUD/persistence methods plus ambient, Dream, self-directed, and engaged prompt assembly
 - **Rationale**: Durable experience should causally inform later model calls while prior generated self-description remains revisable rather than canonical
 
+### `loose_autonomy`
+- **Does**: Forms explicit self-authored goal seeds and parses per-episode continue/complete/block/abandon reports for armed Loose mode.
+- **Interacts with**: `maybe_run_self_directive`, durable intentions, generation telemetry, and the Loose capability profile.
+- **Rationale**: The agent receives an indefinite biography made of bounded, durable cognitive episodes rather than one unbounded invocation.
+
 ### `AgentState`
 - **Does**: Tracks in-memory runtime state (visual mode, pause flag, rolling outbound-action timestamps, processed event IDs)
 - **Interacts with**: `run_loop`, `run_cycle`, and UI-facing event emission
@@ -43,9 +48,14 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `maybe_update_orientation`, `execute_disposition`, `maybe_run_self_directive`, `maybe_run_heartbeat`, `ConcernsManager`
 
 ### `maybe_run_self_directive`
-- **Does**: Periodically claims at most one durable intention, executes one bounded self-directed micro-task when no operator messages or background subtasks are active, records retry/block/completion outcomes, emits telemetry, and persists autonomy summaries. Operator/private intentions are excluded from global temporal context and route any autonomous progress back only to their source conversation. Self-directed progress cannot terminally settle an operator request: it returns the exact intention to immediate engaged-loop eligibility for message reconciliation. Intentions synthesized by prior model output (`orientation_thought` and `dream`) use a memory-only profile rather than inheriting outward autonomous authority.
+- **Does**: Periodically claims at most one durable intention and executes one bounded self-directed micro-task when no operator messages or background subtasks are active. When Loose mode is armed and its self-authored queue is empty, a separate tool-free goal-forming call adopts one explicit durable goal; each subsequent episode reports continue/complete/block/abandon state, with immediate continuation and periodic cooldown. Operator/private intentions are excluded from global temporal context and route autonomous progress only to their source conversation. Self-directed progress cannot terminally settle an operator request. Intentions synthesized by prior reflection (`orientation_thought` and `dream`) remain memory-only rather than inheriting Loose authority.
 - **Interacts with**: `AgenticLoop`, `AgentDatabase` intention/concern/memory/activity-log APIs, `ToolRegistry` via its independent autonomous self-directed capability profile
 - **Rationale**: A 5-60 minute cadence derived from the ambient tick provides genuine self-triggering without spending an LLM call every few ambient observations.
+- **Rationale**: Normal self-direction retains its bounded cadence; armed Loose mode gets an indefinite biography through durable re-triggering, never through an unbounded invocation.
+
+### `AgentRuntimeStatus` / `RuntimeIntentionSummary`
+- **Does**: Exposes visual/cancellation state plus whether Loose mode is armed and the current or next durable intention's motive, lifecycle, attempts, and last outcome.
+- **Interacts with**: `server.rs` status/health payloads and the frontend Mind panel.
 
 ### `maybe_run_heartbeat`
 - **Does**: Schedules autonomous heartbeat cycles, reads pending checklist/reminder signals, and invokes the tool-calling loop only when work exists
