@@ -20,8 +20,8 @@ Working memory CRUD, conversation-scoped memory context, memory design versionin
 - `set_working_memory` / `get_working_memory` / `get_all_working_memory` / `delete_working_memory` — delegate to `MemoryBackend`
 - `search_working_memory` — ranked text search over key/content with multi-term scoring
 - `append_daily_activity_log` — accumulates timestamped lines into date-keyed activity log entries
-- `get_working_memory_context` — formats all entries as `## Your Working Memory` section
-- `get_working_memory_context_for_conversation` — conversation-scoped variant: filters activity log lines to the conversation's tag, truncates to `max_chars`
+- `get_working_memory_context` — formats ordinary entries as `## Your Working Memory` while excluding one-shot private handoff keys
+- `get_working_memory_context_for_conversation` — conversation-scoped variant: filters activity log lines to the conversation's tag, excludes every handoff key (handoffs have a separate exact-key injection path), and truncates to `max_chars`
 
 ## Contracts
 | Dependent | Expects |
@@ -35,3 +35,4 @@ Working memory CRUD, conversation-scoped memory context, memory design versionin
 - `promotion_decisions` enforces `rollback_design_id` / `rollback_schema_version` as NOT NULL to ensure every decision includes an explicit fallback target
 - Memory design metadata is stored in `agent_state` under `MEMORY_DESIGN_STATE_KEY` and `MEMORY_SCHEMA_VERSION_STATE_KEY`
 - Activity log filtering uses `short_conversation_tag` (first 12 chars of conversation ID) for compact line tagging
+- `session-handoff` and `session-handoff:*` entries never enter generic working-memory hydration; private chat reads and clears only its exact scoped key before prompt assembly.

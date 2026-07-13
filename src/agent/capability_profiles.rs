@@ -4,6 +4,9 @@ use crate::tools::ToolContext;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentCapabilityProfile {
     PrivateChat,
+    Scheduled,
+    Background,
+    SelfDirected,
     SkillEvents,
     Heartbeat,
     Ambient,
@@ -18,13 +21,15 @@ pub struct ToolCapabilityPolicy {
 }
 
 impl ToolCapabilityPolicy {
-    fn to_tool_context(self, working_directory: String, username: String) -> ToolContext {
+    fn into_tool_context(self, working_directory: String, username: String) -> ToolContext {
         ToolContext {
             working_directory,
             username,
+            conversation_id: None,
             autonomous: self.autonomous,
             allowed_tools: self.allowed_tools,
             disallowed_tools: self.disallowed_tools,
+            outbound_action_rate_limit: None,
         }
     }
 }
@@ -36,7 +41,7 @@ pub fn build_tool_context_for_profile(
     username: String,
 ) -> ToolContext {
     resolve_capability_policy(profile, &config.capability_profiles)
-        .to_tool_context(working_directory, username)
+        .into_tool_context(working_directory, username)
 }
 
 pub fn resolve_capability_policy(
@@ -46,6 +51,9 @@ pub fn resolve_capability_policy(
     let default_policy = default_policy(profile);
     let override_cfg = match profile {
         AgentCapabilityProfile::PrivateChat => &config.private_chat,
+        AgentCapabilityProfile::Scheduled => &config.scheduled,
+        AgentCapabilityProfile::Background => &config.background,
+        AgentCapabilityProfile::SelfDirected => &config.self_directed,
         AgentCapabilityProfile::SkillEvents => &config.skill_events,
         AgentCapabilityProfile::Heartbeat => &config.heartbeat,
         AgentCapabilityProfile::Ambient => &config.ambient,
@@ -62,6 +70,13 @@ fn default_policy(profile: AgentCapabilityProfile) -> ToolCapabilityPolicy {
             // Graphchan tools are allowed in private chat so the operator can explicitly
             // direct posts. Spontaneous posting is discouraged via the system prompt.
             disallowed_tools: vec![],
+        },
+        AgentCapabilityProfile::Scheduled
+        | AgentCapabilityProfile::Background
+        | AgentCapabilityProfile::SelfDirected => ToolCapabilityPolicy {
+            autonomous: true,
+            allowed_tools: None,
+            disallowed_tools: Vec::new(),
         },
         AgentCapabilityProfile::SkillEvents => ToolCapabilityPolicy {
             autonomous: true,
@@ -171,6 +186,52 @@ mod tests {
             .iter()
             .any(|tool| tool.eq_ignore_ascii_case("graphchan_skill")));
         assert!(policy.allowed_tools.is_none());
+    }
+
+    #[test]
+    fn unattended_execution_profiles_are_always_autonomous() {
+        let cfg = AgentConfig::default();
+
+        for profile in [
+            AgentCapabilityProfile::Scheduled,
+            AgentCapabilityProfile::Background,
+            AgentCapabilityProfile::SelfDirected,
+        ] {
+            let policy = resolve_capability_policy(profile, &cfg.capability_profiles);
+            assert!(
+                policy.autonomous,
+                "{profile:?} must gate approval-required tools"
+            );
+            assert!(policy.allowed_tools.is_none());
+        }
+    }
+
+    #[test]
+    fn unattended_execution_profiles_have_independent_overrides() {
+        let mut cfg = AgentConfig::default();
+        cfg.capability_profiles.scheduled.disallowed_tools = Some(vec!["shell".to_string()]);
+        cfg.capability_profiles.background.allowed_tools = Some(vec!["search_memory".to_string()]);
+        cfg.capability_profiles.self_directed.disallowed_tools =
+            Some(vec!["post_to_graphchan".to_string()]);
+
+        let scheduled =
+            resolve_capability_policy(AgentCapabilityProfile::Scheduled, &cfg.capability_profiles);
+        let background =
+            resolve_capability_policy(AgentCapabilityProfile::Background, &cfg.capability_profiles);
+        let self_directed = resolve_capability_policy(
+            AgentCapabilityProfile::SelfDirected,
+            &cfg.capability_profiles,
+        );
+
+        assert_eq!(scheduled.disallowed_tools, vec!["shell".to_string()]);
+        assert_eq!(
+            background.allowed_tools,
+            Some(vec!["search_memory".to_string()])
+        );
+        assert_eq!(
+            self_directed.disallowed_tools,
+            vec!["post_to_graphchan".to_string()]
+        );
     }
 
     #[test]

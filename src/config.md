@@ -31,7 +31,7 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - **Interacts with**: `agent::reasoning` for deciding whether to reply
 
 ### `CapabilityProfileConfig` / `CapabilityProfileOverride`
-- **Does**: Declares optional per-loop tool policy overrides (`private_chat`, `skill_events`, `heartbeat`, `ambient`, `dream`) for allowlist/denylist replacement
+- **Does**: Declares optional per-loop tool policy overrides (`private_chat`, `scheduled`, `background`, `self_directed`, `skill_events`, `heartbeat`, `ambient`, `dream`) for allowlist/denylist replacement
 - **Interacts with**: `agent::capability_profiles` policy resolver used by loop-level `ToolContext` construction
 
 ### `normalize_private_chat_mode`
@@ -56,13 +56,15 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - `database_path` is normalized to an executable-directory absolute runtime path on load, and converted back to a portable relative path when saving TOML.
 - `plugin_settings` is intentionally schema-agnostic at the config layer; validation lives in plugin manifests and runtime bundle loaders.
 - Default LLM is `llama3.2` at `localhost:11434` (Ollama).
-- Living-loop defaults keep phase-5 architecture opt-in (`enable_ambient_loop=false`, `enable_dream_cycle=false`), while `enable_journal`/`enable_concerns` default true for continuity.
+- Living-loop continuity is active by default: ambient orientation, journal/concerns, and bounded Dream are enabled for new configs and for older config files that omit those fields. Explicit `false` values remain respected.
+- Private sensors and formal persona evolution remain opt-in: screen/camera access and `enable_self_reflection` still default false.
 - Heartbeat defaults: disabled, 30-minute interval, checklist path `HEARTBEAT.md`.
 - Agentic loop defaults: max 10 tool-calling iterations per turn, with optional config to disable the limit entirely.
-- Private-chat mode default is `agentic`; `direct` is a single-turn mode that still permits tool calls.
+- Private-chat mode default is `agentic`; `direct` is a single-turn mode that still permits tool calls and now uses the same tool-iteration setting path as normal chat.
 - Private-chat turn defaults: model-decided continuation (`disable_chat_turn_limit=true`, `disable_background_subtask_turn_limit=true`). Optional safety caps remain configurable at 4 foreground turns and 8 background turns when re-enabled.
 - Loop-breaker defaults: `loop_heat_threshold=20`, `loop_similarity_threshold=0.92`, `loop_signature_window=24`, `loop_heat_cooldown=1`.
 - Memory evolution defaults: disabled, 24-hour interval, built-in replay trace set.
 - Capability profile overrides default to empty, so loop policies fall back to code-defined defaults.
+- Unattended scheduled, background, and self-directed profiles are independently configurable and always resolve to autonomous execution semantics.
 - Screen and camera capture tools default to disabled and must be explicitly enabled in settings.
 - Default Graphchan URL derives from `GRAPHCHAN_PORT` env var if set.

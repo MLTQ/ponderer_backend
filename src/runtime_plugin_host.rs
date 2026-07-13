@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -22,6 +23,9 @@ use crate::tools::{ToolCategory, ToolOutput, ToolRegistry};
 const DEFAULT_MAX_CONTRIBUTION_CHARS: usize = 300;
 const DEFAULT_MAX_SLOT_TOTAL_CHARS: usize = 1_200;
 const MAX_NON_JSON_PLUGIN_LINES: usize = 256;
+const DEFAULT_RUNTIME_PLUGIN_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+const RUNTIME_PLUGIN_PROMPT_RPC_TIMEOUT: Duration = Duration::from_millis(250);
+const RUNTIME_PLUGIN_TOOL_RPC_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimePluginRpcRequest {
@@ -95,6 +99,8 @@ pub struct RuntimePluginCapabilities {
     pub event_hooks: Vec<String>,
     #[serde(default)]
     pub prompt_slots: Vec<String>,
+    #[serde(default)]
+    pub skill_polling: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +259,22 @@ pub struct RuntimePluginEventAck {
 pub struct RuntimePluginEventEffect {
     pub plugin_id: String,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePluginPollEvent {
+    pub id: String,
+    pub source: String,
+    pub author: String,
+    pub body: String,
+    #[serde(default)]
+    pub parent_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimePluginPollResponse {
+    #[serde(default)]
+    pub events: Vec<RuntimePluginPollEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,11 +457,16 @@ impl RuntimePluginHost {
             }
 
             let params = serde_json::to_value(event)?;
-            let mut client = plugin.client.lock().await;
-            match self
-                .call_plugin::<RuntimePluginEventAck>(&mut client, "plugin.handle_event", params)
+            let call_result = {
+                let mut client = plugin.client.lock().await;
+                self.call_plugin::<RuntimePluginEventAck>(
+                    &mut client,
+                    "plugin.handle_event",
+                    params,
+                )
                 .await
-            {
+            };
+            match call_result {
                 Ok(ack) => {
                     if let Some(summary) = ack.summary.filter(|summary| !summary.trim().is_empty())
                     {
@@ -488,15 +515,16 @@ impl RuntimePluginHost {
                 continue;
             }
 
-            let mut client = plugin.client.lock().await;
-            match self
-                .call_plugin::<RuntimePluginPromptResponse>(
+            let call_result = {
+                let mut client = plugin.client.lock().await;
+                self.call_plugin::<RuntimePluginPromptResponse>(
                     &mut client,
                     "plugin.get_prompt_contributions",
                     serde_json::to_value(query)?,
                 )
                 .await
-            {
+            };
+            match call_result {
                 Ok(response) => {
                     for mut contribution in response.contributions {
                         contribution.plugin_id = plugin.bundle.id().to_string();
@@ -578,6 +606,55 @@ impl RuntimePluginHost {
         Ok(convert_tool_result(result))
     }
 
+    pub async fn poll_plugin_events(&self) -> Result<Vec<crate::skills::SkillEvent>> {
+        let plugins = self
+            .loaded
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for plugin in plugins {
+            if !plugin.handshake.capabilities.skill_polling {
+                continue;
+            }
+            let call_result = {
+                let mut client = plugin.client.lock().await;
+                self.call_plugin::<RuntimePluginPollResponse>(
+                    &mut client,
+                    "plugin.poll_events",
+                    serde_json::json!({}),
+                )
+                .await
+            };
+            match call_result {
+                Ok(response) => {
+                    for event in response.events {
+                        events.push(crate::skills::SkillEvent::NewContent {
+                            id: event.id,
+                            source: event.source,
+                            author: event.author,
+                            body: event.body,
+                            parent_ids: event.parent_ids,
+                        });
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Runtime plugin '{}' poll_events failed: {}",
+                        plugin.bundle.id(),
+                        error
+                    );
+                    if Self::is_transport_error(&error) {
+                        self.deactivate_failed_plugin(plugin.bundle.id()).await;
+                    }
+                }
+            }
+        }
+        Ok(events)
+    }
+
     async fn start_plugin(
         &self,
         bundle: RuntimeProcessPluginBundle,
@@ -619,9 +696,16 @@ impl RuntimePluginHost {
             stdout: BufReader::new(stdout),
         };
 
-        let handshake: RuntimePluginHandshake = self
+        let handshake: RuntimePluginHandshake = match self
             .call_plugin(&mut client, "plugin.handshake", json!({}))
-            .await?;
+            .await
+        {
+            Ok(handshake) => handshake,
+            Err(error) => {
+                let _ = client.child.kill().await;
+                return Err(error);
+            }
+        };
         if handshake.id != bundle.id() {
             anyhow::bail!(
                 "Runtime plugin '{}' reported mismatched handshake id '{}'",
@@ -630,7 +714,10 @@ impl RuntimePluginHost {
             );
         }
 
-        self.configure_client(&mut client, &bundle, config).await?;
+        if let Err(error) = self.configure_client(&mut client, &bundle, config).await {
+            let _ = client.child.kill().await;
+            return Err(error);
+        }
 
         Ok(Arc::new(LoadedRuntimePlugin {
             bundle,
@@ -700,7 +787,7 @@ impl RuntimePluginHost {
                 json!({ "settings": settings.clone() }),
             )
             .await?;
-        let _: RuntimePluginEventAck = self
+        let settings_event_result: Result<RuntimePluginEventAck> = self
             .call_plugin(
                 client,
                 "plugin.handle_event",
@@ -709,8 +796,17 @@ impl RuntimePluginHost {
                     settings,
                 })?,
             )
-            .await
-            .unwrap_or_default();
+            .await;
+        if let Err(error) = settings_event_result {
+            if Self::is_transport_error(&error) {
+                return Err(error);
+            }
+            tracing::warn!(
+                "Runtime plugin '{}' rejected optional settings_changed event: {}",
+                bundle.id(),
+                error
+            );
+        }
         Ok(())
     }
 
@@ -790,6 +886,21 @@ impl RuntimePluginHost {
     }
 
     async fn call_plugin_raw(
+        &self,
+        client: &mut RuntimePluginClient,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        let timeout_duration = rpc_timeout_for_method(method);
+        await_rpc_with_timeout(
+            method,
+            timeout_duration,
+            self.call_plugin_raw_io(client, method, params),
+        )
+        .await
+    }
+
+    async fn call_plugin_raw_io(
         &self,
         client: &mut RuntimePluginClient,
         method: &str,
@@ -905,12 +1016,39 @@ impl RuntimePluginHost {
     fn is_transport_error(error: &anyhow::Error) -> bool {
         let message = format!("{error:#}").to_lowercase();
         message.contains("broken pipe")
+            || message.contains("runtime plugin transport timeout")
             || message.contains("closed stdout")
             || message.contains("failed to write runtime plugin request")
             || message.contains("failed to flush runtime plugin request")
             || message.contains("failed to read runtime plugin response")
             || message.contains("process exited")
             || message.contains("connection reset by peer")
+    }
+}
+
+fn rpc_timeout_for_method(method: &str) -> Duration {
+    match method {
+        "plugin.get_prompt_contributions" => RUNTIME_PLUGIN_PROMPT_RPC_TIMEOUT,
+        "plugin.invoke_tool" => RUNTIME_PLUGIN_TOOL_RPC_TIMEOUT,
+        _ => DEFAULT_RUNTIME_PLUGIN_RPC_TIMEOUT,
+    }
+}
+
+async fn await_rpc_with_timeout<T, F>(
+    method: &str,
+    timeout_duration: Duration,
+    operation: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(timeout_duration, operation).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "Runtime plugin transport timeout during '{}' after {}ms",
+            method,
+            timeout_duration.as_millis()
+        ),
     }
 }
 
@@ -1121,5 +1259,43 @@ mod tests {
         });
 
         assert!(matches!(output, ToolOutput::Error(message) if message == "boom"));
+    }
+
+    #[test]
+    fn rpc_timeout_policy_bounds_every_method_class() {
+        assert_eq!(
+            rpc_timeout_for_method("plugin.get_prompt_contributions"),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            rpc_timeout_for_method("plugin.invoke_tool"),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            rpc_timeout_for_method("plugin.poll_events"),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn rpc_timeout_is_classified_as_transport_failure() {
+        let error = anyhow::anyhow!(
+            "Runtime plugin transport timeout during 'plugin.poll_events' after 10000ms"
+        );
+        assert!(RuntimePluginHost::is_transport_error(&error));
+    }
+
+    #[tokio::test]
+    async fn rpc_timeout_bounds_a_stalled_transport_operation() {
+        let error =
+            await_rpc_with_timeout("plugin.poll_events", Duration::from_millis(10), async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok::<_, anyhow::Error>(Value::Null)
+            })
+            .await
+            .expect_err("stalled transport should time out");
+
+        assert!(RuntimePluginHost::is_transport_error(&error));
+        assert!(error.to_string().contains("plugin.poll_events"));
     }
 }

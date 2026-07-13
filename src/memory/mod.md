@@ -15,7 +15,7 @@ Defines the versioned memory backend contract for Ponderer and provides the base
 
 ### `eval` (submodule)
 - **Does**: Offline memory replay/evaluation harness with deterministic scoring and JSON reports
-- **Interacts with**: `MemoryBackend` trait for candidate comparison; future scheduler/archive tasks in ALMA-lite roadmap
+- **Interacts with**: `MemoryBackend` candidate comparison, the heartbeat-scheduled memory-evolution runner, and database archive/promotion persistence
 
 ### `MemoryDesignVersion`
 - **Does**: Identifies the active memory design (`design_id`) and schema version (`schema_version`)

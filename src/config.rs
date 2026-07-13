@@ -120,6 +120,12 @@ pub struct CapabilityProfileConfig {
     #[serde(default)]
     pub private_chat: CapabilityProfileOverride,
     #[serde(default)]
+    pub scheduled: CapabilityProfileOverride,
+    #[serde(default)]
+    pub background: CapabilityProfileOverride,
+    #[serde(default)]
+    pub self_directed: CapabilityProfileOverride,
+    #[serde(default)]
     pub skill_events: CapabilityProfileOverride,
     #[serde(default)]
     pub heartbeat: CapabilityProfileOverride,
@@ -176,17 +182,17 @@ pub struct AgentConfig {
     pub loop_signature_window: u32,
     #[serde(default = "default_loop_heat_cooldown")]
     pub loop_heat_cooldown: u32,
-    #[serde(default)]
+    #[serde(default = "default_enabled")]
     pub enable_ambient_loop: bool,
     #[serde(default = "default_ambient_min_interval_secs")]
     pub ambient_min_interval_secs: u64,
-    #[serde(default)]
+    #[serde(default = "default_enabled")]
     pub enable_journal: bool,
     #[serde(default = "default_journal_min_interval_secs")]
     pub journal_min_interval_secs: u64,
-    #[serde(default)]
+    #[serde(default = "default_enabled")]
     pub enable_concerns: bool,
-    #[serde(default)]
+    #[serde(default = "default_enabled")]
     pub enable_dream_cycle: bool,
     #[serde(default = "default_dream_min_interval_secs")]
     pub dream_min_interval_secs: u64,
@@ -346,6 +352,10 @@ fn default_ambient_min_interval_secs() -> u64 {
     30
 }
 
+fn default_enabled() -> bool {
+    true
+}
+
 fn default_journal_min_interval_secs() -> u64 {
     300
 }
@@ -399,12 +409,12 @@ impl Default for AgentConfig {
             loop_similarity_threshold: default_loop_similarity_threshold(),
             loop_signature_window: default_loop_signature_window(),
             loop_heat_cooldown: default_loop_heat_cooldown(),
-            enable_ambient_loop: false,
+            enable_ambient_loop: true,
             ambient_min_interval_secs: default_ambient_min_interval_secs(),
             enable_journal: true,
             journal_min_interval_secs: default_journal_min_interval_secs(),
             enable_concerns: true,
-            enable_dream_cycle: false,
+            enable_dream_cycle: true,
             dream_min_interval_secs: default_dream_min_interval_secs(),
             enable_heartbeat: false,
             heartbeat_interval_mins: default_heartbeat_interval_mins(),
@@ -822,4 +832,30 @@ fn normalize_portable_path(raw_path: &str, default_name: String) -> String {
     }
 
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn living_loop_is_alive_by_default_without_enabling_private_sensors() {
+        let config = AgentConfig::default();
+        assert!(config.enable_ambient_loop);
+        assert!(config.enable_journal);
+        assert!(config.enable_concerns);
+        assert!(config.enable_dream_cycle);
+        assert!(!config.enable_screen_capture_in_loop);
+        assert!(!config.enable_camera_capture_tool);
+        assert!(!config.enable_self_reflection);
+    }
+
+    #[test]
+    fn missing_living_loop_fields_deserialize_to_alive_defaults() {
+        let config: AgentConfig = toml::from_str("").expect("empty config uses serde defaults");
+        assert!(config.enable_ambient_loop);
+        assert!(config.enable_journal);
+        assert!(config.enable_concerns);
+        assert!(config.enable_dream_cycle);
+    }
 }

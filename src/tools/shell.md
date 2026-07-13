@@ -24,4 +24,4 @@ Provides the `shell` tool for command execution during agentic runs. It wraps `/
 ## Notes
 - Non-zero command exits still return `ToolOutput::Text` so the model can inspect stderr and recover.
 - Background mode returns structured JSON containing the tracked process snapshot instead of blocking on command completion.
-- Tests use the shared `ToolContext` policy fields (`allowed_tools`, `disallowed_tools`) introduced in registry-level gating.
+- Tests use an unscoped, unmetered `ToolContext` plus the shared allow/deny policy fields; conversation handoffs and outbound network quotas do not affect shell behavior.

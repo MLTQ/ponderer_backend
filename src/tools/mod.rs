@@ -18,15 +18,16 @@ pub mod runtime_plugin;
 pub mod safety;
 pub mod scheduled_jobs;
 pub mod shell;
-pub mod skill_bridge;
 pub mod vision;
 pub mod workflow_plugin;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Category of tool — used for grouping in UI and applying approval policies
@@ -88,12 +89,18 @@ pub struct ToolContext {
     pub working_directory: String,
     /// The agent's username (for attribution)
     pub username: String,
+    /// Conversation scope for tools that persist resumable private state.
+    pub conversation_id: Option<String>,
     /// Whether the tool is running in autonomous mode (vs interactive with user present)
     pub autonomous: bool,
     /// If set, only these tool names are callable in this context (case-insensitive)
     pub allowed_tools: Option<Vec<String>>,
     /// Tool names that are not callable in this context (case-insensitive)
     pub disallowed_tools: Vec<String>,
+    /// Optional shared rolling limiter for side-effecting tool invocations.
+    /// The registry reserves quota immediately before execution so a single
+    /// multi-call pass cannot race or overshoot a context-level visibility check.
+    pub outbound_action_rate_limit: Option<Arc<ToolInvocationRateLimit>>,
 }
 
 impl ToolContext {
@@ -111,6 +118,87 @@ impl ToolContext {
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(tool_name)),
             None => true,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ToolRateLimitEntry {
+    reserved_at: Instant,
+}
+
+/// A process-wide rolling limiter shared by every autonomous tool context.
+/// Reservations count from the moment a call is dispatched. They remain in the
+/// window even when the result is an error because a timeout or lost response
+/// cannot prove that a remote side effect did not occur. This closes concurrent-
+/// pass and same-pass quota overshoot without pushing policy into plugins.
+#[derive(Debug)]
+pub struct ToolInvocationRateLimit {
+    limited_tools: HashSet<String>,
+    max_actions: AtomicU32,
+    window: Duration,
+    entries: StdMutex<VecDeque<ToolRateLimitEntry>>,
+}
+
+impl ToolInvocationRateLimit {
+    pub fn new(limited_tools: &[&str], max_actions: u32, window: Duration) -> Self {
+        Self {
+            limited_tools: limited_tools
+                .iter()
+                .map(|name| name.trim().to_ascii_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect(),
+            max_actions: AtomicU32::new(max_actions),
+            window,
+            entries: StdMutex::new(VecDeque::new()),
+        }
+    }
+
+    pub fn set_max_actions(&self, max_actions: u32) {
+        self.max_actions.store(max_actions, Ordering::SeqCst);
+    }
+
+    pub fn active_count(&self) -> u32 {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.prune_locked(&mut entries, Instant::now());
+        entries.len().try_into().unwrap_or(u32::MAX)
+    }
+
+    fn try_reserve(&self, tool_name: &str) -> std::result::Result<(), ()> {
+        if !self
+            .limited_tools
+            .contains(&tool_name.trim().to_ascii_lowercase())
+        {
+            return Ok(());
+        }
+        let max_actions = self.max_actions.load(Ordering::SeqCst);
+        if max_actions == 0 {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.prune_locked(&mut entries, now);
+        if entries.len() >= max_actions as usize {
+            return Err(());
+        }
+
+        entries.push_back(ToolRateLimitEntry { reserved_at: now });
+        Ok(())
+    }
+
+    fn prune_locked(&self, entries: &mut VecDeque<ToolRateLimitEntry>, now: Instant) {
+        while entries
+            .front()
+            .is_some_and(|entry| now.duration_since(entry.reserved_at) >= self.window)
+        {
+            entries.pop_front();
         }
     }
 }
@@ -319,16 +407,31 @@ impl ToolRegistry {
             };
         }
 
-        // Execute the tool
-        match tool.execute(call.arguments.clone(), ctx).await {
-            Ok(output) => ToolCallResult {
-                name: call.name.clone(),
-                output,
-            },
-            Err(e) => ToolCallResult {
-                name: call.name.clone(),
-                output: ToolOutput::Error(format!("Tool execution failed: {}", e)),
-            },
+        if let Some(limit) = ctx.outbound_action_rate_limit.as_ref() {
+            match limit.try_reserve(&call.name) {
+                Ok(()) => {}
+                Err(()) => {
+                    let message = format!(
+                        "Tool '{}' is temporarily disabled by the rolling outbound-action limit",
+                        call.name
+                    );
+                    return ToolCallResult {
+                        name: call.name.clone(),
+                        output: ToolOutput::Error(message),
+                    };
+                }
+            }
+        }
+
+        // Execute after reserving. A failed/ambiguous response keeps its slot:
+        // only the remote system can know whether dispatch caused a side effect.
+        let output = match tool.execute(call.arguments.clone(), ctx).await {
+            Ok(output) => output,
+            Err(e) => ToolOutput::Error(format!("Tool execution failed: {}", e)),
+        };
+        ToolCallResult {
+            name: call.name.clone(),
+            output,
         }
     }
 
@@ -393,6 +496,31 @@ mod tests {
 
     struct DangerousTool;
 
+    struct FailingTool;
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn name(&self) -> &str {
+            "failing"
+        }
+
+        fn description(&self) -> &str {
+            "Always returns a structured failure"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput> {
+            Ok(ToolOutput::Error("deliberate failure".to_string()))
+        }
+    }
+
     #[async_trait]
     impl Tool for DangerousTool {
         fn name(&self) -> &str {
@@ -431,9 +559,11 @@ mod tests {
         ToolContext {
             working_directory: "/tmp".to_string(),
             username: "test".to_string(),
+            conversation_id: None,
             autonomous: false,
             allowed_tools: None,
             disallowed_tools: Vec::new(),
+            outbound_action_rate_limit: None,
         }
     }
 
@@ -512,6 +642,57 @@ mod tests {
         ctx.autonomous = false;
         let result = registry.execute_call(&call, &ctx).await;
         assert!(result.output.is_success());
+    }
+
+    #[tokio::test]
+    async fn rolling_limit_is_reserved_per_successful_invocation() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool)).await;
+        let mut ctx = test_ctx();
+        ctx.autonomous = true;
+        ctx.outbound_action_rate_limit = Some(Arc::new(ToolInvocationRateLimit::new(
+            &["echo"],
+            1,
+            Duration::from_secs(60),
+        )));
+        let call = ToolCall {
+            name: "echo".to_string(),
+            arguments: serde_json::json!({"message": "hello"}),
+        };
+
+        assert!(registry.execute_call(&call, &ctx).await.output.is_success());
+        let blocked = registry.execute_call(&call, &ctx).await;
+        assert!(!blocked.output.is_success());
+        assert!(blocked
+            .output
+            .to_llm_string()
+            .contains("rolling outbound-action limit"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_failure_retains_rolling_reservation() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(FailingTool)).await;
+        let limiter = Arc::new(ToolInvocationRateLimit::new(
+            &["failing"],
+            1,
+            Duration::from_secs(60),
+        ));
+        let mut ctx = test_ctx();
+        ctx.autonomous = true;
+        ctx.outbound_action_rate_limit = Some(Arc::clone(&limiter));
+        let call = ToolCall {
+            name: "failing".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        assert!(!registry.execute_call(&call, &ctx).await.output.is_success());
+        assert_eq!(limiter.active_count(), 1);
+        let retry = registry.execute_call(&call, &ctx).await;
+        assert!(retry
+            .output
+            .to_llm_string()
+            .contains("rolling outbound-action limit"));
     }
 
     #[tokio::test]

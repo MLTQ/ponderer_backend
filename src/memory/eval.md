@@ -40,14 +40,14 @@ Provides an offline, deterministic replay harness for benchmarking memory backen
 
 ### `load_trace_set(path)` / `write_report_json(report, path)`
 - **Does**: File I/O for machine-readable replay input and output artifacts
-- **Interacts with**: Future scheduled runner and archive/promotion tasks
+- **Interacts with**: Heartbeat-scheduled `Agent::maybe_run_memory_evolution` plus archive/promotion persistence
 
 ## Contracts
 
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
-| Future scheduler (`Ponderer-cpf.1.4`) | `evaluate_trace_set` is deterministic for identical inputs | Non-deterministic ranking/scoring |
-| Future design archive (`Ponderer-cpf.1.3`) | `MemoryEvalReport` is serializable JSON | Renaming/removing report fields |
+| `Agent::maybe_run_memory_evolution` | `evaluate_trace_set` is deterministic for identical inputs | Non-deterministic ranking/scoring |
+| Database design archive | `MemoryEvalReport` is serializable JSON | Renaming/removing report fields |
 | Candidate backend work (`Ponderer-cpf.1.5`) | `evaluate_shadow_against_kv` emits baseline-safe comparison data | Removing non-regression fields or baseline pairing behavior |
 
 ## Notes

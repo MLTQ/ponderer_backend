@@ -14,11 +14,11 @@ Adds memory-management tools the agent can call during the tool loop: searching 
 - **Interacts with**: `AgentDatabase::get_working_memory`, `AgentDatabase::set_working_memory`, `AgentDatabase::append_daily_activity_log`
 
 ### `WriteSessionHandoffTool`
-- **Does**: Implements `write_session_handoff`, writing a cross-session continuity note to the fixed key `session-handoff` in working memory. The note is injected at the very top of the next session's prompt context via `build_private_chat_agentic_prompt`.
-- **Interacts with**: `AgentDatabase::set_working_memory` using `SESSION_HANDOFF_KEY`; consumed by `agent/mod.rs` prompt assembly
+- **Does**: Implements `write_session_handoff`, writing a one-shot cross-session continuity note under a conversation-scoped key when `ToolContext` identifies a chat. The note is injected only into that conversation's next session prompt.
+- **Interacts with**: `AgentDatabase::set_working_memory`, `ToolContext::conversation_id`, `session_handoff_key`, and `agent/mod.rs` prompt assembly.
 
-### `SESSION_HANDOFF_KEY` (pub const)
-- **Does**: The fixed working-memory key (`"session-handoff"`) used by both the write tool and the prompt assembler.
+### `SESSION_HANDOFF_KEY` / `session_handoff_key`
+- **Does**: Defines the base key (`"session-handoff"`) and derives `session-handoff:<conversation_id>` for private chat continuity.
 - **Interacts with**: `WriteSessionHandoffTool`, `build_private_chat_agentic_prompt` in `agent/mod.rs`
 
 ### `PrivateChatModeTool`
@@ -48,13 +48,13 @@ Adds memory-management tools the agent can call during the tool loop: searching 
 | `runtime.rs` | Tools constructible via `MemorySearchTool::new`, `MemoryWriteTool::new`, `WriteSessionHandoffTool::new`, `PrivateChatModeTool::new`, `ScratchNoteTool::new` | Renaming tool structs or constructors |
 | LLM tool-calling | Tool names and parameter schemas remain stable (`search_memory`, `write_memory`, `write_session_handoff`, `private_chat_mode`, `scratch_note`) | Renaming tools or changing required params |
 | `database.rs` | Search/write APIs behave synchronously and return durable state | Changing DB API names or return semantics |
-| `agent/mod.rs` | `SESSION_HANDOFF_KEY` constant remains stable; `get_working_memory(SESSION_HANDOFF_KEY)` returns the handoff note | Renaming key or changing storage format |
+| `agent/mod.rs` | `session_handoff_key(Some(conversation_id))` matches the key written by the tool | Renaming key or changing scope semantics |
 
 ## Notes
 - `search_memory` clamps result count to 1-50 and requires a non-empty query.
 - `write_memory` appends a daily activity-log line on successful writes for longitudinal traceability.
-- `write_session_handoff` always overwrites the previous note — one clean note per wrap-up, not append.
+- `write_session_handoff` always overwrites the previous note for the same conversation — one clean note per wrap-up, not append.
 - `private_chat_mode` updates the runtime mode immediately through DB state and attempts to persist the same mode in TOML for restart continuity.
-- The handoff note is injected before all other context sections in `build_private_chat_agentic_prompt` so it's the first thing the agent reads on resumption.
+- A conversation's handoff note is injected before its other context sections, then cleared immediately; it is never consumed by another conversation.
 - `scratch_note` mode=clear sets the key to an empty string (filtered from context by the empty-content check in `get_working_memory_context_for_conversation`).
 - Distinct tool time horizons: scratchpad = current task; working memory = cross-task notes; handoff note = cross-session continuity.

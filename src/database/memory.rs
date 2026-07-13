@@ -475,6 +475,9 @@ impl AgentDatabase {
 
         let mut context = String::from("## Your Working Memory (Notes to Self)\n\n");
         for entry in entries {
+            if is_session_handoff_entry(&entry.key) {
+                continue;
+            }
             context.push_str(&format!("### {}\n{}\n\n", entry.key, entry.content));
         }
         Ok(context)
@@ -497,6 +500,9 @@ impl AgentDatabase {
 
         for entry in entries {
             if entry.content.trim().is_empty() {
+                continue;
+            }
+            if is_session_handoff_entry(&entry.key) {
                 continue;
             }
 
@@ -528,4 +534,8 @@ impl AgentDatabase {
 
         Ok(context)
     }
+}
+
+fn is_session_handoff_entry(key: &str) -> bool {
+    key == "session-handoff" || key.starts_with("session-handoff:")
 }

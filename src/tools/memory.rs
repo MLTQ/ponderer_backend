@@ -220,9 +220,17 @@ impl Tool for MemoryWriteTool {
     }
 }
 
-/// The fixed working-memory key used to store the cross-session handoff note.
+/// Base working-memory key used for conversation-scoped cross-session handoff notes.
 pub const SESSION_HANDOFF_KEY: &str = "session-handoff";
 pub const PRIVATE_CHAT_MODE_STATE_KEY: &str = "private-chat-mode";
+
+pub fn session_handoff_key(conversation_id: Option<&str>) -> String {
+    conversation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("{SESSION_HANDOFF_KEY}:{value}"))
+        .unwrap_or_else(|| SESSION_HANDOFF_KEY.to_string())
+}
 
 pub struct WriteSessionHandoffTool;
 
@@ -259,7 +267,7 @@ impl Tool for WriteSessionHandoffTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let content = match params.get("content").and_then(Value::as_str).map(str::trim) {
             Some(value) if !value.is_empty() => value,
             _ => {
@@ -274,7 +282,8 @@ impl Tool for WriteSessionHandoffTool {
             Err(e) => return Ok(ToolOutput::Error(e.to_string())),
         };
 
-        if let Err(e) = db.set_working_memory(SESSION_HANDOFF_KEY, content) {
+        let key = session_handoff_key(ctx.conversation_id.as_deref());
+        if let Err(e) = db.set_working_memory(&key, content) {
             return Ok(ToolOutput::Error(format!(
                 "Failed to save handoff note: {}",
                 e
@@ -283,6 +292,7 @@ impl Tool for WriteSessionHandoffTool {
 
         Ok(ToolOutput::Json(json!({
             "status": "ok",
+            "conversation_id": ctx.conversation_id.as_deref(),
             "message": "Handoff note saved. It will be injected at the top of your context when you return.",
         })))
     }
@@ -634,5 +644,23 @@ impl Tool for FlagUncertaintyTool {
 
     fn category(&self) -> ToolCategory {
         ToolCategory::General
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handoff_keys_are_conversation_scoped() {
+        assert_eq!(session_handoff_key(None), SESSION_HANDOFF_KEY);
+        assert_eq!(
+            session_handoff_key(Some("conversation-a")),
+            "session-handoff:conversation-a"
+        );
+        assert_ne!(
+            session_handoff_key(Some("conversation-a")),
+            session_handoff_key(Some("conversation-b"))
+        );
     }
 }

@@ -203,6 +203,10 @@ impl Tool for CreateScheduledJobTool {
     fn category(&self) -> ToolCategory {
         ToolCategory::Memory
     }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
 }
 
 pub struct UpdateScheduledJobTool;
@@ -308,6 +312,10 @@ impl Tool for UpdateScheduledJobTool {
     fn category(&self) -> ToolCategory {
         ToolCategory::Memory
     }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
 }
 
 pub struct DeleteScheduledJobTool;
@@ -377,5 +385,22 @@ impl Tool for DeleteScheduledJobTool {
 
     fn category(&self) -> ToolCategory {
         ToolCategory::Memory
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listing_jobs_is_read_only_but_mutations_require_approval() {
+        assert!(!ListScheduledJobsTool::new().requires_approval());
+        assert!(CreateScheduledJobTool::new().requires_approval());
+        assert!(UpdateScheduledJobTool::new().requires_approval());
+        assert!(DeleteScheduledJobTool::new().requires_approval());
     }
 }

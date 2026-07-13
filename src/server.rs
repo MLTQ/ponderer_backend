@@ -22,13 +22,14 @@ use crate::database::{
 };
 use crate::plugin::BackendPluginManifest;
 use crate::process_registry::{ProcessInfo, ProcessRegistry};
-use crate::runtime::BackendRuntime;
+use crate::runtime::{AgentLoopSupervisor, AgentLoopSupervisorStatus, BackendRuntime};
 use crate::scheduled_jobs::ScheduledJob;
 use crate::tools::memory::PRIVATE_CHAT_MODE_STATE_KEY;
 
 #[derive(Clone)]
 pub struct ServerState {
     pub agent: Arc<crate::agent::Agent>,
+    pub agent_supervisor: AgentLoopSupervisor,
     pub db: Arc<AgentDatabase>,
     pub auth: BackendAuthConfig,
     pub config: Arc<tokio::sync::RwLock<AgentConfig>>,
@@ -60,6 +61,8 @@ pub struct ApiEventEnvelope {
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
+    supervisor: AgentLoopSupervisorStatus,
+    agent_runtime: AgentRuntimeStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +168,7 @@ pub async fn serve_backend(
 
     let state = Arc::new(ServerState {
         agent: runtime.agent.clone(),
+        agent_supervisor: runtime.agent_supervisor.clone(),
         db,
         auth,
         config: Arc::new(tokio::sync::RwLock::new(runtime.config.clone())),
@@ -177,15 +181,15 @@ pub async fn serve_backend(
     spawn_event_bridge(event_rx, ws_events);
     telegram_bot
         .reconfigure(
-        state.clone(),
-        runtime
-            .config
-            .telegram_bot_token
-            .clone()
-            .unwrap_or_default(),
-        runtime.config.telegram_chat_id,
-    )
-    .await;
+            state.clone(),
+            runtime
+                .config
+                .telegram_bot_token
+                .clone()
+                .unwrap_or_default(),
+            runtime.config.telegram_chat_id,
+        )
+        .await;
     runtime.spawn_agent_loop();
 
     let protected = Router::new()
@@ -436,8 +440,22 @@ fn authorize(headers: &HeaderMap, auth: &BackendAuthConfig) -> Result<(), Status
     Ok(())
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+async fn health(State(state): State<Arc<ServerState>>) -> Json<HealthResponse> {
+    let supervisor = state.agent_supervisor.snapshot();
+    let agent_runtime = state.agent.runtime_status().await;
+    Json(HealthResponse {
+        status: health_status(&supervisor),
+        supervisor,
+        agent_runtime,
+    })
+}
+
+fn health_status(supervisor: &AgentLoopSupervisorStatus) -> &'static str {
+    if supervisor.active {
+        "ok"
+    } else {
+        "degraded"
+    }
 }
 
 async fn get_config(
@@ -1028,5 +1046,19 @@ mod tests {
         assert_eq!(envelope.event_type, "observation");
         assert_eq!(envelope.payload["text"], "hi");
         assert!(envelope.emitted_at <= Utc::now());
+    }
+
+    #[test]
+    fn health_is_ok_only_while_the_supervised_loop_is_active() {
+        let mut supervisor = AgentLoopSupervisorStatus::default();
+        assert_eq!(health_status(&supervisor), "degraded");
+
+        supervisor.active = true;
+        supervisor.generation = 1;
+        assert_eq!(health_status(&supervisor), "ok");
+
+        supervisor.active = false;
+        supervisor.last_error = Some("loop panic".to_string());
+        assert_eq!(health_status(&supervisor), "degraded");
     }
 }

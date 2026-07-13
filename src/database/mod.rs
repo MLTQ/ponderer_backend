@@ -11,6 +11,8 @@ mod helpers;
 
 pub mod chat;
 pub mod concerns;
+pub mod dream;
+pub mod intentions;
 pub mod journal;
 pub mod memory;
 pub mod orientation;
@@ -421,6 +423,51 @@ impl AgentDatabase {
             [],
         )?;
 
+        // Durable self-directed work, including restart-safe claim leases and outcomes.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS agent_intentions (
+                id TEXT PRIMARY KEY,
+                origin TEXT NOT NULL CHECK(origin IN (
+                    'orientation_thought', 'unfinished_goal', 'operator_request',
+                    'external_event', 'heartbeat', 'dream', 'system'
+                )),
+                status TEXT NOT NULL CHECK(status IN (
+                    'pending', 'claimed', 'blocked', 'completed', 'abandoned'
+                )),
+                summary TEXT NOT NULL,
+                motivation TEXT NOT NULL,
+                priority REAL NOT NULL CHECK(priority >= 0.0 AND priority <= 1.0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                due_at TEXT,
+                next_eligible_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+                last_attempt_at TEXT,
+                last_outcome TEXT,
+                last_outcome_at TEXT,
+                related_concern_ids_json TEXT NOT NULL DEFAULT '[]',
+                source_reference TEXT,
+                claimed_by TEXT,
+                claim_expires_at TEXT,
+                completed_at TEXT
+            )"#,
+            [],
+        )?;
+
+        // Bounded, revisable continuity artifacts produced by the private Dream pass.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS dream_consolidations (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                synthesis TEXT NOT NULL,
+                patterns_json TEXT NOT NULL,
+                unresolved_tensions_json TEXT NOT NULL,
+                continuities_json TEXT NOT NULL,
+                next_orientation_cues_json TEXT NOT NULL
+            )"#,
+            [],
+        )?;
+
         // Living Loop foundation: private journal entries.
         conn.execute(
             r#"CREATE TABLE IF NOT EXISTS journal_entries (
@@ -547,6 +594,22 @@ impl AgentDatabase {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due ON scheduled_jobs(enabled, next_run_at ASC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_intentions_eligible ON agent_intentions(status, next_eligible_at, due_at, priority DESC, created_at ASC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_intentions_origin_updated ON agent_intentions(origin, updated_at DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dream_consolidations_created_at ON dream_consolidations(created_at DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_intentions_source ON agent_intentions(origin, source_reference) WHERE source_reference IS NOT NULL AND TRIM(source_reference) <> ''",
             [],
         )?;
         conn.execute(
@@ -791,7 +854,7 @@ mod tests {
             .get_chat_history_for_conversation(&job.conversation_id, 8)
             .expect("load scheduled conversation history");
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].role, "operator");
+        assert_eq!(history[0].role, "scheduled");
         assert!(!history[0].processed);
         assert!(history[0]
             .content
@@ -916,6 +979,16 @@ mod tests {
             "Keep autonomous turns bounded to useful work.",
         )
         .expect("seed stable memory");
+        db.set_working_memory(
+            "session-handoff:73a4b73d-8589-4763-9e8f-a0a237225f8d",
+            "private continuation for this conversation",
+        )
+        .expect("seed same-conversation handoff");
+        db.set_working_memory(
+            "session-handoff:0fc67f06-da6d-42da-90fd-619ef8e9b6b2",
+            "private continuation for another conversation",
+        )
+        .expect("seed other-conversation handoff");
 
         let scoped = db
             .get_working_memory_context_for_conversation(conversation_id, 4000)
@@ -925,6 +998,10 @@ mod tests {
         assert!(!scoped.contains(&other_tag));
         assert!(scoped.contains("self-directive"));
         assert!(scoped.contains("project-brief"));
+        assert!(!scoped.contains("private continuation"));
+
+        let global = db.get_working_memory_context().expect("global context");
+        assert!(!global.contains("private continuation"));
 
         let _ = std::fs::remove_file(&path);
     }

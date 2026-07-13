@@ -10,7 +10,9 @@ src/database/
   mod.rs            - AgentDatabase struct, Connection handling, ensure_schema, migrations, schema helpers, get_state/set_state, tests
   chat.rs           - ChatSession, ChatConversation, ChatConversationSummary, ChatMessage, ChatTurn, ChatTurnToolCall, ChatTurnPhase, OodaTurnPacketRecord, all chat/OODA methods
   concerns.rs       - Concern methods (save_concern, get_concern, get_active_concerns, update_concern_salience, touch_concern, etc.)
+  dream.rs          - Append-oriented Dream consolidation persistence and latest/recent retrieval
   helpers.rs        - Private helper functions (short_conversation_tag, filter_activity_log_for_conversation, summarize_chat_message_for_context, extract_tagged_blocks, summarize_*_blocks, compact_whitespace, truncate_for_db_digest, outcome_to_db)
+  intentions.rs     - Durable intention CRUD, idempotent source creation, leased claims, outcome transitions, restart recovery
   journal.rs        - Journal methods (add_journal_entry, get_recent_journal, get_journal_for_context, search_journal)
   memory.rs         - Working memory CRUD, memory design version, archive/eval/promotion methods
   orientation.rs    - OrientationSnapshotRecord, PendingThoughtRecord, orientation snapshot and pending thought methods
@@ -43,7 +45,8 @@ See each submodule's `.md` file for detailed component documentation.
 | `server.rs` | Conversation fetch + diagnostics APIs (`get_chat_conversation`, `get_chat_conversation_summary`, `list_chat_turns_for_conversation`, `list_chat_turn_tool_calls`) remain available for REST routes | Renaming/removing these query methods or changing return semantics |
 | `memory::mod` | `MemoryBackend` trait and `MemoryDesignVersion` metadata keys remain stable | Changing backend trait signatures or metadata semantics |
 | `memory::archive` | Archive methods serialize/deserialize policy + metrics snapshots without loss | Changing JSON field contracts for policy/snapshot structs |
-| `agent::{journal, concerns}` | DB CRUD accepts/returns these typed records | Breaking type-field compatibility or db string mappings |
+| `agent::{journal, concerns, dream}` | DB CRUD accepts/returns these typed records | Breaking type-field compatibility or db string mappings |
+| Future orientation/self-work loops | Intention creation is source-idempotent; open intentions can be hydrated in one query; claims are exclusive leases; only the owner can record an outcome | Bypassing claim transitions or changing eligibility semantics |
 
 ## Notes
 - All timestamps stored as RFC 3339 strings in SQLite, parsed back to `chrono::DateTime<Utc>`.
@@ -52,9 +55,11 @@ See each submodule's `.md` file for detailed component documentation.
 - `ensure_schema()` also adds `chat_turns.prompt_text` and `chat_turns.system_prompt_text` in place for existing DBs so turn-level prompt inspection is backward-compatible.
 - Conversation compaction snapshots are stored in `chat_conversation_summaries` and updated opportunistically by the agent loop when message-count thresholds are exceeded.
 - Scheduled jobs live in their own additive `scheduled_jobs` table and create a dedicated chat conversation on insert so recurring runs retain thread-local history.
-- Living Loop ll.1 adds four additive tables: `journal_entries`, `concerns`, `orientation_snapshots`, `pending_thoughts_queue`.
+- Durable intentions live in the additive `agent_intentions` table. A partial unique index on `(origin, source_reference)` prevents replayed source events from duplicating work, while lease and eligibility indexes support restart-safe claiming.
+- Dream consolidations live in an additive append-oriented table so the latest revisable continuity artifact can causally inform later loops without overwriting history.
+- Living Loop ll.1 added `journal_entries`, `concerns`, `orientation_snapshots`, and the now-legacy `pending_thoughts_queue`; actionable thoughts use `agent_intentions` so they have claims, retries, outcomes, and restart recovery.
 - OODA continuity adds additive table `ooda_turn_packets` plus supporting indexes on `(conversation_id, created_at)` and `(turn_id)`.
-- Conversation-scoped working-memory context keeps stable notes while filtering noisy cross-conversation activity lines by conversation tag.
+- Conversation-scoped working-memory context keeps stable notes while filtering noisy cross-conversation activity lines by conversation tag. One-shot `session-handoff:*` entries are excluded from every generic context and consumed only through their exact conversation key.
 - Chat-context rendering now compacts metadata envelopes into concise tags so prompt windows avoid large embedded tool outputs.
 - Memory design metadata is stored in `agent_state` under `memory_design_id` and `memory_schema_version`.
 - Memory evolution archive uses three tables: `memory_design_archive`, `memory_eval_runs`, `memory_promotion_decisions`.

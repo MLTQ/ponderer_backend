@@ -22,9 +22,14 @@ Hosts subprocess-backed runtime plugins. It owns the JSON-RPC-over-stdio transpo
 - **Interacts with**: prompt builders across `agent/*`.
 
 ### `RuntimePluginHost`
-- **Does**: Discovers enabled runtime bundles, launches subprocesses, performs handshake/configure calls, registers proxy tools, dispatches lifecycle events, collects prompt contributions, and forwards tool invocations.
+- **Does**: Discovers enabled runtime bundles, launches subprocesses, performs bounded handshake/configure calls, registers proxy tools, dispatches lifecycle events, collects prompt contributions, and forwards tool invocations.
 - **Interacts with**: `runtime.rs`, `runtime_process_plugin.rs`, `tools/runtime_plugin.rs`, and `agent/mod.rs`.
 - **Rationale**: Caches the last seen `ToolRegistry` so transport failures can deactivate a dead plugin and deregister stale proxy tools instead of repeatedly surfacing broken-pipe errors.
+
+### Runtime RPC timeout policy
+- **Does**: Bounds the entire stdio transaction for every RPC, including request writes, newline write, flush, and response reads.
+- **Policy**: Prompt contributions use 250ms, normal control/event/poll RPCs use 10s, and potentially expensive tool invocations use 300s.
+- **Rationale**: Keeps latency-sensitive prompt assembly responsive while allowing bounded media/browser tools to run substantially longer than control-plane calls.
 
 ### Runtime tool result types
 - **Does**: `RuntimePluginToolInvocation`, `RuntimePluginToolResult`, and related enums define the narrow bridge between subprocess RPC and `ToolOutput`.
@@ -41,6 +46,7 @@ Hosts subprocess-backed runtime plugins. It owns the JSON-RPC-over-stdio transpo
 | Future runtime plugins | RPC envelopes stay `{id, method, params}` and `{id, ok, result?, error?}`; method names (`plugin.handshake`, `plugin.configure`, `plugin.handle_event`, `plugin.get_prompt_contributions`, `plugin.invoke_tool`) remain stable | Renaming core RPC fields or method names |
 | Prompt builders | `render_prompt_slot_addendum` remains additive-only, bounded, and deterministic | Changing ordering, labels, or cap semantics |
 | `agent/mod.rs` | `RuntimePluginHost::dispatch_event`, `collect_prompt_contributions`, and config reapply are callable even when no plugins are installed | Making no-plugin calls fail |
+| Always-on agent loop | Hung plugin stdio is converted into a recognizable transport timeout and the plugin is deactivated | Removing RPC deadlines or excluding a write/flush/read phase from the deadline |
 
 ## Notes
 - Runtime plugin failures are isolated: startup, event, or prompt-call failures are logged per plugin and do not fail the whole agent loop.
@@ -48,4 +54,6 @@ Hosts subprocess-backed runtime plugins. It owns the JSON-RPC-over-stdio transpo
 - The stdio transport now tolerates a bounded amount of non-JSON stdout noise before the first valid RPC response, which helps when third-party runtimes emit banners or environment chatter during startup.
 - Runtime plugins should be initialized from a long-lived Tokio runtime (the dedicated agent loop runtime) so plugin stdio/process resources are polled on the same runtime for their full lifetime.
 - Transport-layer plugin failures (broken pipe, closed stdout, process exit) now deactivate that plugin instance immediately, preventing stale stdio handles from producing repeated broken-pipe tool errors.
+- RPC deadline expiry is classified as a transport failure. Loaded plugins are deactivated and their proxy tools deregistered; startup failures also kill the partially initialized subprocess.
+- The client mutex is released before failure deactivation so cleanup cannot deadlock while reacquiring the failed plugin transport.
 - Plugin subprocess `stderr` is now piped into structured tracing logs (`target=runtime_plugin_stderr`) instead of being discarded, which makes model/runtime failures diagnosable without changing plugin transport behavior.

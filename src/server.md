@@ -10,8 +10,13 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - **Interacts with**: `runtime.rs` (`BackendRuntime`), `agent/mod.rs` (`AgentEvent`), `database.rs` (`AgentDatabase` chat APIs).
 
 ### `ServerState`
-- **Does**: Shared application state containing agent handle, DB handle, auth token, mutable config snapshot, shared process registry, plugin manifests, WS broadcaster, and the Telegram bot manager.
+- **Does**: Shared application state containing the agent handle, agent-loop supervisor health, DB handle, auth token, mutable config snapshot, shared process registry, plugin manifests, WS broadcaster, and the Telegram bot manager.
 - **Interacts with**: all route handlers, auth middleware, and `telegram.rs`.
+
+### `GET /v1/health`
+- **Does**: Returns top-level `ok` only while an agent-loop generation is active; otherwise returns `degraded`. The payload includes the complete supervisor snapshot and the agent's own runtime status.
+- **Interacts with**: `runtime.rs` (`AgentLoopSupervisorStatus`) and `Agent::runtime_status()`.
+- **Notes**: Both states use HTTP 200 so an attached desktop treats a degraded-but-serving backend as the existing process rather than launching a duplicate. Authentication still applies in required mode.
 
 ### REST handlers (`/v1/...`)
 - **Does**: Provide CRUD-like operations for config/conversations/messages, scheduled jobs, process inspection, turn/tool-call/prompt inspection, plugin manifest discovery, pause/status/stop controls, direct private-chat-mode get/set control, and tool session-approval grants. Config updates normalize private-chat mode before save/reload and also reconfigure Telegram runtime state. Message enqueue also triggers an immediate agent wake signal.
@@ -48,13 +53,13 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
-| Future API frontend client | Stable `/v1` routes and JSON payload structure for conversations/messages/turns/tools | Renaming routes or changing response schemas |
+| Future API frontend client | Stable `/v1` routes and JSON payload structure for conversations/messages/turns/tools; health remains HTTP-successful while the server can answer | Renaming routes, changing response schemas, or turning supervised-loop degradation into transport failure |
 | Backend operators | `PONDERER_BACKEND_BIND` and `PONDERER_BACKEND_TOKEN` env vars control bind + auth | Removing env var support or token requirement |
 | Event consumers | WS events contain `event_type`, `emitted_at`, and `payload` | Changing envelope shape or event-type names |
 | `agent/mod.rs` | `AgentEvent` variants can be mapped into API event payloads | Removing variants without updating mapping |
 
 ## Notes
-- `/v1/health` is authenticated in `required` mode, matching deny-by-default auth boundaries.
+- `/v1/health` is authenticated in `required` mode, matching deny-by-default auth boundaries. Its body reports `ok` or `degraded` from live supervisor state while retaining HTTP 200 in either case.
 - `/v1/plugins` exposes loaded plugin manifests (built-ins, discovered workflow bundles, discovered runtime-process bundles, and extension plugins) for client-side capability discovery, including optional settings-tab metadata and inline settings schemas for the desktop settings window.
 - Runtime-process plugins are initialized by `Agent::run_loop` on the dedicated agent runtime thread so plugin stdio/process handles and tool execution share one Tokio runtime context.
 - Message enqueue validates non-empty content and returns the created `message_id`.

@@ -156,11 +156,11 @@ impl TokenNoveltyTracker {
             .collect()
     }
 
-    fn ingest_provider_tokens(
-        &mut self,
-        tokens: Vec<TokenEmission>,
-    ) -> Vec<StreamingTokenMetric> {
-        tokens.into_iter().map(|token| self.score_token(token)).collect()
+    fn ingest_provider_tokens(&mut self, tokens: Vec<TokenEmission>) -> Vec<StreamingTokenMetric> {
+        tokens
+            .into_iter()
+            .map(|token| self.score_token(token))
+            .collect()
     }
 
     fn finish_pending(&mut self) -> Vec<StreamingTokenMetric> {
@@ -201,11 +201,7 @@ impl TokenNoveltyTracker {
         }
 
         if !current.is_empty() {
-            if combined
-                .chars()
-                .last()
-                .is_some_and(is_metric_word_char)
-            {
+            if combined.chars().last().is_some_and(is_metric_word_char) {
                 self.pending_fragment = current;
             } else {
                 tokens.push(current);
@@ -308,10 +304,7 @@ fn approx_entropy_from_top_logprobs(value: Option<&serde_json::Value>) -> Option
         return None;
     }
 
-    let max_logprob = logprobs
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max_logprob = logprobs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut weights = Vec::with_capacity(logprobs.len());
     let mut normalizer = 0.0f32;
     for logprob in logprobs {

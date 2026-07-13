@@ -16,7 +16,7 @@ Persistent scheduled job CRUD and atomic due-job dequeuing with chat message inj
 - `update_scheduled_job` — patches name/prompt/interval/enabled; re-advances `next_run_at` if interval changed or job re-enabled while overdue; updates conversation title to match new name
 - `delete_scheduled_job` — removes the job row (conversation is preserved)
 - `next_scheduled_job_due_at` — returns the earliest `next_run_at` among enabled jobs; used for sleep-cap in the agent loop
-- `take_due_scheduled_jobs` — atomically selects due jobs (within a transaction), injects an operator-style message into each job's conversation, advances `last_run_at` / `next_run_at`, and commits
+- `take_due_scheduled_jobs` — atomically selects due jobs (within a transaction), injects a `scheduled`-role message into each job's conversation, advances `last_run_at` / `next_run_at`, and commits
 
 ## Contracts
 | Dependent | Expects |

@@ -1,15 +1,20 @@
-use std::sync::Arc;
+use std::any::Any;
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use flume::Sender;
+use futures_util::FutureExt;
+use serde::Serialize;
 
 use crate::agent::{Agent, AgentEvent};
 use crate::config::AgentConfig;
 use crate::database::AgentDatabase;
-use crate::plugin::{
-    BackendPlugin, BackendPluginKind, BackendPluginManifest, PluginSettingsTabManifest,
-};
+
+use crate::plugin::{BackendPlugin, BackendPluginKind, BackendPluginManifest};
 use crate::process_registry::ProcessRegistry;
 use crate::runtime_plugin_host::RuntimePluginHost;
 use crate::runtime_process_plugin::RuntimeProcessPluginCatalog;
@@ -19,12 +24,63 @@ use crate::tools::ToolRegistry;
 pub struct BackendRuntime {
     pub config: AgentConfig,
     pub agent: Arc<Agent>,
+    pub agent_supervisor: AgentLoopSupervisor,
     pub tool_registry: Arc<ToolRegistry>,
     pub process_registry: Arc<ProcessRegistry>,
     pub runtime_plugin_host: Arc<RuntimePluginHost>,
     pub ui_database: Option<Arc<AgentDatabase>>,
     pub plugin_manifests: Vec<BackendPluginManifest>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct AgentLoopSupervisorStatus {
+    pub active: bool,
+    pub generation: u64,
+    pub restart_count: u64,
+    pub last_started_at: Option<DateTime<Utc>>,
+    pub last_exited_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct AgentLoopSupervisor {
+    status: Arc<RwLock<AgentLoopSupervisorStatus>>,
+}
+
+impl AgentLoopSupervisor {
+    pub fn snapshot(&self) -> AgentLoopSupervisorStatus {
+        self.status
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn mark_generation_started(&self) {
+        let mut status = self
+            .status
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if status.generation > 0 {
+            status.restart_count = status.restart_count.saturating_add(1);
+        }
+        status.generation = status.generation.saturating_add(1);
+        status.active = true;
+        status.last_started_at = Some(Utc::now());
+    }
+
+    fn mark_generation_exited(&self, error: String) {
+        let mut status = self
+            .status
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        status.active = false;
+        status.last_exited_at = Some(Utc::now());
+        status.last_error = Some(error);
+    }
+}
+
+const AGENT_RESTART_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const AGENT_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 pub struct BackendRuntimeBuilder {
     config: AgentConfig,
@@ -56,7 +112,7 @@ impl BackendRuntimeBuilder {
 
     pub fn build(self) -> Result<BackendRuntime> {
         let config = self.config;
-        let mut skill_list = build_builtin_skills(&config);
+        let mut skill_list: Vec<Box<dyn Skill>> = Vec::new();
         let tool_registry = Arc::new(ToolRegistry::new());
         let process_registry = Arc::new(ProcessRegistry::new());
         let runtime_process_plugins = Arc::new(RuntimeProcessPluginCatalog::discover()?);
@@ -70,9 +126,8 @@ impl BackendRuntimeBuilder {
             process_registry.clone(),
             self.event_tx.clone(),
         ))?;
-        init_rt.block_on(register_builtin_orbweaver_tools(tool_registry.clone()))?;
 
-        let mut manifests = vec![builtin_core_manifest(), builtin_orbweaver_manifest()];
+        let mut manifests = vec![builtin_core_manifest()];
         manifests.extend(runtime_process_plugins.manifests());
         for plugin in self.plugins {
             let manifest = plugin.manifest();
@@ -115,6 +170,7 @@ impl BackendRuntimeBuilder {
         Ok(BackendRuntime {
             config,
             agent,
+            agent_supervisor: AgentLoopSupervisor::default(),
             tool_registry,
             process_registry,
             runtime_plugin_host,
@@ -131,33 +187,67 @@ impl BackendRuntime {
 
     pub fn spawn_agent_loop(&self) -> JoinHandle<()> {
         let agent = self.agent.clone();
+        let supervisor = self.agent_supervisor.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("backend runtime thread");
-            rt.block_on(async {
-                if let Err(e) = agent.run_loop().await {
-                    tracing::error!("Agent loop error: {}", e);
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let error = format!("Failed to create agent Tokio runtime: {error}");
+                    supervisor.mark_generation_exited(error.clone());
+                    tracing::error!("{error}");
+                    return;
                 }
-            });
+            };
+            runtime.block_on(supervise_agent_loop(agent, supervisor));
         })
     }
 }
 
-fn build_builtin_skills(config: &AgentConfig) -> Vec<Box<dyn Skill>> {
-    let mut skill_list: Vec<Box<dyn Skill>> = Vec::new();
-    skill_list.extend(build_builtin_orbweaver_skills(config));
-    tracing::info!("Loaded {} built-in skill(s)", skill_list.len());
-    skill_list
+async fn supervise_agent_loop(agent: Arc<Agent>, supervisor: AgentLoopSupervisor) {
+    let mut consecutive_exits = 0_u64;
+    loop {
+        supervisor.mark_generation_started();
+        let outcome = AssertUnwindSafe(agent.clone().run_loop())
+            .catch_unwind()
+            .await;
+        let error = describe_agent_loop_exit(outcome);
+        supervisor.mark_generation_exited(error.clone());
+
+        consecutive_exits = consecutive_exits.saturating_add(1);
+        let backoff = agent_restart_backoff(consecutive_exits);
+        tracing::error!(
+            error = %error,
+            restart_in_seconds = backoff.as_secs(),
+            "Agent loop exited; supervisor will restart it"
+        );
+        tokio::time::sleep(backoff).await;
+    }
 }
 
-fn build_builtin_orbweaver_skills(config: &AgentConfig) -> Vec<Box<dyn Skill>> {
-    let mut skill_list: Vec<Box<dyn Skill>> = Vec::new();
-    if !config.graphchan_api_url.trim().is_empty() {
-        tracing::info!("Graphchan skill enabled: {}", config.graphchan_api_url);
-        skill_list.push(Box::new(crate::skills::graphchan::GraphchanSkill::new(
-            config.graphchan_api_url.clone(),
-        )));
+fn describe_agent_loop_exit(
+    outcome: std::result::Result<Result<()>, Box<dyn Any + Send>>,
+) -> String {
+    match outcome {
+        Ok(Ok(())) => "Agent loop exited unexpectedly without an error".to_string(),
+        Ok(Err(error)) => format!("Agent loop returned an error: {error:#}"),
+        Err(payload) => format!("Agent loop panicked: {}", panic_payload_message(&*payload)),
     }
-    skill_list
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("non-string panic payload")
+}
+
+fn agent_restart_backoff(consecutive_exit_count: u64) -> Duration {
+    let exponent = consecutive_exit_count.saturating_sub(1).min(5) as u32;
+    let multiplier = 1_u32 << exponent;
+    AGENT_RESTART_INITIAL_BACKOFF
+        .saturating_mul(multiplier)
+        .min(AGENT_RESTART_MAX_BACKOFF)
 }
 
 fn builtin_core_manifest() -> BackendPluginManifest {
@@ -192,27 +282,6 @@ fn builtin_core_manifest() -> BackendPluginManifest {
         ],
         provided_skills: Vec::new(),
         settings_tab: None,
-        settings_schema: None,
-    }
-}
-
-fn builtin_orbweaver_manifest() -> BackendPluginManifest {
-    BackendPluginManifest {
-        id: "builtin.orbweaver".to_string(),
-        kind: BackendPluginKind::Builtin,
-        name: "OrbWeaver".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        description: "Built-in OrbWeaver / Graphchan integration.".to_string(),
-        provided_tools: vec![
-            "post_to_graphchan".to_string(),
-            "graphchan_skill".to_string(),
-        ],
-        provided_skills: vec!["graphchan".to_string()],
-        settings_tab: Some(PluginSettingsTabManifest {
-            id: "skill.orbweaver".to_string(),
-            title: "OrbWeaver".to_string(),
-            order: 210,
-        }),
         settings_schema: None,
     }
 }
@@ -297,15 +366,69 @@ async fn register_builtin_core_tools(
     Ok(())
 }
 
-async fn register_builtin_orbweaver_tools(tool_registry: Arc<ToolRegistry>) -> Result<()> {
-    use crate::tools::{comfy::PostToGraphchanTool, skill_bridge::GraphchanSkillTool};
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    tool_registry
-        .register(Arc::new(PostToGraphchanTool::new()))
+    #[test]
+    fn restart_backoff_grows_exponentially_and_is_bounded() {
+        let delays = (1..=8)
+            .map(agent_restart_backoff)
+            .collect::<Vec<Duration>>();
+
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn supervisor_tracks_generation_restarts_and_last_exit() {
+        let supervisor = AgentLoopSupervisor::default();
+        assert_eq!(supervisor.snapshot(), AgentLoopSupervisorStatus::default());
+
+        supervisor.mark_generation_started();
+        let first_generation = supervisor.snapshot();
+        assert!(first_generation.active);
+        assert_eq!(first_generation.generation, 1);
+        assert_eq!(first_generation.restart_count, 0);
+        assert!(first_generation.last_started_at.is_some());
+
+        supervisor.mark_generation_exited("first failure".to_string());
+        let exited = supervisor.snapshot();
+        assert!(!exited.active);
+        assert!(exited.last_exited_at.is_some());
+        assert_eq!(exited.last_error.as_deref(), Some("first failure"));
+
+        supervisor.mark_generation_started();
+        let restarted = supervisor.snapshot();
+        assert!(restarted.active);
+        assert_eq!(restarted.generation, 2);
+        assert_eq!(restarted.restart_count, 1);
+        assert_eq!(restarted.last_error.as_deref(), Some("first failure"));
+    }
+
+    #[tokio::test]
+    async fn panic_is_converted_to_supervisor_error_text() {
+        let outcome = AssertUnwindSafe(async {
+            panic!("simulated agent panic");
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        })
+        .catch_unwind()
         .await;
-    tool_registry
-        .register(Arc::new(GraphchanSkillTool::new()))
-        .await;
-    tracing::info!("OrbWeaver plugin tools initialized");
-    Ok(())
+
+        let error = describe_agent_loop_exit(outcome);
+        assert!(error.contains("panicked"));
+        assert!(error.contains("simulated agent panic"));
+    }
 }

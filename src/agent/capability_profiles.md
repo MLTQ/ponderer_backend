@@ -1,13 +1,14 @@
 # capability_profiles.rs
 
 ## Purpose
-Defines explicit tool-capability profiles for agent loop contexts (`private_chat`, `skill_events`, `heartbeat`, `ambient`, `dream`) and resolves config overrides into executable `ToolContext` policies.
+Defines explicit tool-capability profiles for interactive and unattended agent contexts (`private_chat`, `scheduled`, `background`, `self_directed`, `skill_events`, `heartbeat`, `ambient`, `dream`) and resolves config overrides into executable `ToolContext` policies.
 
 ## Components
 
 ### `AgentCapabilityProfile`
 - **Does**: Enumerates the policy domains used by the agent loops
 - **Interacts with**: `agent/mod.rs` when constructing per-loop tool contexts
+- **Rationale**: Scheduled jobs, detached work, and self-directed work are separate autonomous profiles so none can inherit interactive authority or another loop's overrides.
 
 ### `ToolCapabilityPolicy`
 - **Does**: Holds resolved policy values (`autonomous`, allowlist, denylist) before conversion to `ToolContext`
@@ -19,7 +20,7 @@ Defines explicit tool-capability profiles for agent loop contexts (`private_chat
 - **Rationale**: Keeps policy semantics centralized and testable outside the main loop
 
 ### `build_tool_context_for_profile`
-- **Does**: Builds a ready-to-use `ToolContext` for a loop using resolved policy
+- **Does**: Builds a policy-ready `ToolContext` for a loop. Conversation identity and the shared outward-action limiter default to absent and are attached by the orchestrator for the concrete run.
 - **Interacts with**: `agent/mod.rs` heartbeat, skill-event, and private-chat flows
 
 ### Policy tests
@@ -39,3 +40,4 @@ Defines explicit tool-capability profiles for agent loop contexts (`private_chat
 - Tool names are normalized (trimmed, deduplicated case-insensitively) before policy application.
 - `ambient` defaults are read-oriented (blocks write/shell/posting/media-publish operations).
 - `dream` defaults are internal-memory-only via explicit allowlist (`search_memory`, `write_memory`).
+- `scheduled`, `background`, and `self_directed` default to `autonomous=true`; approval-required tools remain blocked until the operator grants approval.

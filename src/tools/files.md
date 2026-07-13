@@ -31,4 +31,4 @@ Implements filesystem-facing tools (`read_file`, `write_file`, `list_directory`,
 
 ## Notes
 - `MAX_READ_BYTES` and `MAX_LIST_ENTRIES` cap expensive operations.
-- Tests build `ToolContext` with default allow/deny lists to match registry policy changes.
+- Tests build an unscoped, unmetered `ToolContext` with default allow/deny lists; conversation scoping and outward-action quotas are registry/orchestrator concerns and do not change filesystem behavior.

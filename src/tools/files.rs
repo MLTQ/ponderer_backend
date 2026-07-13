@@ -555,9 +555,11 @@ mod tests {
         ToolContext {
             working_directory: "/tmp".to_string(),
             username: "test".to_string(),
+            conversation_id: None,
             autonomous: false,
             allowed_tools: None,
             disallowed_tools: Vec::new(),
+            outbound_action_rate_limit: None,
         }
     }
 
