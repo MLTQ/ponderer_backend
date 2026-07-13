@@ -213,6 +213,46 @@ fn logprob_request_unsupported(error: &str) -> bool {
             || lower.contains("extra inputs"))
 }
 
+fn select_verified_response(message: Message) -> Result<Message> {
+    let has_tool_calls = message
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty());
+    let has_visible_text = message
+        .content
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|text| !text.is_empty());
+    if has_tool_calls || has_visible_text {
+        return Ok(message);
+    }
+
+    anyhow::bail!(
+        "LLM returned no visible text or tool calls in either streaming or non-streaming mode"
+    )
+}
+
+fn emit_message_as_stream_update(callback: Option<&dyn Fn(&StreamingUpdate)>, message: &Message) {
+    let Some(callback) = callback else {
+        return;
+    };
+    let Some(content) = message
+        .content
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    else {
+        return;
+    };
+    let mut tracker = TokenNoveltyTracker::default();
+    let mut token_metrics = tracker.ingest_text_fragment(content);
+    token_metrics.extend(tracker.finish_pending());
+    callback(&StreamingUpdate {
+        content: content.to_string(),
+        done: true,
+        token_metrics,
+    });
+}
+
 /// The agentic loop executor
 pub struct AgenticLoop {
     config: AgenticConfig,
@@ -550,11 +590,6 @@ impl AgenticLoop {
                 .await
             {
                 Ok(message) => {
-                    // Some LLM servers silently drop tool_calls in streaming responses even
-                    // when the model intended to call a tool.  Only apply the fallback on
-                    // the first LLM call of a loop iteration (where the last message is
-                    // from the user/system), because subsequent calls (after tool results)
-                    // are producing a final text response and won't have tool_calls.
                     let has_tool_calls =
                         message.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
                     let has_visible_text = message
@@ -562,36 +597,18 @@ impl AgenticLoop {
                         .as_deref()
                         .map(str::trim)
                         .is_some_and(|text| !text.is_empty());
-                    let last_role = messages.last().map(|m| m.role.as_str()).unwrap_or("");
-                    let is_first_call = last_role == "user" || last_role == "system";
-                    if has_tool_calls || has_visible_text || tool_defs.is_empty() || !is_first_call
-                    {
+                    if has_tool_calls || has_visible_text {
                         return Ok(message);
                     }
-                    // Streaming returned no tool_calls on the initial user-facing call.
-                    // Retry with non-streaming; if it finds tool_calls, streaming silently
-                    // dropped them.  If it also returns no tool_calls the response is a
-                    // legitimate text-only reply — return the streaming version so the
-                    // text content already streamed to the caller stays consistent.
-                    let streaming_message = message;
+
                     tracing::debug!(
-                        "Streaming returned no tool_calls on initial call; \
-                         retrying non-streaming to check for function calls"
+                        "Streaming returned no visible text or tool calls; \
+                         retrying non-streaming to recover the response"
                     );
                     let ns_message = self.call_llm_non_streaming(messages, tool_defs).await?;
-                    let ns_has_tool_calls = ns_message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|tc| !tc.is_empty());
-                    if ns_has_tool_calls {
-                        tracing::info!(
-                            "Non-streaming fallback found tool_calls that streaming dropped"
-                        );
-                        return Ok(ns_message);
-                    }
-                    // Both paths agree: no tool_calls.  Return the streaming message to
-                    // keep the streamed text consistent with what the caller already saw.
-                    return Ok(streaming_message);
+                    let recovered = select_verified_response(ns_message)?;
+                    emit_message_as_stream_update(on_text_stream, &recovered);
+                    return Ok(recovered);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -603,20 +620,7 @@ impl AgenticLoop {
         }
 
         let message = self.call_llm_non_streaming(messages, tool_defs).await?;
-        if let Some(callback) = on_text_stream {
-            if let Some(content) = message.content.as_deref() {
-                if !content.is_empty() {
-                    let mut tracker = TokenNoveltyTracker::default();
-                    let mut token_metrics = tracker.ingest_text_fragment(content);
-                    token_metrics.extend(tracker.finish_pending());
-                    callback(&StreamingUpdate {
-                        content: content.to_string(),
-                        done: true,
-                        token_metrics,
-                    });
-                }
-            }
-        }
+        emit_message_as_stream_update(on_text_stream, &message);
         Ok(message)
     }
 
@@ -1070,6 +1074,107 @@ mod tests {
         let config = AgenticConfig::default();
         assert_eq!(config.max_iterations, Some(10));
         assert_eq!(config.temperature, 0.7);
+    }
+
+    #[test]
+    fn verified_text_recovers_an_empty_streaming_response() {
+        let recovered = select_verified_response(Message {
+            role: "assistant".to_string(),
+            content: Some("Hi!".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        })
+        .expect("valid recovered response");
+
+        assert_eq!(recovered.content.as_deref(), Some("Hi!"));
+    }
+
+    #[test]
+    fn double_empty_response_is_an_error() {
+        let error = select_verified_response(Message {
+            role: "assistant".to_string(),
+            content: Some("   ".to_string()),
+            tool_calls: Some(Vec::new()),
+            tool_call_id: None,
+        })
+        .expect_err("empty verification must fail closed");
+
+        assert!(error.to_string().contains("no visible text or tool calls"));
+    }
+
+    #[tokio::test]
+    async fn empty_stream_uses_verified_non_streaming_text() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::sync::Mutex;
+
+        async fn completion(Json(body): Json<serde_json::Value>) -> axum::response::Response {
+            if body.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
+                return (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                )
+                    .into_response();
+            }
+            Json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hi!",
+                        "tool_calls": []
+                    }
+                }]
+            }))
+            .into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock provider");
+        let address = listener.local_addr().expect("mock provider address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/chat/completions", post(completion)),
+            )
+            .await
+            .expect("serve mock provider");
+        });
+
+        let loop_runner = AgenticLoop::new(
+            AgenticConfig {
+                api_url: format!("http://{address}"),
+                ..AgenticConfig::default()
+            },
+            Arc::new(ToolRegistry::new()),
+        );
+        let updates = Arc::new(Mutex::new(Vec::<StreamingUpdate>::new()));
+        let captured = Arc::clone(&updates);
+        let callback = move |update: &StreamingUpdate| {
+            captured.lock().unwrap().push(update.clone());
+        };
+        let response = loop_runner
+            .call_llm(
+                &[Message {
+                    role: "user".to_string(),
+                    content: Some("Hello?".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                &[],
+                Some(&callback),
+            )
+            .await
+            .expect("recover verified response");
+
+        server.abort();
+        assert_eq!(response.content.as_deref(), Some("Hi!"));
+        assert!(updates
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|update| update.done && update.content == "Hi!"));
     }
 
     #[tokio::test]

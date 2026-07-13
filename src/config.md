@@ -55,7 +55,7 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - Heartbeat defaults: disabled, 30-minute interval, checklist path `HEARTBEAT.md`.
 - Agentic loop defaults: max 10 tool-calling iterations per turn, with optional config to disable the limit entirely.
 - Private-chat mode default is `agentic`; `direct` is a single-turn mode that still permits tool calls and now uses the same tool-iteration setting path as normal chat.
-- Private-chat turn defaults: model-decided continuation (`disable_chat_turn_limit=true`, `disable_background_subtask_turn_limit=true`). Optional safety caps remain configurable at 4 foreground turns and 8 background turns when re-enabled.
+- Private-chat turn defaults are model-directed (`disable_chat_turn_limit=true`, `disable_background_subtask_turn_limit=true`) but never infinite: the host retains emergency ceilings of 32 foreground turns and 64 background turns. Re-enabled configured caps default to 4 and 8 and are clamped to those ceilings.
 - Loop-breaker defaults: `loop_heat_threshold=20`, `loop_similarity_threshold=0.92`, `loop_signature_window=24`, `loop_heat_cooldown=1`.
 - Memory evolution defaults: disabled, 24-hour interval, built-in replay trace set.
 - Capability profile overrides default to empty, so loop policies fall back to code-defined defaults.

@@ -25,6 +25,11 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 - **Does**: Calls `chat/completions` with `"stream": true`, opportunistically requests token logprobs, parses SSE `data:` payloads, accumulates text/tool-call deltas, and produces a final assistant message
 - **Interacts with**: OpenAI, vLLM, and LMStudio-compatible stream payloads; fallback path in `call_llm`
 
+### `select_verified_response`
+- **Does**: Accepts a non-streaming verification response only when it contains visible text or tool calls; rejects a double-empty provider response.
+- **Interacts with**: `call_llm` empty-stream recovery and the outer agentic error path.
+- **Rationale**: A valid recovery response must not be discarded in favor of the empty stream that triggered verification.
+
 ### `StreamingTokenMetric` / `StreamingUpdate`
 - **Does**: Represent the per-token-ish novelty samples and per-chunk stream update packets emitted to the agent/UI layer.
 - **Interacts with**: `../agent/mod.rs` stream callbacks and the frontend token monitor via the backend WS bridge.
@@ -56,7 +61,7 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 - Tool definitions are now filtered per `ToolContext` before each loop run, preventing out-of-scope tools from being proposed/called.
 - Thinking tags are preserved only as structured metadata (`thinking_blocks`) for optional UI/debug display.
 - Streaming failures automatically degrade to the non-streaming code path instead of failing the entire agentic call.
-- Non-streaming verification fallback now runs only when the initial streaming response returned neither tool calls nor visible text, reducing duplicate first-pass LLM calls.
+- Non-streaming verification runs whenever a stream ends without visible text or tool calls. Valid recovered text/tool calls become authoritative and are replayed to the stream callback; if verification is also empty, the call fails explicitly instead of returning an empty successful completion.
 - Streaming requests now try `logprobs` / `top_logprobs` first and retry without them when the provider rejects those fields.
 - When logprobs are missing, token metrics still flow using a lightweight local tokenizer and novelty estimator so the UI can render a stable live trace.
 - HTTP client initialization now has a panic-safe fallback (`no_proxy`) if default system proxy discovery fails on host OS APIs.
