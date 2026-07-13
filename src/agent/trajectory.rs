@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::agent::reasoning::extract_json;
 use crate::database::{PersonaSnapshot, PersonaTraits};
+use crate::generation_telemetry::GenerationObserver;
 use crate::http_client::build_http_client;
 use crate::runtime_plugin_host::{
     render_prompt_slot_addendum, PromptContribution, PromptContributionMergeLimits,
@@ -56,6 +57,7 @@ pub struct TrajectoryEngine {
     api_url: String,
     model: String,
     api_key: Option<String>,
+    generation_observer: Option<GenerationObserver>,
 }
 
 impl TrajectoryEngine {
@@ -65,7 +67,13 @@ impl TrajectoryEngine {
             api_url,
             model,
             api_key,
+            generation_observer: None,
         }
+    }
+
+    pub fn with_generation_observer(mut self, observer: GenerationObserver) -> Self {
+        self.generation_observer = Some(observer);
+        self
     }
 
     /// Analyze persona history and infer trajectory
@@ -218,6 +226,10 @@ Respond ONLY with valid JSON."#,
     }
 
     async fn call_llm(&self, prompt: &str) -> Result<String> {
+        let mut generation = self
+            .generation_observer
+            .as_ref()
+            .map(GenerationObserver::start);
         let url = normalize_chat_url(&self.api_url);
 
         #[derive(Serialize)]
@@ -327,6 +339,10 @@ Respond ONLY with valid JSON."#,
             );
         }
 
+        if let Some(session) = &mut generation {
+            session.finish_with_text(&content);
+        }
+
         Ok(content)
     }
 
@@ -392,15 +408,23 @@ Respond ONLY with valid JSON."#,
 }
 
 /// Capture a persona snapshot by asking the LLM to self-reflect
+pub struct PersonaCaptureContext<'a> {
+    pub trigger: &'a str,
+    pub generation_observer: Option<&'a GenerationObserver>,
+}
+
 pub async fn capture_persona_snapshot(
     api_url: &str,
     model: &str,
     api_key: Option<&str>,
     current_prompt: &str,
-    trigger: &str,
+    capture_context: PersonaCaptureContext<'_>,
     recent_experiences: &[String],
     guiding_principles: &[String],
 ) -> Result<PersonaSnapshot> {
+    let mut generation = capture_context
+        .generation_observer
+        .map(GenerationObserver::start);
     let client = build_http_client();
     let url = normalize_chat_url(api_url);
 
@@ -558,6 +582,10 @@ Be honest about your current state. Respond ONLY with valid JSON."#,
         );
     }
 
+    if let Some(session) = &mut generation {
+        session.finish_with_text(&content);
+    }
+
     // Parse the response
     let json_str = extract_json(&content)?;
     let json: serde_json::Value =
@@ -594,7 +622,7 @@ Be honest about your current state. Respond ONLY with valid JSON."#,
         captured_at: Utc::now(),
         traits: PersonaTraits { dimensions },
         system_prompt: current_prompt.to_string(),
-        trigger: trigger.to_string(),
+        trigger: capture_context.trigger.to_string(),
         self_description: json["self_description"]
             .as_str()
             .unwrap_or("Unable to describe self")

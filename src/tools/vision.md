@@ -37,3 +37,4 @@ Provides vision/media companion tools for the agentic loop: local image evaluati
 - `evaluate_local_image` currently uses the existing inline-base64 vision request style from `llm_client`; provider support can vary.
 - `capture_screen` is intentionally opt-in and defaults to disabled for privacy.
 - `capture_camera_snapshot` is intentionally opt-in, tool-invoked only, and defaults to disabled for privacy.
+- Image evaluation forwards the context generation observer under the `vision` source so tool-triggered GPU work appears in the same generation stream.

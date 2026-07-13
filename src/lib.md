@@ -22,3 +22,4 @@ Defines the backend crate surface for Ponderer. This crate is the extraction bou
 ## Notes
 - `lib.rs` is intentionally thin; runtime composition lives in `runtime.rs`.
 - This crate is the canonical location for backend logic going forward.
+- `generation_telemetry` is the transport-neutral observability seam for every model generation.

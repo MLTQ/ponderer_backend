@@ -41,3 +41,4 @@ Implements the private inner-life journal system for the Living Loop. It defines
 ## Notes
 - Prompt explicitly asks for inner monologue and varied wording to reduce repetitive report-style entries.
 - Parsing is tolerant: malformed model output causes a skip rather than crashing the loop.
+- `with_generation_observer` forwards journal generations through the shared telemetry layer.

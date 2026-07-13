@@ -20,6 +20,7 @@ use crate::database::{
     AgentDatabase, ChatConversation, ChatConversationSummary, ChatMessage, ChatTurn,
     ChatTurnToolCall, DEFAULT_CHAT_CONVERSATION_ID,
 };
+use crate::generation_telemetry::GenerationEvent;
 use crate::plugin_contract::{PluginKind, PluginManifest, PluginRuntimeStatus};
 use crate::process_registry::{ProcessInfo, ProcessRegistry};
 use crate::runtime::{AgentLoopSupervisor, AgentLoopSupervisorStatus, BackendRuntime};
@@ -311,18 +312,48 @@ fn map_agent_event(event: AgentEvent) -> ApiEventEnvelope {
                 "done": done
             }),
         ),
-        AgentEvent::TokenMetrics {
-            conversation_id,
-            clear,
-            samples,
-        } => envelope(
-            "token_metrics",
-            serde_json::json!({
-                "conversation_id": conversation_id,
-                "clear": clear,
-                "samples": samples
-            }),
-        ),
+        AgentEvent::Generation(event) => match event {
+            GenerationEvent::Started {
+                generation_id,
+                source,
+                conversation_id,
+            } => envelope(
+                "generation_started",
+                serde_json::json!({
+                    "generation_id": generation_id,
+                    "source": source,
+                    "conversation_id": conversation_id
+                }),
+            ),
+            GenerationEvent::Metrics {
+                generation_id,
+                source,
+                conversation_id,
+                samples,
+            } => envelope(
+                "generation_metrics",
+                serde_json::json!({
+                    "generation_id": generation_id,
+                    "source": source,
+                    "conversation_id": conversation_id,
+                    "samples": samples
+                }),
+            ),
+            GenerationEvent::Finished {
+                generation_id,
+                source,
+                conversation_id,
+                outcome,
+            } => envelope(
+                "generation_finished",
+                serde_json::json!({
+                    "generation_id": generation_id,
+                    "source": source,
+                    "conversation_id": conversation_id,
+                    "outcome": outcome
+                }),
+            ),
+        },
         AgentEvent::ActionTaken { action, result } => envelope(
             "action_taken",
             serde_json::json!({
@@ -1083,6 +1114,26 @@ mod tests {
         assert_eq!(envelope.event_type, "observation");
         assert_eq!(envelope.payload["text"], "hi");
         assert!(envelope.emitted_at <= Utc::now());
+    }
+
+    #[test]
+    fn generation_metrics_keep_identity_and_source_on_the_wire() {
+        let envelope = map_agent_event(AgentEvent::Generation(GenerationEvent::Metrics {
+            generation_id: "gen-1".to_string(),
+            source: crate::generation_telemetry::GenerationSource::Heartbeat,
+            conversation_id: None,
+            samples: vec![crate::generation_telemetry::GenerationMetricSample {
+                text: "hello".to_string(),
+                logprob: None,
+                entropy: None,
+                novelty: 0.4,
+            }],
+        }));
+
+        assert_eq!(envelope.event_type, "generation_metrics");
+        assert_eq!(envelope.payload["generation_id"], "gen-1");
+        assert_eq!(envelope.payload["source"], "heartbeat");
+        assert_eq!(envelope.payload["samples"][0]["text"], "hello");
     }
 
     #[test]

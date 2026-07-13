@@ -23,6 +23,7 @@ pub mod vision;
 
 pub use effect_policy::{EffectiveToolPolicy, ToolApprovalMinimum, ToolRateLimitClass};
 
+use crate::generation_telemetry::GenerationObserver;
 use crate::plugin_contract::PluginEffectDeclaration;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -105,6 +106,8 @@ pub struct ToolContext {
     /// The registry reserves quota immediately before execution so a single
     /// multi-call pass cannot race or overshoot a context-level visibility check.
     pub outbound_action_rate_limit: Option<Arc<ToolInvocationRateLimit>>,
+    /// Observability lane inherited by tools that make their own model calls.
+    pub generation_observer: Option<GenerationObserver>,
 }
 
 impl ToolContext {
@@ -756,6 +759,7 @@ mod tests {
             allowed_tools: None,
             disallowed_tools: Vec::new(),
             outbound_action_rate_limit: None,
+            generation_observer: None,
         }
     }
 

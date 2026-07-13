@@ -32,3 +32,4 @@ Implements filesystem-facing tools (`read_file`, `write_file`, `list_directory`,
 ## Notes
 - `MAX_READ_BYTES` and `MAX_LIST_ENTRIES` cap expensive operations.
 - Tests build an unscoped, unmetered `ToolContext` with default allow/deny lists; conversation scoping and outward-action quotas are registry/orchestrator concerns and do not change filesystem behavior.
+- Test contexts explicitly leave generation telemetry unset because filesystem tools never call a model.

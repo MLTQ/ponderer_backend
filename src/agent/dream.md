@@ -40,3 +40,4 @@ Implements Ponderer's private Dream pass: a bounded, non-agentic LLM consolidati
 - Current orientation, actions, journal, concerns, and intentions precede prior Dream and self-description material so fresh evidence remains prominent.
 - Embedded source lines are prefixed with `| `, preventing source text from closing its own trust-boundary marker.
 - HTTP deadlines come from the shared bounded `LlmClient` transport.
+- `with_generation_observer` exposes private Dream generations to the monitor while preserving the no-tools boundary.

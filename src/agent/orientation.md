@@ -53,3 +53,4 @@ Implements the Living Loop orientation engine: synthesizes presence, concerns, j
 - Orientation prompts include `Recent Action Digest`, `Previous OODA Packet`, `Latest Dream Consolidation`, and `Open Intentions` sections so immediate action history and longer temporal continuity jointly inform the next orientation.
 - Orientation prompt assembly now has a dedicated additive plugin slot (`orientation.context`) so future runtime plugins can supply context without replacing the base orientation prompt.
 - Plugin slot text is treated as untrusted data rather than instruction authority inside orientation synthesis.
+- `with_generation_observer` makes orientation model calls observable without giving this engine knowledge of websocket or UI types.

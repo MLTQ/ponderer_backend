@@ -2,6 +2,7 @@ pub mod agent;
 pub mod character_card;
 pub mod config;
 pub mod database;
+pub mod generation_telemetry;
 pub mod http_client;
 pub mod intentions;
 pub mod llm_client;

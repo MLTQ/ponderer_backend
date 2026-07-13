@@ -145,6 +145,7 @@ mod tests {
             allowed_tools: None,
             disallowed_tools: Vec::new(),
             outbound_action_rate_limit: None,
+            generation_observer: None,
         }
     }
 

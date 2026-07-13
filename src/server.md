@@ -81,3 +81,4 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - Config updates sanitize `private_chat_mode` (`agentic` or `direct`) before persisting and reloading runtime state.
 - Config updates now also start/stop/restart the Telegram bot task when the Telegram token or authorized chat ID changes, so Telegram settings no longer require a backend restart to take effect.
 - Process routes only expose processes started through the tracked background shell path.
+- Websocket generation telemetry uses `generation_started`, `generation_metrics`, and `generation_finished` envelopes with a stable generation ID, typed source, optional conversation ID, and terminal outcome.

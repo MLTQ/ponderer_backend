@@ -5,6 +5,9 @@ use image::imageops::FilterType;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::generation_telemetry::{
+    GenerationObserver, GenerationOutcome, GenerationSession, TokenNoveltyTracker,
+};
 use crate::http_client::build_http_client;
 
 const VISION_MAX_DIMENSION: u32 = 1280;
@@ -17,6 +20,7 @@ pub struct LlmClient {
     api_key: String,
     model: String,
     client: reqwest::Client,
+    generation_observer: Option<GenerationObserver>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,7 +62,13 @@ impl LlmClient {
             api_key,
             model,
             client: build_http_client(),
+            generation_observer: None,
         }
+    }
+
+    pub fn with_generation_observer(mut self, observer: GenerationObserver) -> Self {
+        self.generation_observer = Some(observer);
+        self
     }
 
     /// Generate a completion using the OpenAI API format
@@ -68,6 +78,7 @@ impl LlmClient {
 
     /// Generate a completion with a specific model
     pub async fn generate_with_model(&self, messages: Vec<Message>, model: &str) -> Result<String> {
+        let session = self.begin_generation();
         let url = chat_completions_url(&self.api_url);
 
         let request = ChatCompletionRequest {
@@ -106,6 +117,8 @@ impl LlmClient {
             .first()
             .map(|c| c.message.content.clone())
             .ok_or_else(|| anyhow::anyhow!("No response from LLM"))?;
+
+        Self::complete_generation(session, &content);
 
         Ok(content)
     }
@@ -199,6 +212,7 @@ impl LlmClient {
         image_base64: &str,
         mime_type: &str,
     ) -> Result<String> {
+        let session = self.begin_generation();
         let url = chat_completions_url(&self.api_url);
 
         let mut request_messages = Vec::with_capacity(messages.len().max(1));
@@ -275,6 +289,8 @@ impl LlmClient {
         let content = extract_message_content(message.get("content"))
             .ok_or_else(|| anyhow::anyhow!("No textual content from vision model"))?;
 
+        Self::complete_generation(session, &content);
+
         Ok(content)
     }
 
@@ -284,6 +300,7 @@ impl LlmClient {
         original_image_bytes: &[u8],
         max_inline_bytes: usize,
     ) -> Result<String> {
+        let session = self.begin_generation();
         let (processed_bytes, _) =
             preprocess_image_for_vision(original_image_bytes, max_inline_bytes)
                 .context("Failed to preprocess image for inline fallback")?;
@@ -322,11 +339,30 @@ impl LlmClient {
             .await
             .context("Failed to parse inline fallback vision response")?;
 
-        completion
+        let content = completion
             .choices
             .first()
             .map(|c| c.message.content.clone())
-            .ok_or_else(|| anyhow::anyhow!("No response from inline fallback vision model"))
+            .ok_or_else(|| anyhow::anyhow!("No response from inline fallback vision model"))?;
+        Self::complete_generation(session, &content);
+        Ok(content)
+    }
+
+    fn begin_generation(&self) -> Option<GenerationSession> {
+        self.generation_observer
+            .as_ref()
+            .map(GenerationObserver::start)
+    }
+
+    fn complete_generation(mut session: Option<GenerationSession>, content: &str) {
+        let Some(session) = session.as_mut() else {
+            return;
+        };
+        let mut tracker = TokenNoveltyTracker::default();
+        let mut samples = tracker.ingest_text_fragment(content);
+        samples.extend(tracker.finish_pending());
+        session.emit_samples(samples);
+        session.finish(GenerationOutcome::Completed);
     }
 
     fn parse_json<T>(&self, response: &str) -> Result<T>

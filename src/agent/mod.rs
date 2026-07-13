@@ -36,6 +36,9 @@ use crate::config::{
 use crate::database::{
     AgentDatabase, ChatTurnPhase, OodaTurnPacketRecord, OrientationSnapshotRecord,
 };
+use crate::generation_telemetry::{
+    GenerationEvent, GenerationEventSink, GenerationObserver, GenerationSource,
+};
 use crate::intentions::{
     AgentIntention, IntentionAttemptOutcome, IntentionOrigin, NewAgentIntention,
 };
@@ -53,8 +56,7 @@ use crate::runtime_plugin_host::{
 };
 use crate::skills::SkillEvent;
 use crate::tools::agentic::{
-    AgenticConfig, AgenticLoop, AgenticResult, AgenticTermination, StreamingTokenMetric,
-    StreamingUpdate, ToolCallRecord,
+    AgenticConfig, AgenticLoop, AgenticResult, AgenticTermination, StreamingUpdate, ToolCallRecord,
 };
 use crate::tools::memory::PRIVATE_CHAT_MODE_STATE_KEY;
 use crate::tools::vision::capture_screen_to_path;
@@ -135,11 +137,7 @@ pub enum AgentEvent {
         content: String,
         done: bool,
     },
-    TokenMetrics {
-        conversation_id: String,
-        clear: bool,
-        samples: Vec<StreamingTokenMetric>,
-    },
+    Generation(GenerationEvent),
     /// Emitted once per operator-visible reply with the clean, stripped response text.
     /// Use this (not ChatStreaming) to relay finished replies to external channels (e.g. Telegram).
     ChatReply {
@@ -256,6 +254,7 @@ pub struct Agent {
     state: Arc<RwLock<AgentState>>,
     outbound_action_rate_limit: Arc<ToolInvocationRateLimit>,
     event_tx: Sender<AgentEvent>,
+    generation_event_sink: GenerationEventSink,
     reasoning: Arc<RwLock<reasoning::ReasoningEngine>>,
     database: Arc<RwLock<Option<AgentDatabase>>>,
     trajectory_engine: Arc<RwLock<Option<trajectory::TrajectoryEngine>>>,
@@ -283,27 +282,53 @@ impl Agent {
     ) -> Self {
         let mut config = config;
         config.private_chat_mode = normalize_private_chat_mode(&config.private_chat_mode);
+        let generation_event_sink: GenerationEventSink = {
+            let generation_event_tx = event_tx.clone();
+            Arc::new(move |event| {
+                let _ = generation_event_tx.send(AgentEvent::Generation(event));
+            })
+        };
         let reasoning = reasoning::ReasoningEngine::new(
             config.llm_api_url.clone(),
             config.llm_model.clone(),
             config.llm_api_key.clone(),
             config.system_prompt.clone(),
-        );
+        )
+        .with_generation_observer(GenerationObserver::new(
+            GenerationSource::Reasoning,
+            None,
+            Arc::clone(&generation_event_sink),
+        ));
         let orientation_engine = OrientationEngine::new(
             config.llm_api_url.clone(),
             config.llm_model.clone(),
             config.llm_api_key.clone(),
-        );
+        )
+        .with_generation_observer(GenerationObserver::new(
+            GenerationSource::Orientation,
+            None,
+            Arc::clone(&generation_event_sink),
+        ));
         let journal_engine = JournalEngine::new(
             config.llm_api_url.clone(),
             config.llm_model.clone(),
             config.llm_api_key.clone(),
-        );
+        )
+        .with_generation_observer(GenerationObserver::new(
+            GenerationSource::Journal,
+            None,
+            Arc::clone(&generation_event_sink),
+        ));
         let dream_engine = DreamEngine::new(
             config.llm_api_url.clone(),
             config.llm_model.clone(),
             config.llm_api_key.clone(),
-        );
+        )
+        .with_generation_observer(GenerationObserver::new(
+            GenerationSource::Dream,
+            None,
+            Arc::clone(&generation_event_sink),
+        ));
         let outbound_action_rate_limit = Arc::new(ToolInvocationRateLimit::for_outbound_effects(
             config.max_posts_per_hour,
             Duration::from_secs(OUTBOUND_ACTION_WINDOW_SECS as u64),
@@ -340,11 +365,18 @@ impl Agent {
                 .clone()
                 .unwrap_or_else(|| config.llm_model.clone());
             tracing::info!("Trajectory engine enabled (model: {})", model);
-            Some(trajectory::TrajectoryEngine::new(
-                config.llm_api_url.clone(),
-                model,
-                config.llm_api_key.clone(),
-            ))
+            Some(
+                trajectory::TrajectoryEngine::new(
+                    config.llm_api_url.clone(),
+                    model,
+                    config.llm_api_key.clone(),
+                )
+                .with_generation_observer(GenerationObserver::new(
+                    GenerationSource::PersonaTrajectory,
+                    None,
+                    Arc::clone(&generation_event_sink),
+                )),
+            )
         } else {
             None
         };
@@ -356,6 +388,7 @@ impl Agent {
             state: Arc::new(RwLock::new(AgentState::default())),
             outbound_action_rate_limit,
             event_tx,
+            generation_event_sink,
             reasoning: Arc::new(RwLock::new(reasoning)),
             database: Arc::new(RwLock::new(database)),
             trajectory_engine: Arc::new(RwLock::new(trajectory_engine)),
@@ -385,22 +418,26 @@ impl Agent {
             new_config.llm_model.clone(),
             new_config.llm_api_key.clone(),
             new_config.system_prompt.clone(),
-        );
+        )
+        .with_generation_observer(self.generation_observer(GenerationSource::Reasoning, None));
         let new_orientation = OrientationEngine::new(
             new_config.llm_api_url.clone(),
             new_config.llm_model.clone(),
             new_config.llm_api_key.clone(),
-        );
+        )
+        .with_generation_observer(self.generation_observer(GenerationSource::Orientation, None));
         let new_journal = JournalEngine::new(
             new_config.llm_api_url.clone(),
             new_config.llm_model.clone(),
             new_config.llm_api_key.clone(),
-        );
+        )
+        .with_generation_observer(self.generation_observer(GenerationSource::Journal, None));
         let new_dream = DreamEngine::new(
             new_config.llm_api_url.clone(),
             new_config.llm_model.clone(),
             new_config.llm_api_key.clone(),
-        );
+        )
+        .with_generation_observer(self.generation_observer(GenerationSource::Dream, None));
 
         // Recreate trajectory engine if self-reflection settings changed
         let new_trajectory = if new_config.enable_self_reflection {
@@ -408,11 +445,16 @@ impl Agent {
                 .reflection_model
                 .clone()
                 .unwrap_or_else(|| new_config.llm_model.clone());
-            Some(trajectory::TrajectoryEngine::new(
-                new_config.llm_api_url.clone(),
-                model,
-                new_config.llm_api_key.clone(),
-            ))
+            Some(
+                trajectory::TrajectoryEngine::new(
+                    new_config.llm_api_url.clone(),
+                    model,
+                    new_config.llm_api_key.clone(),
+                )
+                .with_generation_observer(
+                    self.generation_observer(GenerationSource::PersonaTrajectory, None),
+                ),
+            )
         } else {
             None
         };
@@ -494,6 +536,18 @@ impl Agent {
         }
     }
 
+    fn generation_observer(
+        &self,
+        source: GenerationSource,
+        conversation_id: Option<String>,
+    ) -> GenerationObserver {
+        GenerationObserver::new(
+            source,
+            conversation_id,
+            Arc::clone(&self.generation_event_sink),
+        )
+    }
+
     async fn tool_context_for_profile(
         &self,
         config: &AgentConfig,
@@ -506,6 +560,17 @@ impl Agent {
         if context.autonomous {
             context.outbound_action_rate_limit = Some(Arc::clone(&self.outbound_action_rate_limit));
         }
+        let source = match profile {
+            AgentCapabilityProfile::PrivateChat => GenerationSource::OperatorChat,
+            AgentCapabilityProfile::Scheduled => GenerationSource::ScheduledChat,
+            AgentCapabilityProfile::Background => GenerationSource::BackgroundChat,
+            AgentCapabilityProfile::SelfDirected => GenerationSource::SelfDirective,
+            AgentCapabilityProfile::SkillEvents => GenerationSource::PluginEvent,
+            AgentCapabilityProfile::Heartbeat => GenerationSource::Heartbeat,
+            AgentCapabilityProfile::Ambient => GenerationSource::Orientation,
+            AgentCapabilityProfile::Dream => GenerationSource::Dream,
+        };
+        context.generation_observer = Some(self.generation_observer(source, None));
         context
     }
 
@@ -1004,6 +1069,7 @@ impl Agent {
         llm_model: &str,
         llm_api_key: Option<&str>,
         mode: PrivateChatExecutionMode,
+        generation_observer: GenerationObserver,
     ) -> AgenticConfig {
         AgenticConfig {
             max_iterations: Self::chat_loop_max_iterations(config_snapshot, mode),
@@ -1014,6 +1080,7 @@ impl Agent {
             max_tokens: 2048,
             cancel_generation: Some(self.stop_generation.clone()),
             start_generation: self.stop_generation.load(Ordering::SeqCst),
+            generation_observer: Some(generation_observer),
         }
     }
 
@@ -1568,6 +1635,9 @@ impl Agent {
             max_tokens: 1600,
             cancel_generation: Some(self.stop_generation.clone()),
             start_generation: self.stop_generation.load(Ordering::SeqCst),
+            generation_observer: Some(
+                self.generation_observer(GenerationSource::SelfDirective, None),
+            ),
         };
         let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
         let self_directed_profile = self_directed_profile_for_origin(
@@ -1862,7 +1932,8 @@ impl Agent {
             agentic_api_url(&config_snapshot.llm_api_url),
             config_snapshot.llm_api_key.clone().unwrap_or_default(),
             config_snapshot.llm_model.clone(),
-        );
+        )
+        .with_generation_observer(self.generation_observer(GenerationSource::Social, None));
         let messages = vec![
             crate::llm_client::Message {
                 role: "system".to_string(),
@@ -2032,6 +2103,7 @@ impl Agent {
             max_tokens: 2048,
             cancel_generation: Some(self.stop_generation.clone()),
             start_generation: self.stop_generation.load(Ordering::SeqCst),
+            generation_observer: Some(self.generation_observer(GenerationSource::Heartbeat, None)),
         };
         let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
 
@@ -2387,12 +2459,16 @@ impl Agent {
             }
         };
 
+        let persona_observer = self.generation_observer(GenerationSource::PersonaSnapshot, None);
         let snapshot = trajectory::capture_persona_snapshot(
             &api_url,
             &model,
             api_key.as_deref(),
             &system_prompt,
-            trigger,
+            trajectory::PersonaCaptureContext {
+                trigger,
+                generation_observer: Some(&persona_observer),
+            },
             &experiences,
             &guiding_principles,
         )
@@ -2677,7 +2753,8 @@ impl Agent {
             config.llm_api_url.clone(),
             config.llm_api_key.clone().unwrap_or_default(),
             config.llm_model.clone(),
-        );
+        )
+        .with_generation_observer(self.generation_observer(GenerationSource::Vision, None));
         let evaluation = match timeout(
             Duration::from_secs(ORIENTATION_VISION_TIMEOUT_SECS),
             llm_client.evaluate_image(
@@ -3236,6 +3313,9 @@ impl Agent {
             max_tokens: 1536,
             cancel_generation: Some(self.stop_generation.clone()),
             start_generation: self.stop_generation.load(Ordering::SeqCst),
+            generation_observer: Some(
+                self.generation_observer(GenerationSource::PluginEvent, None),
+            ),
         };
         let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
         let tool_ctx = self
@@ -3859,6 +3939,9 @@ impl Agent {
             max_tokens: 1536,
             cancel_generation: Some(self.stop_generation.clone()),
             start_generation: self.stop_generation.load(Ordering::SeqCst),
+            generation_observer: Some(
+                self.generation_observer(GenerationSource::PluginEvent, None),
+            ),
         };
         let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
         let tool_ctx = self
@@ -4127,6 +4210,10 @@ impl Agent {
                 )
                 .await;
             tool_ctx.conversation_id = Some(conversation_id.clone());
+            if let Some(observer) = tool_ctx.generation_observer.take() {
+                tool_ctx.generation_observer =
+                    Some(observer.with_conversation(Some(conversation_id.clone())));
+            }
             let active_chat_mode = if is_scheduled {
                 PrivateChatExecutionMode::Agentic
             } else {
@@ -4152,6 +4239,14 @@ impl Agent {
                 &llm_model,
                 llm_api_key.as_deref(),
                 active_chat_mode,
+                self.generation_observer(
+                    if is_scheduled {
+                        GenerationSource::ScheduledChat
+                    } else {
+                        GenerationSource::OperatorChat
+                    },
+                    Some(conversation_id.clone()),
+                ),
             );
             if is_scheduled {
                 loop_config.max_iterations = Some(SCHEDULED_CHAT_MAX_TOOL_ITERATIONS);
@@ -4432,22 +4527,12 @@ impl Agent {
                 }
                 let event_tx = self.event_tx.clone();
                 let stream_conversation_id = conversation_id.clone();
-                let stream_started = Arc::new(AtomicBool::new(false));
-                let metrics_started = Arc::clone(&stream_started);
                 let stream_callback = move |update: &StreamingUpdate| {
                     let _ = event_tx.send(AgentEvent::ChatStreaming {
                         conversation_id: stream_conversation_id.clone(),
                         content: update.content.clone(),
                         done: update.done,
                     });
-                    if !update.token_metrics.is_empty() {
-                        let clear = !metrics_started.swap(true, Ordering::SeqCst);
-                        let _ = event_tx.send(AgentEvent::TokenMetrics {
-                            conversation_id: stream_conversation_id.clone(),
-                            clear,
-                            samples: update.token_metrics.clone(),
-                        });
-                    }
                 };
                 let tool_event_tx = self.event_tx.clone();
                 let tool_event_conversation_id = conversation_id.clone();
@@ -4743,6 +4828,7 @@ impl Agent {
                                 .as_ref()
                                 .filter(|goal| goal.conversation_id == conversation_id)
                                 .and_then(|goal| goal.durable_claim.clone()),
+                            generation_event_sink: Arc::clone(&self.generation_event_sink),
                         })
                         .await;
 
@@ -4896,12 +4982,17 @@ impl Agent {
                                     let title_model = llm_model.clone();
                                     let title_api_key = llm_api_key.clone().unwrap_or_default();
                                     let title_db = self.database.clone();
+                                    let title_observer = self.generation_observer(
+                                        GenerationSource::ConversationTitle,
+                                        Some(conversation_id.clone()),
+                                    );
                                     tokio::spawn(async move {
                                         let client = crate::llm_client::LlmClient::new(
                                             title_api_url,
                                             title_api_key,
                                             title_model,
-                                        );
+                                        )
+                                        .with_generation_observer(title_observer);
                                         let prompt = format!(
                                             "Generate a concise 3-6 word title for a conversation that starts with this message. \
                                              Respond with ONLY the title, no quotes, no punctuation at the end:\n\n{}",
@@ -5350,6 +5441,14 @@ impl Agent {
             agentic_api_url(llm_api_url),
             llm_api_key.unwrap_or("").to_string(),
             llm_model.to_string(),
+        )
+        .with_generation_observer(
+            self.generation_observer(
+                GenerationSource::ConversationSummary,
+                messages
+                    .first()
+                    .map(|message| message.conversation_id.clone()),
+            ),
         );
         let result = tokio::time::timeout(
             Duration::from_secs(20),
@@ -5484,7 +5583,7 @@ struct TurnControlBlock {
     reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct BackgroundSubtaskRequest {
     conversation_id: String,
     initial_continuation_hint: String,
@@ -5498,6 +5597,7 @@ struct BackgroundSubtaskRequest {
     stop_generation: Arc<AtomicU64>,
     start_generation: u64,
     intention_claim: Option<DurableIntentionClaim>,
+    generation_event_sink: GenerationEventSink,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6365,6 +6465,11 @@ async fn run_background_chat_subtask(
         max_tokens: 2048,
         cancel_generation: Some(request.stop_generation.clone()),
         start_generation: request.start_generation,
+        generation_observer: Some(GenerationObserver::new(
+            GenerationSource::BackgroundChat,
+            Some(request.conversation_id.clone()),
+            Arc::clone(&request.generation_event_sink),
+        )),
     };
     let plugin_tool_registry = tool_registry.clone();
     let agentic_loop = AgenticLoop::new(loop_config, tool_registry);
@@ -6377,6 +6482,11 @@ async fn run_background_chat_subtask(
         request.config_snapshot.username.clone(),
     );
     tool_ctx.conversation_id = Some(request.conversation_id.clone());
+    tool_ctx.generation_observer = Some(GenerationObserver::new(
+        GenerationSource::BackgroundChat,
+        Some(request.conversation_id.clone()),
+        Arc::clone(&request.generation_event_sink),
+    ));
     tool_ctx.outbound_action_rate_limit = Some(Arc::clone(&outbound_action_rate_limit));
 
     let mut turns_executed = 0usize;
@@ -6540,22 +6650,12 @@ async fn run_background_chat_subtask(
 
         let stream_tx = event_tx.clone();
         let stream_conversation_id = request.conversation_id.clone();
-        let stream_started = Arc::new(AtomicBool::new(false));
-        let metrics_started = Arc::clone(&stream_started);
         let stream_callback = move |update: &StreamingUpdate| {
             let _ = stream_tx.send(AgentEvent::ChatStreaming {
                 conversation_id: stream_conversation_id.clone(),
                 content: update.content.clone(),
                 done: update.done,
             });
-            if !update.token_metrics.is_empty() {
-                let clear = !metrics_started.swap(true, Ordering::SeqCst);
-                let _ = stream_tx.send(AgentEvent::TokenMetrics {
-                    conversation_id: stream_conversation_id.clone(),
-                    clear,
-                    samples: update.token_metrics.clone(),
-                });
-            }
         };
         let tool_event_tx = event_tx.clone();
         let tool_event_conversation_id = request.conversation_id.clone();

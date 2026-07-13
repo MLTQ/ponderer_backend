@@ -54,3 +54,4 @@ Defines the shared tool abstraction (`Tool` trait), typed tool I/O (`ToolOutput`
 - The process-shared outbound limiter enforces quota at invocation time across concurrent autonomous contexts. `for_outbound_effects` supports name-independent enforcement while the fixed-name constructor remains a compatibility adapter. Durable rolling-window recovery across backend restart remains separate persistence work.
 - An outward-action quota of zero is fail-closed: it disables tools with the `OutboundAction` policy instead of meaning unlimited.
 - `ToolOutput::Json` is now a key channel for rich chat metadata (for example media payloads extracted later by `agent/mod.rs` and `ui/chat.rs`).
+- `ToolContext::generation_observer` lets model-using tools inherit the caller's telemetry lane without coupling tools to the UI event bus.

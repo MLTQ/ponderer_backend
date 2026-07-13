@@ -61,3 +61,4 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 - When logprobs are missing, token metrics still flow using a lightweight local tokenizer and novelty estimator so the UI can render a stable live trace.
 - HTTP client initialization now has a panic-safe fallback (`no_proxy`) if default system proxy discovery fails on host OS APIs.
 - Cancellation is re-checked after each LLM request because request helpers unwind with a synthetic assistant message; the outer result still reports `AgenticTermination::Cancelled` rather than `Completed`.
+- `AgenticConfig::generation_observer` emits one independently identified path per model request, including autonomous and tool-calling iterations; chat streaming callbacks no longer own monitor telemetry.

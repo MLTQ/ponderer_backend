@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::config::AgentConfig;
+use crate::generation_telemetry::GenerationSource;
 use crate::llm_client::LlmClient;
 
 use super::{Tool, ToolCategory, ToolContext, ToolOutput};
@@ -63,7 +64,7 @@ impl Tool for EvaluateLocalImageTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let path = match params.get("path").and_then(Value::as_str) {
             Some(path) if !path.trim().is_empty() => path.trim(),
             _ => return Ok(ToolOutput::Error("Missing 'path' parameter".to_string())),
@@ -111,11 +112,15 @@ impl Tool for EvaluateLocalImageTool {
 
         let config = AgentConfig::load();
         let chosen_model = model_override.unwrap_or_else(|| config.llm_model.clone());
-        let llm_client = LlmClient::new(
+        let mut llm_client = LlmClient::new(
             normalize_api_url_for_chat(&config.llm_api_url),
             config.llm_api_key.unwrap_or_default(),
             chosen_model.clone(),
         );
+        if let Some(observer) = &ctx.generation_observer {
+            llm_client =
+                llm_client.with_generation_observer(observer.with_source(GenerationSource::Vision));
+        }
 
         let evaluation = match llm_client
             .evaluate_image(&image_bytes, prompt, context)

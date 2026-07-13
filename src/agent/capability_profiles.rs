@@ -30,6 +30,7 @@ impl ToolCapabilityPolicy {
             allowed_tools: self.allowed_tools,
             disallowed_tools: self.disallowed_tools,
             outbound_action_rate_limit: None,
+            generation_observer: None,
         }
     }
 }

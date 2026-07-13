@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::concerns::Concern;
 use crate::agent::journal::JournalEntry;
 use crate::database::PersonaSnapshot;
+use crate::generation_telemetry::GenerationObserver;
 use crate::llm_client::{LlmClient, Message as LlmMessage};
 use crate::presence::{PresenceState, ProcessCategory};
 use crate::runtime_plugin_host::{
@@ -369,6 +370,11 @@ impl OrientationEngine {
             client: LlmClient::new(api_url, api_key.unwrap_or_default(), model.clone()),
             model,
         }
+    }
+
+    pub fn with_generation_observer(mut self, observer: GenerationObserver) -> Self {
+        self.client = self.client.with_generation_observer(observer);
+        self
     }
 
     pub async fn orient(&self, context: OrientationContext) -> Result<Orientation> {

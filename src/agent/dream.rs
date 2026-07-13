@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::generation_telemetry::GenerationObserver;
 use crate::llm_client::{LlmClient, Message as LlmMessage};
 
 const MAX_INPUT_ITEMS: usize = 12;
@@ -47,6 +48,11 @@ impl DreamEngine {
             client: LlmClient::new(api_url, api_key.unwrap_or_default(), model.clone()),
             model,
         }
+    }
+
+    pub fn with_generation_observer(mut self, observer: GenerationObserver) -> Self {
+        self.client = self.client.with_generation_observer(observer);
+        self
     }
 
     /// Produces at most one consolidation with a single structured LLM call.

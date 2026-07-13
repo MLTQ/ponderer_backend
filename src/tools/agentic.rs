@@ -9,10 +9,13 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::generation_telemetry::{
+    GenerationMetricSample, GenerationObserver, GenerationOutcome, ProviderToken,
+    TokenNoveltyTracker,
+};
 use crate::http_client::build_http_client;
 
 use super::safety;
@@ -38,6 +41,8 @@ pub struct AgenticConfig {
     pub cancel_generation: Option<Arc<AtomicU64>>,
     /// Generation snapshot captured at loop start.
     pub start_generation: u64,
+    /// Observability lane for each model request made by this loop.
+    pub generation_observer: Option<GenerationObserver>,
 }
 
 impl Default for AgenticConfig {
@@ -51,6 +56,7 @@ impl Default for AgenticConfig {
             max_tokens: 4096,
             cancel_generation: None,
             start_generation: 0,
+            generation_observer: None,
         }
     }
 }
@@ -125,13 +131,7 @@ pub struct ToolCallRecord {
 /// When the provider exposes true token logprobs we forward them directly.
 /// Otherwise `text` is derived from a lightweight local tokenizer over the
 /// streamed text deltas so the UI still gets a novelty trace.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamingTokenMetric {
-    pub text: String,
-    pub logprob: Option<f32>,
-    pub entropy: Option<f32>,
-    pub novelty: f32,
-}
+pub type StreamingTokenMetric = GenerationMetricSample;
 
 /// Incremental streaming update pushed to the caller.
 #[derive(Debug, Clone)]
@@ -139,171 +139,6 @@ pub struct StreamingUpdate {
     pub content: String,
     pub done: bool,
     pub token_metrics: Vec<StreamingTokenMetric>,
-}
-
-#[derive(Debug, Clone)]
-struct TokenEmission {
-    text: String,
-    logprob: Option<f32>,
-    entropy: Option<f32>,
-}
-
-#[derive(Debug, Default)]
-struct TokenNoveltyTracker {
-    pending_fragment: String,
-    total_tokens: u64,
-    token_counts: HashMap<String, u64>,
-    bigram_counts: HashMap<String, u64>,
-    previous_token: Option<String>,
-}
-
-impl TokenNoveltyTracker {
-    fn ingest_text_fragment(&mut self, fragment: &str) -> Vec<StreamingTokenMetric> {
-        self.tokenize_fragment(fragment)
-            .into_iter()
-            .map(|text| {
-                self.score_token(TokenEmission {
-                    text,
-                    logprob: None,
-                    entropy: None,
-                })
-            })
-            .collect()
-    }
-
-    fn ingest_provider_tokens(&mut self, tokens: Vec<TokenEmission>) -> Vec<StreamingTokenMetric> {
-        tokens
-            .into_iter()
-            .map(|token| self.score_token(token))
-            .collect()
-    }
-
-    fn finish_pending(&mut self) -> Vec<StreamingTokenMetric> {
-        if self.pending_fragment.trim().is_empty() {
-            self.pending_fragment.clear();
-            return Vec::new();
-        }
-
-        let text = std::mem::take(&mut self.pending_fragment);
-        vec![self.score_token(TokenEmission {
-            text,
-            logprob: None,
-            entropy: None,
-        })]
-    }
-
-    fn tokenize_fragment(&mut self, fragment: &str) -> Vec<String> {
-        let mut combined = String::new();
-        combined.push_str(&self.pending_fragment);
-        combined.push_str(fragment);
-        self.pending_fragment.clear();
-
-        let mut tokens = Vec::new();
-        let mut current = String::new();
-        for ch in combined.chars() {
-            if is_metric_word_char(ch) {
-                current.push(ch);
-                continue;
-            }
-
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-
-            if !ch.is_whitespace() {
-                tokens.push(ch.to_string());
-            }
-        }
-
-        if !current.is_empty() {
-            if combined.chars().last().is_some_and(is_metric_word_char) {
-                self.pending_fragment = current;
-            } else {
-                tokens.push(current);
-            }
-        }
-
-        tokens
-    }
-
-    fn score_token(&mut self, token: TokenEmission) -> StreamingTokenMetric {
-        let normalized = normalize_metric_token(&token.text);
-        let seen_count = self.token_counts.get(&normalized).copied().unwrap_or(0) as f32;
-        let total = self.total_tokens as f32;
-        let vocab = self.token_counts.len() as f32 + 1.0;
-        let smoothed_probability = (seen_count + 1.0) / (total + vocab);
-        let frequency_novelty = (-smoothed_probability.ln() / 5.5).clamp(0.0, 1.0);
-
-        let bigram_novelty = if let Some(previous) = self.previous_token.as_ref() {
-            let key = bigram_key(previous, &normalized);
-            let count = self.bigram_counts.get(&key).copied().unwrap_or(0) as f32;
-            if count == 0.0 {
-                1.0
-            } else {
-                (1.0 / (count + 1.0)).clamp(0.0, 1.0)
-            }
-        } else {
-            0.55
-        };
-
-        let surprisal_score = token
-            .logprob
-            .map(|value| (-value / 5.0).clamp(0.0, 1.0))
-            .unwrap_or(frequency_novelty);
-        let entropy_score = token
-            .entropy
-            .map(|value| (value / 1.75).clamp(0.0, 1.0))
-            .unwrap_or(0.0);
-        let repeat_penalty = self
-            .previous_token
-            .as_ref()
-            .filter(|previous| *previous == &normalized)
-            .map(|_| 0.28)
-            .unwrap_or(0.0);
-
-        let novelty = (0.5 * frequency_novelty
-            + 0.3 * surprisal_score
-            + 0.15 * bigram_novelty
-            + 0.05 * entropy_score
-            - repeat_penalty)
-            .clamp(0.0, 1.25);
-
-        self.total_tokens += 1;
-        *self.token_counts.entry(normalized.clone()).or_default() += 1;
-        if let Some(previous) = self.previous_token.replace(normalized.clone()) {
-            *self
-                .bigram_counts
-                .entry(bigram_key(&previous, &normalized))
-                .or_default() += 1;
-        }
-
-        StreamingTokenMetric {
-            text: token.text,
-            logprob: token.logprob,
-            entropy: token.entropy,
-            novelty,
-        }
-    }
-}
-
-fn is_metric_word_char(ch: char) -> bool {
-    ch.is_alphanumeric() || matches!(ch, '_' | '\'' | '-')
-}
-
-fn normalize_metric_token(token: &str) -> String {
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if trimmed.chars().any(char::is_alphanumeric) {
-        trimmed.to_ascii_lowercase()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn bigram_key(previous: &str, current: &str) -> String {
-    format!("{previous}\u{1f}{current}")
 }
 
 fn approx_entropy_from_top_logprobs(value: Option<&serde_json::Value>) -> Option<f32> {
@@ -341,7 +176,7 @@ fn approx_entropy_from_top_logprobs(value: Option<&serde_json::Value>) -> Option
     Some(entropy)
 }
 
-fn parse_logprob_tokens(choice: &serde_json::Value) -> Vec<TokenEmission> {
+fn parse_logprob_tokens(choice: &serde_json::Value) -> Vec<ProviderToken> {
     choice
         .get("logprobs")
         .and_then(|logprobs| logprobs.get("content"))
@@ -354,7 +189,7 @@ fn parse_logprob_tokens(choice: &serde_json::Value) -> Vec<TokenEmission> {
                     if text.is_empty() {
                         return None;
                     }
-                    Some(TokenEmission {
+                    Some(ProviderToken {
                         text: text.to_string(),
                         logprob: item
                             .get("logprob")
@@ -793,6 +628,11 @@ impl AgenticLoop {
         if self.is_cancelled() {
             return Ok(self.cancelled_message());
         }
+        let mut telemetry = self
+            .config
+            .generation_observer
+            .as_ref()
+            .map(GenerationObserver::start);
         let url = format!("{}/chat/completions", self.config.api_url);
 
         let mut body = serde_json::json!({
@@ -815,6 +655,9 @@ impl AgenticLoop {
 
         let response = req.send().await.context("Failed to send LLM request")?;
         if self.is_cancelled() {
+            if let Some(session) = telemetry.as_mut() {
+                session.finish(GenerationOutcome::Cancelled);
+            }
             return Ok(self.cancelled_message());
         }
 
@@ -839,6 +682,16 @@ impl AgenticLoop {
 
         // Parse into our Message type
         let content = message["content"].as_str().map(String::from);
+
+        if let Some(session) = telemetry.as_mut() {
+            if let Some(content) = content.as_deref() {
+                let mut tracker = TokenNoveltyTracker::default();
+                let mut samples = tracker.ingest_text_fragment(content);
+                samples.extend(tracker.finish_pending());
+                session.emit_samples(samples);
+            }
+            session.finish(GenerationOutcome::Completed);
+        }
 
         let tool_calls: Option<Vec<LlmToolCall>> = message
             .get("tool_calls")
@@ -869,6 +722,11 @@ impl AgenticLoop {
         if self.is_cancelled() {
             return Ok(self.cancelled_message());
         }
+        let mut telemetry = self
+            .config
+            .generation_observer
+            .as_ref()
+            .map(GenerationObserver::start);
         let url = format!("{}/chat/completions", self.config.api_url);
 
         let mut body = serde_json::json!({
@@ -899,6 +757,9 @@ impl AgenticLoop {
             Err(error) => return Err(error),
         };
         if self.is_cancelled() {
+            if let Some(session) = telemetry.as_mut() {
+                session.finish(GenerationOutcome::Cancelled);
+            }
             return Ok(self.cancelled_message());
         }
 
@@ -914,6 +775,9 @@ impl AgenticLoop {
             .context("Failed reading streaming chunk")?
         {
             if self.is_cancelled() {
+                if let Some(session) = telemetry.as_mut() {
+                    session.finish(GenerationOutcome::Cancelled);
+                }
                 if let Some(callback) = on_text_stream {
                     callback(&StreamingUpdate {
                         content: String::new(),
@@ -958,6 +822,9 @@ impl AgenticLoop {
                     } else {
                         novelty_tracker.ingest_provider_tokens(token_metrics)
                     };
+                    if let Some(session) = telemetry.as_ref() {
+                        session.emit_samples(token_metrics.clone());
+                    }
                     if let Some(callback) = on_text_stream {
                         callback(&StreamingUpdate {
                             content: content.clone(),
@@ -967,6 +834,9 @@ impl AgenticLoop {
                     }
                 } else if !token_metrics.is_empty() {
                     let token_metrics = novelty_tracker.ingest_provider_tokens(token_metrics);
+                    if let Some(session) = telemetry.as_ref() {
+                        session.emit_samples(token_metrics.clone());
+                    }
                     if let Some(callback) = on_text_stream {
                         callback(&StreamingUpdate {
                             content: content.clone(),
@@ -1019,12 +889,18 @@ impl AgenticLoop {
         }
 
         let final_token_metrics = novelty_tracker.finish_pending();
+        if let Some(session) = telemetry.as_ref() {
+            session.emit_samples(final_token_metrics.clone());
+        }
         if let Some(callback) = on_text_stream {
             callback(&StreamingUpdate {
                 content: content.clone(),
                 done: true,
                 token_metrics: final_token_metrics,
             });
+        }
+        if let Some(session) = telemetry.as_mut() {
+            session.finish(GenerationOutcome::Completed);
         }
 
         let parsed_tool_calls = tool_calls
@@ -1213,6 +1089,7 @@ mod tests {
             allowed_tools: None,
             disallowed_tools: Vec::new(),
             outbound_action_rate_limit: None,
+            generation_observer: None,
         };
 
         let result = loop_runner

@@ -40,3 +40,4 @@ code.
   enable action.
 - Staging a draft is useful progress but never claims that untrusted native code
   is sandboxed.
+- Test contexts leave generation telemetry unset; the workbench itself performs no model calls.

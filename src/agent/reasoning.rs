@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::generation_telemetry::GenerationObserver;
 use crate::http_client::build_http_client;
 use crate::skills::SkillEvent;
 
@@ -13,6 +14,7 @@ pub struct ReasoningEngine {
     model: String,
     api_key: Option<String>,
     system_prompt: String,
+    generation_observer: Option<GenerationObserver>,
 }
 
 impl ReasoningEngine {
@@ -28,7 +30,13 @@ impl ReasoningEngine {
             model,
             api_key,
             system_prompt,
+            generation_observer: None,
         }
+    }
+
+    pub fn with_generation_observer(mut self, observer: GenerationObserver) -> Self {
+        self.generation_observer = Some(observer);
+        self
     }
 
     pub async fn analyze_events(&self, events: &[SkillEvent]) -> Result<Decision> {
@@ -76,6 +84,10 @@ impl ReasoningEngine {
     }
 
     async fn call_llm(&self, user_message: &str) -> Result<String> {
+        let mut generation = self
+            .generation_observer
+            .as_ref()
+            .map(GenerationObserver::start);
         let url = format!("{}/v1/chat/completions", self.api_url);
 
         let request = ChatRequest {
@@ -117,11 +129,15 @@ impl ReasoningEngine {
             .await
             .context("Failed to parse LLM response")?;
 
-        chat_response
+        let content = chat_response
             .choices
             .first()
             .map(|c| c.message.content.clone())
-            .context("Empty LLM response")
+            .context("Empty LLM response")?;
+        if let Some(session) = &mut generation {
+            session.finish_with_text(&content);
+        }
+        Ok(content)
     }
 
     /// Analyze events with additional context (working memory, chat history)
