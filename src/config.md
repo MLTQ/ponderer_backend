@@ -1,12 +1,12 @@
 # config.rs
 
 ## Purpose
-Defines all configuration for the Ponderer agent, including LLM connection, identity, polling behavior, agentic loop iteration controls, private-chat execution mode (`agentic` vs `direct`) and autonomous turn budgets (foreground + background) with optional unbounded mode, deterministic loop-breaker heat controls (similarity/threshold/window/cooldown), three-loop living-loop toggles (ambient/journal/concerns/dream), autonomous heartbeat scheduling, explicit per-loop tool capability profiles, image generation (ComfyUI), plugin-owned settings blobs, screen/camera capture privacy gating, character card fields, and self-reflection settings. Supports loading from TOML files with environment variable fallback.
+Defines all configuration for the Ponderer agent, including LLM connection, identity, polling behavior, agentic loop iteration controls, private-chat execution mode (`agentic` vs `direct`) and autonomous turn budgets, deterministic loop-breaker heat controls, living-loop toggles, heartbeat scheduling, per-loop tool capability profiles, plugin-owned settings blobs, screen/camera privacy gates, character card fields, and self-reflection settings. Supports loading from TOML files with environment variable fallback.
 
 ## Components
 
 ### `AgentConfig`
-- **Does**: Top-level config struct holding all runtime settings (LLM, Graphchan, identity, private-chat mode, ambient/journal/concerns/dream controls, heartbeat, reflection, image gen, namespaced `plugin_settings`, screen-capture gate, character, avatars)
+- **Does**: Top-level config struct holding core runtime settings plus namespaced `plugin_settings`; integration endpoints and model-specific options belong to their plugin schemas.
 - **Interacts with**: `main.rs` (loaded at startup), `agent::Agent` (drives behavior), `ui::app::AgentApp` (display/edit)
 
 ### `AgentConfig::load()`
@@ -18,13 +18,8 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - **Interacts with**: UI settings panel for persisting changes
 
 ### `AgentConfig::from_env()`
-- **Does**: Populates config from environment variables (`GRAPHCHAN_API_URL`, `LLM_API_URL`, `LLM_MODEL`, `LLM_API_KEY`, `AGENT_CHECK_INTERVAL`, `AGENT_MAX_TOOL_ITERATIONS`, `AGENT_DISABLE_TOOL_ITERATION_LIMIT`, `AGENT_MAX_CHAT_AUTONOMOUS_TURNS`, `AGENT_MAX_BACKGROUND_SUBTASK_TURNS`, `AGENT_PRIVATE_CHAT_MODE`, `AGENT_DISABLE_CHAT_TURN_LIMIT`, `AGENT_DISABLE_BACKGROUND_SUBTASK_TURN_LIMIT`, `AGENT_LOOP_HEAT_THRESHOLD`, `AGENT_LOOP_SIMILARITY_THRESHOLD`, `AGENT_LOOP_SIGNATURE_WINDOW`, `AGENT_LOOP_HEAT_COOLDOWN`, `AGENT_ENABLE_AMBIENT_LOOP`, `AGENT_AMBIENT_MIN_INTERVAL_SECS`, `AGENT_ENABLE_JOURNAL`, `AGENT_JOURNAL_MIN_INTERVAL_SECS`, `AGENT_ENABLE_CONCERNS`, `AGENT_ENABLE_DREAM_CYCLE`, `AGENT_DREAM_MIN_INTERVAL_SECS`, `AGENT_ENABLE_HEARTBEAT`, `AGENT_HEARTBEAT_INTERVAL_MINS`, `AGENT_HEARTBEAT_CHECKLIST_PATH`, `AGENT_ENABLE_MEMORY_EVOLUTION`, `AGENT_MEMORY_EVOLUTION_INTERVAL_HOURS`, `AGENT_MEMORY_TRACE_SET_PATH`, `AGENT_ENABLE_SCREEN_CAPTURE`, `AGENT_ENABLE_CAMERA_CAPTURE`, `AGENT_NAME`)
+- **Does**: Populates core config from environment variables (`LLM_API_URL`, `LLM_MODEL`, `LLM_API_KEY`, agent-loop controls, memory controls, sensor gates, and `AGENT_NAME`). Plugin-specific environment/config migration belongs to each package.
 - **Rationale**: Legacy support for env-var-only configuration
-
-### `ComfyUIConfig`
-- **Does**: Holds ComfyUI connection and generation parameters (model, dimensions, sampler, scheduler, CFG, steps)
-- **Interacts with**: `comfy_client.rs`, `agent::image_gen`
-- **Rationale**: New workflow bundles still reuse `comfyui.api_url` as the transport endpoint, while plugin-specific model paths and workflow parameters now live under `AgentConfig.plugin_settings`
 
 ### `RespondTo`
 - **Does**: Controls response behavior (`response_type`: "all" or "selective") with optional separate `decision_model`
@@ -43,10 +38,9 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
 | `main.rs` | `AgentConfig::load()` returns valid config | Changing `load()` return type |
-| `agent::Agent` | Fields: `llm_api_url`, `llm_model`, `llm_api_key`, `system_prompt`, `poll_interval_secs`, `max_tool_iterations`, `disable_tool_iteration_limit`, `max_chat_autonomous_turns`, `max_background_subtask_turns`, `private_chat_mode`, `disable_chat_turn_limit`, `disable_background_subtask_turn_limit`, `loop_heat_threshold`, `loop_similarity_threshold`, `loop_signature_window`, `loop_heat_cooldown`, `enable_ambient_loop`, `ambient_min_interval_secs`, `enable_journal`, `journal_min_interval_secs`, `enable_concerns`, `enable_dream_cycle`, `dream_min_interval_secs`, `enable_heartbeat`, `heartbeat_interval_mins`, `heartbeat_checklist_path`, `enable_memory_evolution`, `memory_evolution_interval_hours`, `memory_eval_trace_set_path`, `capability_profiles`, `enable_self_reflection`, `enable_image_generation`, `enable_screen_capture_in_loop`, `enable_camera_capture_tool`, `guiding_principles` | Renaming/removing any of these fields |
+| `agent::Agent` | Core loop, LLM, memory, reflection, capability-profile, and local-sensor fields retain their meanings | Renaming/removing live core fields |
 | `tools/vision.rs` | `enable_screen_capture_in_loop` and `enable_camera_capture_tool` must be present and default false | Removing/renaming these privacy gate fields |
-| `comfy_client.rs` | `comfyui.api_url` is a valid HTTP URL | Changing `ComfyUIConfig` structure |
-| Workflow plugin bundles | `plugin_settings[plugin_id]` stores arbitrary JSON objects keyed by plugin id | Removing or changing `plugin_settings` serialization |
+| Plugin packages | `plugin_settings[plugin_id]` stores arbitrary JSON objects keyed by plugin id | Removing or changing `plugin_settings` serialization |
 | TOML file | Serde field names and aliases (`agent_name` -> `username`, `check_interval_seconds` -> `poll_interval_secs`) | Removing serde aliases breaks existing config files |
 
 ## Notes
@@ -67,4 +61,4 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - Capability profile overrides default to empty, so loop policies fall back to code-defined defaults.
 - Unattended scheduled, background, and self-directed profiles are independently configurable and always resolve to autonomous execution semantics.
 - Screen and camera capture tools default to disabled and must be explicitly enabled in settings.
-- Default Graphchan URL derives from `GRAPHCHAN_PORT` env var if set.
+- Integration-specific legacy TOML keys are ignored during deserialization; their replacements live in plugin settings schemas.

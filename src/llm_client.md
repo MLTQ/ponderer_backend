@@ -27,7 +27,7 @@ HTTP client for OpenAI-compatible chat completion APIs (Ollama, LM Studio, vLLM,
 
 ### `LlmClient::evaluate_image(image_bytes, prompt, context)`
 - **Does**: Preprocesses images (resize/compress), sends image + prompt to a vision model using OpenAI-style multimodal content (`image_url`), and returns `ImageEvaluation { satisfactory, reasoning, suggested_prompt_refinement }`. Includes a constrained inline-base64 fallback path for providers that reject multimodal payloads.
-- **Interacts with**: `agent::image_gen` for evaluating ComfyUI outputs
+- **Interacts with**: vision tools for evaluating local image outputs.
 
 ### `LlmClient::parse_json<T>(response)`
 - **Does**: Robust JSON parser that tries multiple candidates from noisy model output (raw text, post-`</think>` tail, fenced code blocks, balanced JSON extraction), and also handles double-encoded JSON strings

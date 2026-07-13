@@ -1,13 +1,13 @@
 # mod.rs
 
 ## Purpose
-Coordinates the core autonomous agent loop with explicit three-loop architecture (Ambient/Engaged/Dream): polling skills, reasoning over events, managing visual state, running periodic ambient maintenance, handling private operator chat, and persisting long-lived behavior through the shared database. It is the runtime orchestrator that binds skills, tools, reasoning, memory, and UI events.
+Coordinates the core autonomous agent loop with explicit three-loop architecture (Ambient/Engaged/Dream): polling protocol-v1 plugins, reasoning over normalized events, managing visual state, running periodic ambient maintenance, handling private operator chat, and persisting long-lived behavior through the shared database. It binds the supervised plugin host, tools, reasoning, memory, and UI events.
 
 ## Components
 
 ### `Agent`
-- **Does**: Owns runtime dependencies (skills, tools, config, database, reasoning engines, runtime plugin host) plus per-conversation background-subtask handles, wake-signal primitives for interruptible sleeps, and lifecycle operations (`new`, `run_loop`, `reload_config`, `toggle_pause`, `set_paused`, `runtime_status`, `notify_operator_message_queued`)
-- **Interacts with**: `config::AgentConfig`, `database::AgentDatabase`, `skills::*`, `tools::ToolRegistry`, `runtime_plugin_host.rs`, `agent::reasoning`, `agent::trajectory`, `agent::orientation`, `agent::journal`, `agent::concerns`
+- **Does**: Owns runtime dependencies (tools, config, database, reasoning engines, runtime plugin host) plus per-conversation background-subtask handles, wake-signal primitives for interruptible sleeps, and lifecycle operations (`new`, `run_loop`, `reload_config`, `toggle_pause`, `set_paused`, `runtime_status`, `notify_operator_message_queued`)
+- **Interacts with**: `config::AgentConfig`, `database::AgentDatabase`, `skills::SkillEvent`, `tools::ToolRegistry`, `runtime_plugin_host.rs`, `agent::reasoning`, `agent::trajectory`, `agent::orientation`, `agent::journal`, `agent::concerns`
 
 ### Living Loop foundation modules (`journal`, `concerns`, `dream`, `self_context`)
 - **Does**: Provide typed records for journal entries and concern tracking, a tool-free structured Dream engine, and a bounded temporal self-context renderer
@@ -23,7 +23,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `ui::app` via shared flume channel; `server.rs` maps all variants to typed WS event types.
 
 ### `Agent::grant_session_tool_approval`
-- **Does**: Delegates to `ToolRegistry::grant_session_approval` so the named tool bypasses `NeedsApproval` checks for the rest of the process lifetime.
+- **Does**: Delegates to `ToolRegistry::grant_session_approval` so the named tool bypasses `NeedsApproval` checks for the rest of the process lifetime, then wakes cognition so approval-blocked durable plugin events retry promptly.
 - **Interacts with**: `tools/mod.rs` `ToolRegistry::grant_session_approval`; called from `server.rs` `POST /v1/agent/tools/:name/approve`.
 
 ### `maybe_notify_needs_approval`
@@ -31,12 +31,12 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `tools::ToolOutput::NeedsApproval`, `Agent::emit`, `AgentEvent::ApprovalRequest`.
 
 ### `run_loop`
-- **Does**: Main background loop; restores recent orientation, processed event receipts, and expired intention claims; checks pause state; applies pending runtime-plugin config changes on the loop runtime; then executes either legacy single-loop mode or the three-loop mode (`run_engaged_tick`, `run_ambient_tick`, `run_dream_cycle`). Sleep windows are interruptible so queued operator messages can wake the loop immediately.
+- **Does**: Main cognitive loop; restores recent orientation, processed event receipts, and expired intention claims, then executes either legacy single-loop mode or the three-loop mode (`run_engaged_tick`, `run_ambient_tick`, `run_dream_cycle`). Sleep windows are interruptible so queued operator messages can wake the loop immediately.
 - **Interacts with**: `maybe_evolve_persona`, `run_engaged_tick`, `run_ambient_tick`, `should_dream`, `run_dream_cycle`, `run_cycle`
 
 ### `run_engaged_tick`
-- **Does**: Runs operator chat processing and skill-event handling as the engaged loop, returning the filtered skill events used as ambient context input
-- **Interacts with**: `process_chat_messages`, skill polling, `AgenticLoop` skill-event pass
+- **Does**: Runs operator chat processing and plugin-event handling as the engaged loop, returning normalized filtered events for ambient context. Durable poll receipts advance only after a normally completed pass with an explicit decision or successful action; cancellation, iteration exhaustion, empty output, and approval waits remain pending.
+- **Interacts with**: `process_chat_messages`, runtime-plugin polling, `AgenticLoop` plugin-event pass
 
 ### `run_ambient_tick`
 - **Does**: Runs orientation + disposition execution + optional concern decay + autonomous self-directive scheduling + merged heartbeat scheduling in the ambient loop
@@ -56,8 +56,8 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `memory::eval`, `memory::archive`, `AgentDatabase` memory eval/promotion APIs
 
 ### `run_cycle`
-- **Does**: Polls skills, filters new events, then runs a dedicated agentic pass over those events so tool calls (including bridged skill actions) happen in the same loop architecture as private chat
-- **Interacts with**: `Skill::poll`, `tools::agentic::AgenticLoop`, `ToolRegistry` (notably `graphchan_skill`), `AgentDatabase` memory/chat helpers
+- **Does**: Polls the supervised runtime-plugin host, filters normalized events, then runs a dedicated agentic pass so package tools and regular tools share the same loop architecture as private chat. It applies the same fail-closed durable-receipt acceptance predicate as the Engaged loop.
+- **Interacts with**: runtime-plugin event polling, `tools::agentic::AgenticLoop`, the effect-aware `ToolRegistry`, and `AgentDatabase` memory/chat helpers
 
 ### `maybe_update_orientation`
 - **Does**: Samples presence + context, optionally captures/evaluates a desktop screenshot (when screen-capture opt-in is enabled), injects recent action digest + previous OODA packet context, computes a coarse signature, skips redundant orientation calls when unchanged, and otherwise runs orientation synthesis and persists snapshot records. Orientation/vision LLM calls are time-bounded so ambient work cannot stall engaged chat responsiveness indefinitely.
@@ -77,7 +77,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 ### `process_chat_messages`
 - **Does**: Handles unread operator chat messages by conversation thread, prioritizes operator conversations ahead of scheduled-only queues, and acquires an exact source-idempotent durable claim for the full unread-message batch before execution. If persistence or claim ownership is unavailable, execution fails closed and leaves messages unread for retry; an already-terminal claim reconciles the corresponding messages without duplicate execution. It streams live token output during each LLM call, emits per-tool progress updates plus live token-novelty samples, ingests structured concern signals (`[concerns]...[/concerns]`), and can run multiple autonomous turns per thread before final handoff using a structured `[turn_control]...[/turn_control]` protocol. In `direct` mode it runs a single-turn pass (still tool-capable), suppresses continuation/offload, disables runtime-plugin prompt addenda for latency, and uses existing compacted summaries without triggering a refresh LLM call. Scheduled-job conversations skip plugin prompt addenda and still use hard caps for chat turns + tool iterations so unattended work cannot monopolize the engaged loop. Foreground turn caps are optional safety rails; if enabled and exhausted while work can still continue, it offloads to a detached background subtask. It also runs deterministic loop-heat detection on per-turn signatures (action + response + tool set), forces a loop-break yield when repetitive similarity heat reaches configured threshold, persists per-turn user+system prompt payloads for UI inspection, stores a structured OODA packet per completed autonomous turn, retries one transient agentic error, and writes an operator-visible fallback failure message on terminal turn failure.
 - **Interacts with**: `database::chat_messages`, `database::chat_conversations`, `database::chat_turns`, `database::chat_turn_tool_calls`, `tools::agentic::AgenticLoop::run_with_history_streaming_and_tool_events`, `ToolRegistry`
-- **Rationale**: Uses continuation hints (not synthetic operator messages) for multi-turn autonomy, supports a configurable low-latency direct mode, scopes private-chat tools away from Graphchan posting, compacts long sessions through persisted summary snapshots, and only persists yielded assistant replies while allowing long tasks to continue asynchronously.
+- **Rationale**: Uses continuation hints (not synthetic operator messages) for multi-turn autonomy, supports a configurable low-latency direct mode, applies host-owned semantic effect policy to installed tools, compacts long sessions through persisted summary snapshots, and only persists yielded assistant replies while allowing long tasks to continue asynchronously.
 
 ### `spawn_background_subtask` / `run_background_chat_subtask` / `reap_finished_background_subtasks`
 - **Does**: Starts one detached worker per conversation, keeps subtask uniqueness per thread until the worker is explicitly reaped, executes additional autonomous turns with a dedicated unattended capability profile and the same prompt format, and reports completion/failure back through `AgentEvent`s. Reaping is the sole owner-removal path and preserves `done`, `blocked`, `needs_input`, `loop_break`, `paused`, and `failed` outcomes when settling durable intentions.
@@ -102,8 +102,13 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Interacts with**: `runtime_plugin_host.rs`, `tools::ToolRegistry`.
 
 ### `reload_config`
-- **Does**: Rebuilds the LLM-facing engines from the saved config, syncs private-chat mode into DB-backed runtime state, bumps a config-generation marker, and wakes the loop so runtime-plugin config is reapplied from the loop runtime instead of the API runtime.
-- **Interacts with**: `runtime_plugin_host.rs`, `tools::ToolRegistry`, `agent::{reasoning,orientation,journal,dream,trajectory}`.
+- **Does**: Rebuilds the LLM-facing engines from the saved config, syncs private-chat mode into DB-backed runtime state, and wakes sleeping cognition.
+- **Interacts with**: `agent::{reasoning,orientation,journal,dream,trajectory}` and the runtime control plane through `config_snapshot`.
+
+### `config_snapshot`
+- **Does**: Returns the current normalized config to the crate-internal runtime plugin control task without exposing the config lock.
+- **Interacts with**: `supervise_runtime_plugins` in `runtime.rs`.
+- **Rationale**: Plugin lifecycle reconciliation must continue while cognition is paused or occupied, while all callers still observe the same live config updated by `reload_config`.
 
 ### `calculate_tick_duration` / `should_dream` / `run_dream_cycle`
 - **Does**: Computes adaptive ambient tick frequency from user-state estimate, decides Dream trigger windows (away/deep-night + interval gate), and makes one bounded, tool-free structured consolidation over journal, concerns, intentions, recent action, prior Dream, and current orientation
@@ -120,7 +125,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Rationale**: Agent-wide continuity remains useful in ambient/Dream loops, but private conversation boundaries require an explicitly classified bridge rather than reusing a global narrative wholesale.
 
 ### Chat formatting helpers
-- **Does**: Builds operator-chat prompts and serializes tool-call/thinking/media metadata into `[tool_calls]...[/tool_calls]`, `[thinking]...[/thinking]`, and `[media]...[/media]` blocks for inline UI rendering
+- **Does**: Builds operator-chat prompts and serializes tool-call/thinking/media metadata into `[tool_calls]...[/tool_calls]`, `[thinking]...[/thinking]`, and `[media]...[/media]` blocks for inline UI rendering. Per-media `auto_play` is preserved as a generic boolean and defaults to `false` when a tool omits it.
 - **Interacts with**: `ui/chat.rs` parser for collapsible tool details and media previews
 
 ## Contracts
@@ -131,17 +136,17 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 | `config.rs` | Three-loop fields (`enable_ambient_loop`, `ambient_min_interval_secs`, `enable_journal`, `journal_min_interval_secs`, `enable_concerns`, `enable_dream_cycle`, `dream_min_interval_secs`) plus loop controls (`max_tool_iterations`, `disable_tool_iteration_limit`, `max_chat_autonomous_turns`, `max_background_subtask_turns`, `disable_chat_turn_limit`, `disable_background_subtask_turn_limit`, `loop_heat_threshold`, `loop_similarity_threshold`, `loop_signature_window`, `loop_heat_cooldown`) control runtime behavior | Renaming/removing these loop-control fields |
 | `ui/app.rs` | `AgentEvent` variants remain stable enough for chat/state rendering, including `ChatStreaming { conversation_id, content, done }`, `TokenMetrics { conversation_id, clear, samples }`, `ToolCallProgress { ... }`, `OrientationUpdate(...)`, `JournalWritten(...)`, `ConcernCreated { ... }`, and `ConcernTouched { ... }` | Renaming/removing emitted event types or metric fields |
 | `database.rs` | Chat and memory APIs are available and synchronous; private chat relies on conversation-scoped context plus turn lifecycle APIs (`begin_chat_turn`, `record_chat_turn_tool_call`, `complete_chat_turn`, `fail_chat_turn`, `add_chat_message_in_turn`) | Changing DB API names, turn-state semantics, or message persistence order |
-| `tools/mod.rs` | `ToolRegistry` can be shared and used in autonomous context, including bridged skill tools | Removing registry injection or bridged tool names used by prompts |
+| `tools/mod.rs` | `ToolRegistry` can be shared and used in autonomous context, including supervised package tools | Removing registry injection or package tool registration |
 | `tools/agentic.rs` | `AgenticLoop` accepts OpenAI-compatible endpoint and ToolContext for autonomous runs | Changing loop constructor/run signatures |
-| `agent/capability_profiles.rs` | Loop context policies are resolved centrally and applied consistently across heartbeat, skill events, and private chat | Bypassing policy resolver or changing profile semantics |
+| `agent/capability_profiles.rs` | Loop context policies are resolved centrally and applied consistently across heartbeat, plugin events, and private chat | Bypassing policy resolver or changing profile semantics |
 | `memory/eval.rs` | Replay evaluation functions remain deterministic and serializable | Breaking report schema or candidate IDs |
 | `ui/chat.rs` | Embedded chat-metadata delimiters remain stable (`[tool_calls]`, `[thinking]`, `[media]`, `[turn_control]`) | Changing envelope formats without parser update |
-| `tools/*` | Tool JSON with `media` arrays is transformed into chat-visible media payloads | Changing media extraction shape in formatter |
+| `tools/*` | Tool JSON with `media` arrays is transformed into chat-visible media payloads; any tool may request playback with per-item `auto_play: true` | Changing media extraction shape or autoplay default in formatter |
 | `server.rs` | Explicit pause/status controls remain available (`set_paused`, `runtime_status`) for REST API control; `grant_session_tool_approval` is exposed via `POST /v1/agent/tools/:name/approve` | Removing pause/status/approval methods or changing returned status shape |
 
 ## Notes
-- Current behavior combines periodic skill polling with persona maintenance, optional heartbeat automation, and private chat handling.
-- Skill-event handling now goes through the same multi-step tool-calling loop used by private chat, so skill actions and regular tools share one decision engine.
+- Current behavior combines periodic runtime-plugin polling with persona maintenance, optional heartbeat automation, and private chat handling.
+- Plugin-event handling goes through the same multi-step tool-calling loop used by private chat, so package tools and built-in tools share one decision engine.
 - Private chat replies are now scoped per conversation ID to avoid cross-thread prompt contamination.
 - Long-running private chats are compacted as `summary snapshot + recent context + new messages`, with snapshots stored in DB and refreshed after configurable message deltas.
 - Compaction summaries now include a bounded `Recent Reasoning Digest` synthesized from compacted-window OODA packets so older Observe/Orient/Decide/Act continuity survives transcript compression.
@@ -171,7 +176,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - Tool-call progress is streamed as events during a turn so the UI can show real-time execution output (for example shell output snippets) before final reply persistence.
 - Ambient mode includes a periodic self-directive pass that claims one durable intention, uses its independent autonomous capability profile, and records a leased lifecycle outcome so work can resume after restart.
 - Operator requests are source-idempotent intentions keyed by the complete unread batch, with exact foreground claims acquired before execution; unavailable ownership defers the batch without marking messages processed, while background handoff keeps the same claim and records its eventual completion/block/retry result.
-- Processed external-event IDs are persisted as a bounded receipt window, preventing replay after restart without unbounded state growth.
+- Processed external-event IDs are persisted as a bounded receipt window only after accepted cognition; cancelled, exhausted, empty, and approval-blocked passes retain their host receipt for replay without unbounded state growth.
 - Agent-wide loops receive an advisory `Temporal Self-Context` (Dream, public open intentions, concerns, timestamped orientation, optional self-description). Engaged/background chat receives a conversation-scoped variant containing only coarse timed ambient state and that thread's operator intentions; global narrative fields are excluded. Every historical block is explicitly untrusted data.
 - Background subtasks reuse the same streaming callbacks, so detached turns still surface incremental tool output, token streaming, and token novelty metrics in activity/chat panes.
 - Detached background subtasks use their own `autonomous=true` profile, preserving approval gates after the live operator turn has yielded.
@@ -183,7 +188,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - Repeated orientation screenshot-capture failures are warn-once + debug thereafter to avoid log spam; macOS permission failures include a Screen Recording hint.
 - Journal generation now runs off orientation disposition (`journal`) with two anti-spam guards: skip when disposition is unchanged from previous cycle, and skip until a minimum interval elapses since the last entry.
 - Tool access is enforced by explicit capability profiles per interactive and autonomous loop, with optional config overrides for allow/deny lists.
-- Outbound Graphchan attempts are tracked in a process-wide one-hour rolling window; quota is atomically reserved at each autonomous posting-tool invocation, so concurrent or multi-call passes cannot overshoot it. Ambiguous errors retain their slot because dispatch may have succeeded remotely. Reaching the configured maximum hides posting tools only from autonomous contexts and never stalls operator chat or the main loop. Persisting the window across backend restart remains follow-up work.
+- Tools declaring `external.publish` share a process-wide one-hour rolling quota. Quota is atomically reserved at each autonomous invocation, so concurrent or multi-call passes cannot overshoot it; ambiguous errors retain their slot because dispatch may have succeeded remotely. Tool names do not participate in this policy.
 - Operator messages and per-turn agent outcomes now append to daily memory log keys (`activity-log-YYYY-MM-DD`) for longitudinal context.
 - Heartbeat mode is guarded by config + due-time checks and is intentionally quiet when no pending tasks/reminders are found.
 - Terminal private-chat turn failures now generate an explicit fallback agent message and streaming completion event instead of silently dropping the turn.
@@ -193,4 +198,4 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - Completion nudge (Ponderer-q2y): if the agent returns 0 tool calls to an apparent action request with status=done/still_working, and the turn limit allows another turn, `should_continue` is forced true and the next turn's `continuation_hint` is replaced with an explicit "please actually use tools" prompt. The old completion check at the bottom of the turn loop is now only reached when the nudge could not fire (at turn limit).
 - Engaged private-chat prompts now have bounded plugin extension points: runtime plugins can contribute additive `engaged.context` and `engaged.instructions` blocks, but the core prompt framing still belongs to `Agent`.
 - Persona evolution now notifies the runtime plugin host after snapshot persistence so side-effect plugins can react (for example, voice-profile drift) without adding domain-specific state to `Agent`.
-- Config reload now signals the loop to reapply runtime-plugin settings on the agent runtime thread, preventing cross-runtime Tokio process-context issues while still enabling runtime bundles without a full backend restart.
+- Runtime-plugin configuration is no longer applied by the cognitive loop; a sibling control task on the same long-lived Tokio runtime owns it independently of pause and cognitive work.

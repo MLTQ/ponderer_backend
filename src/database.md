@@ -17,6 +17,7 @@ src/database/
   memory.rs         - Working memory CRUD, memory design version, archive/eval/promotion methods
   orientation.rs    - OrientationSnapshotRecord, PendingThoughtRecord, orientation snapshot and pending thought methods
   persona.rs        - PersonaSnapshot, PersonaTraits, CharacterCard, ReflectionRecord, all persona/character/reflection methods
+  plugins.rs        - Namespaced plugin state, bounded event ledger, receipt-backed delivery, dead letters, and cursor-aware retention
   posts.rs          - ImportantPost and all important post methods
   scheduled_jobs.rs - ScheduledJob methods (create, list, get, update, delete, next_due_at, take_due)
 ```
@@ -57,6 +58,8 @@ See each submodule's `.md` file for detailed component documentation.
 - Scheduled jobs live in their own additive `scheduled_jobs` table and create a dedicated chat conversation on insert so recurring runs retain thread-local history.
 - Durable intentions live in the additive `agent_intentions` table. A partial unique index on `(origin, source_reference)` prevents replayed source events from duplicating work, while lease and eligibility indexes support restart-safe claiming.
 - Dream consolidations live in an additive append-oriented table so the latest revisable continuity artifact can causally inform later loops without overwriting history.
+- Plugin capability continuity uses additive `plugin_state`, `plugin_events`, `plugin_event_cursors`, `plugin_event_deliveries`, and `plugin_event_dead_letters` tables. Events are durably sequenced and source-deduplicated before receipt-backed runtime delivery; malformed or unsupported rows are quarantined so replay continues.
+- SQLite triggers cap serialized plugin event payloads at 256 KiB even for callers that bypass the typed database API. Compaction removes only sufficiently old events passed by every exact-subscription cursor, while dead letters have a separate retention window.
 - Living Loop ll.1 added `journal_entries`, `concerns`, `orientation_snapshots`, and the now-legacy `pending_thoughts_queue`; actionable thoughts use `agent_intentions` so they have claims, retries, outcomes, and restart recovery.
 - OODA continuity adds additive table `ooda_turn_packets` plus supporting indexes on `(conversation_id, created_at)` and `(turn_id)`.
 - Conversation-scoped working-memory context keeps stable notes while filtering noisy cross-conversation activity lines by conversation tag. One-shot `session-handoff:*` entries are excluded from every generic context and consumed only through their exact conversation key.

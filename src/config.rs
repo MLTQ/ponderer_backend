@@ -27,86 +27,6 @@ impl Default for RespondTo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComfyUIConfig {
-    #[serde(default = "default_comfyui_url")]
-    pub api_url: String,
-    #[serde(default = "default_workflow_type")]
-    pub workflow_type: String,
-    #[serde(default = "default_model_name")]
-    pub model_name: String,
-    #[serde(default)]
-    pub vae_name: Option<String>,
-    #[serde(default = "default_width")]
-    pub width: u32,
-    #[serde(default = "default_height")]
-    pub height: u32,
-    #[serde(default = "default_steps")]
-    pub steps: u32,
-    #[serde(default = "default_cfg_scale")]
-    pub cfg_scale: f32,
-    #[serde(default = "default_sampler")]
-    pub sampler: String,
-    #[serde(default = "default_scheduler")]
-    pub scheduler: String,
-    #[serde(default)]
-    pub negative_prompt: String,
-}
-
-fn default_comfyui_url() -> String {
-    "http://127.0.0.1:8188".to_string()
-}
-
-fn default_workflow_type() -> String {
-    "sd".to_string()
-}
-
-fn default_model_name() -> String {
-    "v1-5-pruned-emaonly.safetensors".to_string()
-}
-
-fn default_width() -> u32 {
-    512
-}
-
-fn default_height() -> u32 {
-    512
-}
-
-fn default_steps() -> u32 {
-    20
-}
-
-fn default_cfg_scale() -> f32 {
-    7.0
-}
-
-fn default_sampler() -> String {
-    "euler".to_string()
-}
-
-fn default_scheduler() -> String {
-    "normal".to_string()
-}
-
-impl Default for ComfyUIConfig {
-    fn default() -> Self {
-        Self {
-            api_url: default_comfyui_url(),
-            workflow_type: default_workflow_type(),
-            model_name: default_model_name(),
-            vae_name: None,
-            width: default_width(),
-            height: default_height(),
-            steps: default_steps(),
-            cfg_scale: default_cfg_scale(),
-            sampler: default_sampler(),
-            scheduler: default_scheduler(),
-            negative_prompt: String::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CapabilityProfileOverride {
     #[serde(default)]
@@ -137,10 +57,6 @@ pub struct CapabilityProfileConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
-    // Graphchan connection (for graphchan skill)
-    #[serde(default = "default_graphchan_url")]
-    pub graphchan_api_url: String,
-
     // LLM configuration (OpenAI-compatible: Ollama, LM Studio, vLLM, OpenAI, etc.)
     #[serde(default = "default_llm_url")]
     pub llm_api_url: String,
@@ -233,21 +149,13 @@ pub struct AgentConfig {
     #[serde(default = "default_max_important_posts")]
     pub max_important_posts: u32,
 
-    // Image generation
-    #[serde(default)]
-    pub enable_image_generation: bool,
+    // Local sensing tools
     #[serde(default)]
     pub enable_screen_capture_in_loop: bool,
     #[serde(default)]
     pub enable_camera_capture_tool: bool,
-    #[serde(default)]
-    pub comfyui: ComfyUIConfig,
 
-    // Workflow settings
-    #[serde(default)]
-    pub workflow_path: Option<String>,
-    #[serde(default)]
-    pub workflow_settings: Option<String>, // JSON string of workflow settings
+    // Plugin-owned settings
     #[serde(default)]
     pub plugin_settings: HashMap<String, serde_json::Value>,
 
@@ -283,14 +191,6 @@ pub struct AgentConfig {
     // Legacy fields for backward compatibility
     #[serde(default)]
     pub max_posts_per_hour: u32,
-}
-
-fn default_graphchan_url() -> String {
-    env::var("GRAPHCHAN_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .map(|port| format!("http://localhost:{}", port))
-        .unwrap_or_else(|| "http://localhost:8080".to_string())
 }
 
 fn default_llm_url() -> String {
@@ -391,7 +291,6 @@ fn default_max_important_posts() -> u32 {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            graphchan_api_url: default_graphchan_url(),
             llm_api_url: default_llm_url(),
             llm_model: default_llm_model(),
             llm_api_key: None,
@@ -434,12 +333,8 @@ impl Default for AgentConfig {
             ],
             database_path: default_database_path(),
             max_important_posts: default_max_important_posts(),
-            enable_image_generation: false,
             enable_screen_capture_in_loop: false,
             enable_camera_capture_tool: false,
-            comfyui: ComfyUIConfig::default(),
-            workflow_path: None,
-            workflow_settings: None,
             plugin_settings: HashMap::new(),
             character_name: String::new(),
             character_description: String::new(),
@@ -524,10 +419,6 @@ impl AgentConfig {
     /// Load from environment variables (legacy support)
     pub fn from_env() -> Self {
         let mut config = Self::default();
-
-        if let Ok(url) = env::var("GRAPHCHAN_API_URL") {
-            config.graphchan_api_url = url;
-        }
 
         if let Ok(url) = env::var("LLM_API_URL") {
             config.llm_api_url = url;

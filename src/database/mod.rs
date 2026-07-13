@@ -17,6 +17,7 @@ pub mod journal;
 pub mod memory;
 pub mod orientation;
 pub mod persona;
+pub mod plugins;
 pub mod posts;
 pub mod scheduled_jobs;
 
@@ -28,6 +29,11 @@ pub use chat::{
 };
 pub use orientation::{OrientationSnapshotRecord, PendingThoughtRecord};
 pub use persona::{CharacterCard, PersonaSnapshot, PersonaTraits, ReflectionRecord};
+pub use plugins::{
+    NewPluginEvent, PluginEventCompactionReport, PluginEventCursor, PluginEventDeadLetter,
+    PluginEventDeliveryBatch, PluginEventDeliveryReceipt, PluginEventPage, PluginEventRecord,
+    PluginEventRetentionPolicy, PluginStateRecord,
+};
 pub use posts::ImportantPost;
 
 pub struct AgentDatabase {
@@ -203,6 +209,95 @@ impl AgentDatabase {
                 value TEXT NOT NULL
             )"#,
             [],
+        )?;
+
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS plugin_state (
+                plugin_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (plugin_id, key)
+            )"#,
+            [],
+        )?;
+
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS plugin_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                event_type TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                source_event_id TEXT,
+                occurred_at TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                correlation_id TEXT,
+                causation_id TEXT,
+                payload_json TEXT NOT NULL
+            )"#,
+            [],
+        )?;
+
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS plugin_event_cursors (
+                plugin_id TEXT NOT NULL,
+                subscription TEXT NOT NULL,
+                last_sequence INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (plugin_id, subscription)
+            )"#,
+            [],
+        )?;
+
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS plugin_event_deliveries (
+                plugin_id TEXT NOT NULL,
+                subscription TEXT NOT NULL,
+                delivery_token TEXT NOT NULL UNIQUE,
+                from_sequence INTEGER NOT NULL,
+                through_sequence INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                acknowledged_at TEXT,
+                PRIMARY KEY (plugin_id, subscription)
+            )"#,
+            [],
+        )?;
+
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS plugin_event_dead_letters (
+                sequence INTEGER PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                source TEXT NOT NULL,
+                source_event_id TEXT,
+                occurred_at TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                correlation_id TEXT,
+                causation_id TEXT,
+                payload_json TEXT NOT NULL,
+                payload_truncated INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL,
+                quarantined_at TEXT NOT NULL
+            )"#,
+            [],
+        )?;
+
+        conn.execute_batch(
+            r#"CREATE TRIGGER IF NOT EXISTS plugin_events_payload_limit_insert
+               BEFORE INSERT ON plugin_events
+               WHEN length(CAST(NEW.payload_json AS BLOB)) > 262144
+               BEGIN
+                   SELECT RAISE(ABORT, 'plugin event payload exceeds 262144 bytes');
+               END;
+               CREATE TRIGGER IF NOT EXISTS plugin_events_payload_limit_update
+               BEFORE UPDATE OF payload_json ON plugin_events
+               WHEN length(CAST(NEW.payload_json AS BLOB)) > 262144
+               BEGIN
+                   SELECT RAISE(ABORT, 'plugin event payload exceeds 262144 bytes');
+               END;"#,
         )?;
 
         // Create index for faster lookups
@@ -642,6 +737,22 @@ impl AgentDatabase {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ooda_packets_turn_id ON ooda_turn_packets(turn_id)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_plugin_events_source_id ON plugin_events(source, source_event_id) WHERE source_event_id IS NOT NULL AND TRIM(source_event_id) <> ''",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_plugin_events_type_sequence ON plugin_events(event_type, sequence ASC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_plugin_events_recorded_at ON plugin_events(recorded_at ASC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_plugin_event_dead_letters_quarantined_at ON plugin_event_dead_letters(quarantined_at ASC)",
             [],
         )?;
 

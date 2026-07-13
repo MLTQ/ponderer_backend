@@ -38,6 +38,10 @@ Defines explicit tool-capability profiles for interactive and unattended agent c
 ## Notes
 - `allowed_tools` and `disallowed_tools` overrides are replacement-based when provided.
 - Tool names are normalized (trimmed, deduplicated case-insensitively) before policy application.
-- `ambient` defaults are read-oriented (blocks write/shell/posting/media-publish operations).
+- `ambient` defaults are read-oriented for built-ins (blocks file writes, shell,
+  memory writes, and chat-media publication); semantic effect policy separately
+  gates any installed plugin tool.
 - `dream` defaults are internal-memory-only via explicit allowlist (`search_memory`, `write_memory`).
+- Profiles never hardcode domain plugin names. Outward and sensitive authority is
+  derived from each tool's declared effects.
 - `scheduled`, `background`, and `self_directed` default to `autonomous=true`; approval-required tools remain blocked until the operator grants approval.

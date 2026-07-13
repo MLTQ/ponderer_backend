@@ -82,6 +82,17 @@ pub struct LlmFunctionCall {
     pub arguments: String, // JSON string
 }
 
+/// Why an agentic loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgenticTermination {
+    /// The model produced a terminal response with no further tool calls.
+    Completed,
+    /// The operator advanced the cancellation generation.
+    Cancelled,
+    /// The configured tool-calling iteration budget was exhausted.
+    IterationLimit,
+}
+
 /// The outcome of running the agentic loop
 #[derive(Debug, Clone)]
 pub struct AgenticResult {
@@ -93,7 +104,11 @@ pub struct AgenticResult {
     pub tool_calls_made: Vec<ToolCallRecord>,
     /// Number of iterations used
     pub iterations: usize,
+    /// The explicit reason the loop stopped.
+    pub termination: AgenticTermination,
     /// Whether the loop hit the iteration limit
+    ///
+    /// Retained for compatibility; prefer matching on `termination`.
     pub hit_limit: bool,
 }
 
@@ -397,6 +412,7 @@ impl AgenticLoop {
             thinking_blocks: Vec::new(),
             tool_calls_made,
             iterations,
+            termination: AgenticTermination::Cancelled,
             hit_limit: false,
         }
     }
@@ -529,6 +545,7 @@ impl AgenticLoop {
                         thinking_blocks: Vec::new(),
                         tool_calls_made,
                         iterations: iterations - 1,
+                        termination: AgenticTermination::IterationLimit,
                         hit_limit: true,
                     });
                 }
@@ -547,6 +564,13 @@ impl AgenticLoop {
                 .call_llm(&messages, &tool_defs, on_text_stream)
                 .await
                 .context("LLM call failed in agentic loop")?;
+            // Streaming/non-streaming request helpers use a synthetic assistant
+            // message to unwind promptly on cancellation. Re-check the generation
+            // here so that message cannot be classified as normal completion.
+            if self.is_cancelled() {
+                tracing::info!("Agentic loop cancelled during LLM execution");
+                return Ok(self.cancelled_result(iterations, tool_calls_made));
+            }
 
             // Check if LLM returned tool calls
             if let Some(ref tool_calls) = llm_response.tool_calls {
@@ -672,6 +696,7 @@ impl AgenticLoop {
                 thinking_blocks,
                 tool_calls_made,
                 iterations,
+                termination: AgenticTermination::Completed,
                 hit_limit: false,
             });
         }
@@ -1169,6 +1194,34 @@ mod tests {
         let config = AgenticConfig::default();
         assert_eq!(config.max_iterations, Some(10));
         assert_eq!(config.temperature, 0.7);
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_reports_explicit_termination() {
+        let cancellation_generation = Arc::new(AtomicU64::new(1));
+        let config = AgenticConfig {
+            cancel_generation: Some(cancellation_generation),
+            start_generation: 0,
+            ..AgenticConfig::default()
+        };
+        let loop_runner = AgenticLoop::new(config, Arc::new(ToolRegistry::new()));
+        let context = ToolContext {
+            working_directory: ".".to_string(),
+            username: "tester".to_string(),
+            conversation_id: None,
+            autonomous: true,
+            allowed_tools: None,
+            disallowed_tools: Vec::new(),
+            outbound_action_rate_limit: None,
+        };
+
+        let result = loop_runner
+            .run("system", "event", &context)
+            .await
+            .expect("cancelled loop result");
+
+        assert_eq!(result.termination, AgenticTermination::Cancelled);
+        assert!(!result.hit_limit);
     }
 
     #[test]

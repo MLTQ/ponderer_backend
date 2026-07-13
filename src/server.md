@@ -10,7 +10,7 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 - **Interacts with**: `runtime.rs` (`BackendRuntime`), `agent/mod.rs` (`AgentEvent`), `database.rs` (`AgentDatabase` chat APIs).
 
 ### `ServerState`
-- **Does**: Shared application state containing the agent handle, agent-loop supervisor health, DB handle, auth token, mutable config snapshot, shared process registry, plugin manifests, WS broadcaster, and the Telegram bot manager.
+- **Does**: Shared application state containing the agent handle, agent-loop supervisor health, DB handle, auth token, mutable config snapshot, shared process registry, base manifests, live runtime plugin host, WS broadcaster, and the Telegram bot manager.
 - **Interacts with**: all route handlers, auth middleware, and `telegram.rs`.
 
 ### `GET /v1/health`
@@ -20,7 +20,13 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 
 ### REST handlers (`/v1/...`)
 - **Does**: Provide CRUD-like operations for config/conversations/messages, scheduled jobs, process inspection, turn/tool-call/prompt inspection, plugin manifest discovery, pause/status/stop controls, direct private-chat-mode get/set control, and tool session-approval grants. Config updates normalize private-chat mode before save/reload and also reconfigure Telegram runtime state. Message enqueue also triggers an immediate agent wake signal.
-- **Interacts with**: `database.rs` chat + scheduled-job APIs, `process_registry.rs`, `plugin.rs` manifests, and `agent` runtime control methods.
+- **Interacts with**: `database.rs` chat + scheduled-job APIs, `process_registry.rs`, canonical `plugin_contract` manifests, and `agent` runtime control methods.
+
+### Plugin routes (`/v1/plugins`, `/v1/plugins/status`)
+- **Does**: Merges built-in manifests with the runtime host's live handshake-enriched package manifests and exposes current runtime lifecycle status separately.
+- **Interacts with**: `runtime_plugin_host.rs` `manifests()` / `statuses()` and the desktop API client.
+- **Rationale**: Tool metadata, negotiated protocol, process IDs, failures, and restart state change after server bootstrap and cannot be represented by a startup snapshot.
+- **Tests**: Manifest merging verifies live runtime metadata replaces a stale same-ID entry without dropping `builtin.core`.
 
 ### Scheduled-job routes (`/v1/scheduled-jobs`)
 - **Does**: Exposes list/create/get/update/delete endpoints for interval-based recurring jobs backed by SQLite.
@@ -60,8 +66,9 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 
 ## Notes
 - `/v1/health` is authenticated in `required` mode, matching deny-by-default auth boundaries. Its body reports `ok` or `degraded` from live supervisor state while retaining HTTP 200 in either case.
-- `/v1/plugins` exposes loaded plugin manifests (built-ins, discovered workflow bundles, discovered runtime-process bundles, and extension plugins) for client-side capability discovery, including optional settings-tab metadata and inline settings schemas for the desktop settings window.
-- Runtime-process plugins are initialized by `Agent::run_loop` on the dedicated agent runtime thread so plugin stdio/process handles and tool execution share one Tokio runtime context.
+- `/v1/plugins` exposes built-ins and discovered protocol-v1 package manifests for client-side capability discovery, including optional settings-tab metadata and inline settings schemas for the desktop settings window.
+- `/v1/plugins` preserves built-in entries while querying protocol-v1 package manifests live; `/v1/plugins/status` returns live subprocess desired/actual state and restart diagnostics.
+- Runtime-process plugins are reconciled by the agent supervisor's sibling control task so plugin stdio/process handles and tool execution share one long-lived Tokio runtime without depending on cognitive progress.
 - Message enqueue validates non-empty content and returns the created `message_id`.
 - Message enqueue (`POST /v1/conversations/:id/messages`) now nudges the agent runtime to wake immediately instead of waiting for the next ambient/poll sleep interval.
 - The WS stream now includes `token_metrics` alongside `chat_streaming`, allowing clients to render per-token-ish novelty traces without polling.

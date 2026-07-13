@@ -34,8 +34,9 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 - **Interacts with**: `call_llm_streaming` and the non-streaming fallback path.
 
 ### `AgenticResult`
-- **Does**: Returns the visible response, extracted thinking blocks, tool calls made, iteration count, and limit status
+- **Does**: Returns the visible response, extracted thinking blocks, tool calls made, iteration count, compatibility limit flag, and explicit `AgenticTermination` (`Completed`, `Cancelled`, or `IterationLimit`)
 - **Interacts with**: Chat formatting and UI rendering in `../agent/mod.rs` and `../ui/chat.rs`
+- **Rationale**: Synthetic cancellation/limit messages must not be mistaken for normally accepted cognition at durable-work boundaries
 
 ### `split_visible_and_thinking`
 - **Does**: Strips `<think>`/`<thinking>` sections from model content and returns hidden reasoning blocks separately
@@ -45,7 +46,7 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
-| `../agent/mod.rs` | `AgenticResult` includes `response`, `thinking_blocks`, and `tool_calls_made` | Renaming/removing these fields |
+| `../agent/mod.rs` | `AgenticResult` includes `response`, `thinking_blocks`, `tool_calls_made`, and a truthful `termination` reason | Renaming/removing these fields or classifying cancellation/limit as `Completed` |
 | `../agent/mod.rs` | `run_with_history_streaming` callback receives `StreamingUpdate { content, done, token_metrics }`; tool-event callback receives completed `ToolCallRecord`s | Changing callback semantics or metric payload fields |
 | `../tools/mod.rs` | Tool calls are executed via `ToolRegistry::execute_call` and tool visibility honors `ToolContext` policy | Changing execution or filtering flow contracts |
 | OpenAI-compatible backends | Request/response shape uses `chat/completions` with optional `tools` and optional streaming SSE | Non-compatible payload format changes |
@@ -59,3 +60,4 @@ Implements the multi-step tool-calling loop that drives autonomous and chat-mode
 - Streaming requests now try `logprobs` / `top_logprobs` first and retry without them when the provider rejects those fields.
 - When logprobs are missing, token metrics still flow using a lightweight local tokenizer and novelty estimator so the UI can render a stable live trace.
 - HTTP client initialization now has a panic-safe fallback (`no_proxy`) if default system proxy discovery fails on host OS APIs.
+- Cancellation is re-checked after each LLM request because request helpers unwind with a synthetic assistant message; the outer result still reports `AgenticTermination::Cancelled` rather than `Completed`.

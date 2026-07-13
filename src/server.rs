@@ -20,9 +20,10 @@ use crate::database::{
     AgentDatabase, ChatConversation, ChatConversationSummary, ChatMessage, ChatTurn,
     ChatTurnToolCall, DEFAULT_CHAT_CONVERSATION_ID,
 };
-use crate::plugin::BackendPluginManifest;
+use crate::plugin_contract::{PluginKind, PluginManifest, PluginRuntimeStatus};
 use crate::process_registry::{ProcessInfo, ProcessRegistry};
 use crate::runtime::{AgentLoopSupervisor, AgentLoopSupervisorStatus, BackendRuntime};
+use crate::runtime_plugin_host::RuntimePluginHost;
 use crate::scheduled_jobs::ScheduledJob;
 use crate::tools::memory::PRIVATE_CHAT_MODE_STATE_KEY;
 
@@ -34,7 +35,8 @@ pub struct ServerState {
     pub auth: BackendAuthConfig,
     pub config: Arc<tokio::sync::RwLock<AgentConfig>>,
     pub process_registry: Arc<ProcessRegistry>,
-    pub plugin_manifests: Vec<BackendPluginManifest>,
+    pub base_plugin_manifests: Vec<PluginManifest>,
+    pub runtime_plugin_host: Arc<RuntimePluginHost>,
     pub ws_events: broadcast::Sender<ApiEventEnvelope>,
     pub telegram_bot: Arc<crate::telegram::TelegramBotManager>,
 }
@@ -173,7 +175,13 @@ pub async fn serve_backend(
         auth,
         config: Arc::new(tokio::sync::RwLock::new(runtime.config.clone())),
         process_registry: runtime.process_registry.clone(),
-        plugin_manifests: runtime.plugin_manifests.clone(),
+        base_plugin_manifests: runtime
+            .plugin_manifests
+            .iter()
+            .filter(|manifest| manifest.kind != PluginKind::RuntimeProcessBundle)
+            .cloned()
+            .collect(),
+        runtime_plugin_host: runtime.runtime_plugin_host.clone(),
         ws_events: ws_events.clone(),
         telegram_bot: telegram_bot.clone(),
     });
@@ -196,6 +204,7 @@ pub async fn serve_backend(
         .route("/health", get(health))
         .route("/config", get(get_config).put(update_config))
         .route("/plugins", get(list_plugins))
+        .route("/plugins/status", get(list_plugin_statuses))
         .route(
             "/conversations",
             get(list_conversations).post(create_conversation),
@@ -467,8 +476,36 @@ async fn get_config(
 
 async fn list_plugins(
     State(state): State<Arc<ServerState>>,
-) -> Result<Json<Vec<BackendPluginManifest>>, (StatusCode, String)> {
-    Ok(Json(state.plugin_manifests.clone()))
+) -> Result<Json<Vec<PluginManifest>>, (StatusCode, String)> {
+    let runtime_manifests = state.runtime_plugin_host.manifests().await;
+    Ok(Json(merge_plugin_manifests(
+        &state.base_plugin_manifests,
+        runtime_manifests,
+    )))
+}
+
+async fn list_plugin_statuses(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<Vec<PluginRuntimeStatus>>, (StatusCode, String)> {
+    Ok(Json(state.runtime_plugin_host.statuses().await))
+}
+
+fn merge_plugin_manifests(
+    base_manifests: &[PluginManifest],
+    runtime_manifests: Vec<PluginManifest>,
+) -> Vec<PluginManifest> {
+    let mut manifests = base_manifests.to_vec();
+    for runtime_manifest in runtime_manifests {
+        if let Some(existing) = manifests
+            .iter_mut()
+            .find(|manifest| manifest.id == runtime_manifest.id)
+        {
+            *existing = runtime_manifest;
+        } else {
+            manifests.push(runtime_manifest);
+        }
+    }
+    manifests
 }
 
 async fn update_config(
@@ -1060,5 +1097,44 @@ mod tests {
         supervisor.active = false;
         supervisor.last_error = Some("loop panic".to_string());
         assert_eq!(health_status(&supervisor), "degraded");
+    }
+
+    #[test]
+    fn live_runtime_manifest_replaces_stale_entry_without_dropping_builtin() {
+        fn manifest(id: &str, kind: PluginKind, provided_tools: &[&str]) -> PluginManifest {
+            PluginManifest {
+                manifest_version: crate::plugin_contract::CURRENT_PLUGIN_MANIFEST_VERSION,
+                protocol_version: crate::plugin_contract::CURRENT_PLUGIN_PROTOCOL_VERSION,
+                id: id.to_string(),
+                kind,
+                name: id.to_string(),
+                version: "0.1.0".to_string(),
+                description: "fixture".to_string(),
+                provided_tools: provided_tools.iter().map(|tool| tool.to_string()).collect(),
+                tools: Vec::new(),
+                provided_skills: Vec::new(),
+                requested_capabilities: Vec::new(),
+                declared_effects: Vec::new(),
+                contributions: None,
+                settings_tab: None,
+                settings_schema: None,
+            }
+        }
+
+        let merged = merge_plugin_manifests(
+            &[
+                manifest("builtin.core", PluginKind::Builtin, &["read_file"]),
+                manifest("dev.example", PluginKind::RuntimeProcessBundle, &[]),
+            ],
+            vec![manifest(
+                "dev.example",
+                PluginKind::RuntimeProcessBundle,
+                &["example_reply"],
+            )],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "builtin.core");
+        assert_eq!(merged[1].provided_tools, vec!["example_reply"]);
     }
 }

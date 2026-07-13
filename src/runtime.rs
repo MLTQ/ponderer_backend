@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use flume::Sender;
 use futures_util::FutureExt;
@@ -14,11 +14,13 @@ use crate::agent::{Agent, AgentEvent};
 use crate::config::AgentConfig;
 use crate::database::AgentDatabase;
 
-use crate::plugin::{BackendPlugin, BackendPluginKind, BackendPluginManifest};
+use crate::plugin_contract::{
+    PluginKind, PluginManifest, PluginRuntimeStatus, CURRENT_PLUGIN_MANIFEST_VERSION,
+    CURRENT_PLUGIN_PROTOCOL_VERSION,
+};
 use crate::process_registry::ProcessRegistry;
 use crate::runtime_plugin_host::RuntimePluginHost;
 use crate::runtime_process_plugin::RuntimeProcessPluginCatalog;
-use crate::skills::Skill;
 use crate::tools::ToolRegistry;
 
 pub struct BackendRuntime {
@@ -29,7 +31,7 @@ pub struct BackendRuntime {
     pub process_registry: Arc<ProcessRegistry>,
     pub runtime_plugin_host: Arc<RuntimePluginHost>,
     pub ui_database: Option<Arc<AgentDatabase>>,
-    pub plugin_manifests: Vec<BackendPluginManifest>,
+    pub plugin_manifests: Vec<PluginManifest>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -81,43 +83,33 @@ impl AgentLoopSupervisor {
 
 const AGENT_RESTART_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const AGENT_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const PLUGIN_CONTROL_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct BackendRuntimeBuilder {
     config: AgentConfig,
     event_tx: Sender<AgentEvent>,
-    plugins: Vec<Arc<dyn BackendPlugin>>,
 }
 
 impl BackendRuntimeBuilder {
     pub fn new(config: AgentConfig, event_tx: Sender<AgentEvent>) -> Self {
-        Self {
-            config,
-            event_tx,
-            plugins: Vec::new(),
-        }
-    }
-
-    pub fn with_plugin(mut self, plugin: Arc<dyn BackendPlugin>) -> Self {
-        self.plugins.push(plugin);
-        self
-    }
-
-    pub fn with_plugins<I>(mut self, plugins: I) -> Self
-    where
-        I: IntoIterator<Item = Arc<dyn BackendPlugin>>,
-    {
-        self.plugins.extend(plugins);
-        self
+        Self { config, event_tx }
     }
 
     pub fn build(self) -> Result<BackendRuntime> {
         let config = self.config;
-        let mut skill_list: Vec<Box<dyn Skill>> = Vec::new();
         let tool_registry = Arc::new(ToolRegistry::new());
         let process_registry = Arc::new(ProcessRegistry::new());
         let runtime_process_plugins = Arc::new(RuntimeProcessPluginCatalog::discover()?);
-        let runtime_plugin_host = Arc::new(RuntimePluginHost::with_catalog(
+        let ui_database = match AgentDatabase::new(&config.database_path) {
+            Ok(db) => Some(Arc::new(db)),
+            Err(e) => {
+                tracing::warn!("Failed to create shared runtime database: {}", e);
+                None
+            }
+        };
+        let runtime_plugin_host = Arc::new(RuntimePluginHost::with_catalog_and_database(
             runtime_process_plugins.clone(),
+            ui_database.clone(),
         ));
 
         let init_rt = tokio::runtime::Runtime::new()?;
@@ -129,38 +121,8 @@ impl BackendRuntimeBuilder {
 
         let mut manifests = vec![builtin_core_manifest()];
         manifests.extend(runtime_process_plugins.manifests());
-        for plugin in self.plugins {
-            let manifest = plugin.manifest();
-            let plugin_id = manifest.id.clone();
-            let mut plugin_skills = plugin
-                .build_skills(&config)
-                .with_context(|| format!("Plugin '{}' failed to build skills", plugin_id))?;
-            let plugin_skill_count = plugin_skills.len();
-            skill_list.append(&mut plugin_skills);
-
-            init_rt
-                .block_on(plugin.register_tools(tool_registry.clone(), &config))
-                .with_context(|| format!("Plugin '{}' failed to register tools", plugin_id))?;
-
-            tracing::info!(
-                "Loaded plugin '{}' (skills added: {}, tools: {:?})",
-                plugin_id,
-                plugin_skill_count,
-                manifest.provided_tools
-            );
-            manifests.push(manifest);
-        }
-
-        let ui_database = match AgentDatabase::new(&config.database_path) {
-            Ok(db) => Some(Arc::new(db)),
-            Err(e) => {
-                tracing::warn!("Failed to create UI database: {}", e);
-                None
-            }
-        };
 
         let agent = Arc::new(Agent::new(
-            skill_list,
             tool_registry.clone(),
             runtime_plugin_host.clone(),
             config.clone(),
@@ -188,6 +150,8 @@ impl BackendRuntime {
     pub fn spawn_agent_loop(&self) -> JoinHandle<()> {
         let agent = self.agent.clone();
         let supervisor = self.agent_supervisor.clone();
+        let runtime_plugin_host = self.runtime_plugin_host.clone();
+        let tool_registry = self.tool_registry.clone();
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Runtime::new() {
                 Ok(runtime) => runtime,
@@ -198,18 +162,53 @@ impl BackendRuntime {
                     return;
                 }
             };
-            runtime.block_on(supervise_agent_loop(agent, supervisor));
+            runtime.block_on(supervise_agent_loop(
+                agent,
+                supervisor,
+                runtime_plugin_host,
+                tool_registry,
+            ));
         })
+    }
+
+    pub async fn current_plugin_manifests(&self) -> Vec<PluginManifest> {
+        self.runtime_plugin_host.manifests().await
+    }
+
+    pub async fn plugin_statuses(&self) -> Vec<PluginRuntimeStatus> {
+        self.runtime_plugin_host.statuses().await
     }
 }
 
-async fn supervise_agent_loop(agent: Arc<Agent>, supervisor: AgentLoopSupervisor) {
+async fn supervise_agent_loop(
+    agent: Arc<Agent>,
+    supervisor: AgentLoopSupervisor,
+    runtime_plugin_host: Arc<RuntimePluginHost>,
+    tool_registry: Arc<ToolRegistry>,
+) {
     let mut consecutive_exits = 0_u64;
     loop {
         supervisor.mark_generation_started();
+        reconcile_runtime_plugins_once(
+            agent.clone(),
+            runtime_plugin_host.clone(),
+            tool_registry.clone(),
+        )
+        .await;
+        let plugin_control_task = tokio::spawn(supervise_runtime_plugins(
+            agent.clone(),
+            runtime_plugin_host.clone(),
+            tool_registry.clone(),
+        ));
         let outcome = AssertUnwindSafe(agent.clone().run_loop())
             .catch_unwind()
             .await;
+        plugin_control_task.abort();
+        if let Err(error) = plugin_control_task.await {
+            if !error.is_cancelled() {
+                tracing::warn!("Runtime plugin control task exited abnormally: {error}");
+            }
+        }
         let error = describe_agent_loop_exit(outcome);
         supervisor.mark_generation_exited(error.clone());
 
@@ -221,6 +220,45 @@ async fn supervise_agent_loop(agent: Arc<Agent>, supervisor: AgentLoopSupervisor
             "Agent loop exited; supervisor will restart it"
         );
         tokio::time::sleep(backoff).await;
+    }
+}
+
+async fn supervise_runtime_plugins(
+    agent: Arc<Agent>,
+    runtime_plugin_host: Arc<RuntimePluginHost>,
+    tool_registry: Arc<ToolRegistry>,
+) {
+    let mut interval = tokio::time::interval(PLUGIN_CONTROL_RECONCILE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        reconcile_runtime_plugins_once(
+            agent.clone(),
+            runtime_plugin_host.clone(),
+            tool_registry.clone(),
+        )
+        .await;
+    }
+}
+
+async fn reconcile_runtime_plugins_once(
+    agent: Arc<Agent>,
+    runtime_plugin_host: Arc<RuntimePluginHost>,
+    tool_registry: Arc<ToolRegistry>,
+) {
+    let config = agent.config_snapshot().await;
+    if let Err(error) = runtime_plugin_host
+        .apply_config(&config, tool_registry)
+        .await
+    {
+        tracing::warn!("Runtime plugin control reconciliation failed: {error:#}");
+    }
+    if let Err(error) = runtime_plugin_host
+        .compact_event_ledger_if_due(Utc::now())
+        .await
+    {
+        tracing::warn!("Runtime plugin event compaction failed: {error:#}");
     }
 }
 
@@ -250,10 +288,12 @@ fn agent_restart_backoff(consecutive_exit_count: u64) -> Duration {
         .min(AGENT_RESTART_MAX_BACKOFF)
 }
 
-fn builtin_core_manifest() -> BackendPluginManifest {
-    BackendPluginManifest {
+fn builtin_core_manifest() -> PluginManifest {
+    PluginManifest {
+        manifest_version: CURRENT_PLUGIN_MANIFEST_VERSION,
+        protocol_version: CURRENT_PLUGIN_PROTOCOL_VERSION,
         id: "builtin.core".to_string(),
-        kind: BackendPluginKind::Builtin,
+        kind: PluginKind::Builtin,
         name: "Ponderer Built-ins".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         description: "Core tools and default runtime wiring provided by ponderer_backend."
@@ -279,8 +319,13 @@ fn builtin_core_manifest() -> BackendPluginManifest {
             "create_scheduled_job".to_string(),
             "update_scheduled_job".to_string(),
             "delete_scheduled_job".to_string(),
+            "plugin_workbench".to_string(),
         ],
+        tools: Vec::new(),
         provided_skills: Vec::new(),
+        requested_capabilities: Vec::new(),
+        declared_effects: Vec::new(),
+        contributions: Some(Default::default()),
         settings_tab: None,
         settings_schema: None,
     }
@@ -298,6 +343,7 @@ async fn register_builtin_core_tools(
             FlagUncertaintyTool, MemorySearchTool, MemoryWriteTool, PrivateChatModeTool,
             ScratchNoteTool, WriteSessionHandoffTool,
         },
+        plugin_workbench::PluginWorkbenchTool,
         scheduled_jobs::{
             CreateScheduledJobTool, DeleteScheduledJobTool, ListScheduledJobsTool,
             UpdateScheduledJobTool,
@@ -360,6 +406,11 @@ async fn register_builtin_core_tools(
         .await;
     tool_registry
         .register(Arc::new(DeleteScheduledJobTool::new()))
+        .await;
+    tool_registry
+        .register(Arc::new(PluginWorkbenchTool::new(
+            crate::plugin_workbench::PluginWorkbench::from_environment(),
+        )))
         .await;
 
     tracing::info!("Core tool registry initialized");

@@ -7,7 +7,7 @@ Provides panic-safe `reqwest::Client` constructors used across backend modules. 
 
 ### `build_http_client`
 - **Does**: Builds a default HTTP client with a 120-second request deadline and panic-safe fallback to `no_proxy`.
-- **Interacts with**: `llm_client.rs`, `tools/agentic.rs`, `tools/comfy.rs`, `skills/graphchan.rs`, `agent/reasoning.rs`, `agent/trajectory.rs`, `comfy_client.rs`
+- **Interacts with**: `llm_client.rs`, `tools/agentic.rs`, `agent/reasoning.rs`, and `agent/trajectory.rs`.
 
 ### `build_http_client_with_timeout`
 - **Does**: Builds the same panic-safe client with an explicit optional request timeout; `None` intentionally preserves reqwest's no-deadline behavior for callers that opt into it.

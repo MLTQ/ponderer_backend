@@ -67,8 +67,8 @@ fn default_policy(profile: AgentCapabilityProfile) -> ToolCapabilityPolicy {
         AgentCapabilityProfile::PrivateChat => ToolCapabilityPolicy {
             autonomous: false,
             allowed_tools: None,
-            // Graphchan tools are allowed in private chat so the operator can explicitly
-            // direct posts. Spontaneous posting is discouraged via the system prompt.
+            // Interactive requests may use installed tools; semantic effect policy
+            // still supplies host minimums for sensitive operations.
             disallowed_tools: vec![],
         },
         AgentCapabilityProfile::Scheduled
@@ -86,13 +86,11 @@ fn default_policy(profile: AgentCapabilityProfile) -> ToolCapabilityPolicy {
         AgentCapabilityProfile::Heartbeat => ToolCapabilityPolicy {
             autonomous: true,
             allowed_tools: None,
-            // Graphchan posting allowed — agent may share relevant updates under its own name.
             disallowed_tools: vec![],
         },
         AgentCapabilityProfile::Ambient => ToolCapabilityPolicy {
             autonomous: true,
             allowed_tools: None,
-            // Graphchan posting allowed — agent may share thoughts/work under its own name.
             // Destructive file/shell ops and media generation remain off in ambient mode.
             disallowed_tools: vec![
                 "write_file".to_string(),
@@ -108,10 +106,7 @@ fn default_policy(profile: AgentCapabilityProfile) -> ToolCapabilityPolicy {
                 "search_memory".to_string(),
                 "write_memory".to_string(),
             ]),
-            disallowed_tools: vec![
-                "graphchan_skill".to_string(),
-                "post_to_graphchan".to_string(),
-            ],
+            disallowed_tools: Vec::new(),
         },
     }
 }
@@ -154,37 +149,25 @@ mod tests {
     use crate::config::AgentConfig;
 
     #[test]
-    fn private_chat_allows_graphchan_tools_for_explicit_operator_requests() {
-        // Graphchan tools are no longer hard-blocked in private chat so the operator
-        // can explicitly ask the agent to post. Spontaneous posting is discouraged via
-        // the system prompt instruction, not via capability gating.
+    fn private_chat_does_not_hardcode_plugin_tool_names() {
         let cfg = AgentConfig::default();
         let policy = resolve_capability_policy(
             AgentCapabilityProfile::PrivateChat,
             &cfg.capability_profiles,
         );
         assert!(!policy.autonomous);
-        assert!(
-            !policy
-                .disallowed_tools
-                .iter()
-                .any(|tool| tool.eq_ignore_ascii_case("graphchan_skill")),
-            "graphchan_skill should not be hard-blocked in private chat"
-        );
+        assert!(policy.disallowed_tools.is_empty());
     }
 
     #[test]
-    fn skill_events_allow_graphchan_tools_by_default() {
+    fn skill_events_allow_installed_tools_by_default() {
         let cfg = AgentConfig::default();
         let policy = resolve_capability_policy(
             AgentCapabilityProfile::SkillEvents,
             &cfg.capability_profiles,
         );
         assert!(policy.autonomous);
-        assert!(!policy
-            .disallowed_tools
-            .iter()
-            .any(|tool| tool.eq_ignore_ascii_case("graphchan_skill")));
+        assert!(policy.disallowed_tools.is_empty());
         assert!(policy.allowed_tools.is_none());
     }
 
@@ -212,7 +195,7 @@ mod tests {
         cfg.capability_profiles.scheduled.disallowed_tools = Some(vec!["shell".to_string()]);
         cfg.capability_profiles.background.allowed_tools = Some(vec!["search_memory".to_string()]);
         cfg.capability_profiles.self_directed.disallowed_tools =
-            Some(vec!["post_to_graphchan".to_string()]);
+            Some(vec!["external_publish".to_string()]);
 
         let scheduled =
             resolve_capability_policy(AgentCapabilityProfile::Scheduled, &cfg.capability_profiles);
@@ -230,24 +213,17 @@ mod tests {
         );
         assert_eq!(
             self_directed.disallowed_tools,
-            vec!["post_to_graphchan".to_string()]
+            vec!["external_publish".to_string()]
         );
     }
 
     #[test]
-    fn heartbeat_allows_graphchan_for_autonomous_posting() {
-        // Agent may spontaneously post under its own name; heartbeat no longer blocks it.
+    fn heartbeat_defers_outward_policy_to_tool_effects() {
         let cfg = AgentConfig::default();
         let policy =
             resolve_capability_policy(AgentCapabilityProfile::Heartbeat, &cfg.capability_profiles);
         assert!(policy.autonomous);
-        assert!(
-            !policy
-                .disallowed_tools
-                .iter()
-                .any(|tool| tool.eq_ignore_ascii_case("graphchan_skill")),
-            "graphchan_skill should not be blocked in heartbeat mode"
-        );
+        assert!(policy.disallowed_tools.is_empty());
     }
 
     #[test]
@@ -305,7 +281,7 @@ mod tests {
     fn tool_context_uses_resolved_policy() {
         let mut cfg = AgentConfig::default();
         cfg.capability_profiles.skill_events.allowed_tools =
-            Some(vec!["graphchan_skill".to_string()]);
+            Some(vec!["external_reply".to_string()]);
 
         let ctx = build_tool_context_for_profile(
             &cfg,
@@ -315,7 +291,7 @@ mod tests {
         );
 
         assert!(ctx.autonomous);
-        assert_eq!(ctx.allowed_tools, Some(vec!["graphchan_skill".to_string()]));
+        assert_eq!(ctx.allowed_tools, Some(vec!["external_reply".to_string()]));
         assert_eq!(ctx.disallowed_tools, Vec::<String>::new());
     }
 }

@@ -1,38 +1,38 @@
 # plugin.rs
 
 ## Purpose
-Defines the backend plugin contract plus the shared manifest/schema types used to describe plugin-driven settings tabs. This is the backend/frontend handshake for both built-in integrations and filesystem-discovered workflow bundles.
+Provides compatibility re-exports for plugin manifest DTOs. Canonical manifest,
+settings, and wire definitions live in `plugin_contract/`; executable extensions
+use protocol-v1 subprocess packages rather than Rust trait objects.
 
 ## Components
 
-### `BackendPluginManifest`
-- **Does**: Describes plugin identity, plugin kind, declared capabilities (`provided_tools`, `provided_skills`), optional settings-tab metadata, and optional inline settings schema for frontend settings composition.
-- **Interacts with**: `runtime.rs` plugin loading and runtime diagnostics/introspection.
+### `BackendPluginManifest` / `PluginManifest`
+- **Does**: Re-exports canonical manifest DTOs under both current and historical names.
+- **Interacts with**: runtime discovery, API responses, and older internal imports.
 
 ### `PluginSettingsTabManifest`
 - **Does**: Declares the frontend-visible settings tab (`id`, `title`, `order`) exposed by a plugin.
 - **Interacts with**: frontend plugin discovery via `/v1/plugins` and `ui/settings.rs` tab rendering.
 
-### `BackendPluginKind`
-- **Does**: Distinguishes built-in code plugins, data-only workflow bundles, and subprocess runtime bundles.
-- **Interacts with**: runtime discovery and future UI affordances.
+### `BackendPluginKind` / `PluginKind`
+- **Does**: Re-exports the canonical package-kind enum under both names.
+- **Interacts with**: runtime discovery and UI affordances.
 
 ### Settings schema manifests
-- **Does**: `PluginSettingsSchemaManifest`, `PluginSettingsFieldManifest`, and related enums/options describe a small vocabulary of form fields (`boolean`, `text`, `multiline`, `number`, `select`, `path`, `secret`) that the frontend can render generically.
-- **Interacts with**: `workflow_plugin.rs` bundle loading and `ui/plugin_settings_form.rs`.
-
-### `BackendPlugin`
-- **Does**: Trait for plugin hooks: provide manifest, optionally register tools, optionally build skill instances.
-- **Interacts with**: `runtime.rs` (`BackendRuntimeBuilder`) and backend extension crates.
+- **Does**: Re-export the canonical schema DTOs from `plugin_contract::manifest`.
+- **Interacts with**: legacy import paths, package discovery, and the generic settings UI.
 
 ## Contracts
 
 | Dependent | Expects | Breaking changes |
 |-----------|---------|------------------|
-| `runtime.rs` | Plugin trait remains object-safe and callable at bootstrap | Changing trait method signatures |
-| External backend extensions | `register_tools` receives `ToolRegistry` + config, `build_skills` can return `Vec<Box<dyn Skill>>` | Removing hooks or changing ownership requirements |
+| Legacy imports | Plugin DTO names remain available under `crate::plugin::*` | Removing compatibility re-exports |
+| Runtime host and API | Re-exported DTOs are the exact canonical contract types | Wrapping or forking the canonical DTOs |
 
 ## Notes
-- Default trait implementations are no-op so plugins can provide only tools or only skills.
-- Plugin loading order is deterministic: built-ins first, then user-supplied plugins.
-- `settings_tab` and `settings_schema` are declarative metadata only; plugins do not render UI directly.
+- `settings_tab` and `settings_schema` are declarative metadata only; packages do not render UI directly.
+- Core runtime, host, and API code imports canonical DTO names from
+  `crate::plugin_contract`; this module exists only for downstream source
+  compatibility.
+- The former `BackendPlugin` trait was intentionally removed. Keeping a second in-process extension path would bypass package validation, effect declarations, lifecycle supervision, and durable event receipts.
