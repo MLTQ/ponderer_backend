@@ -8,6 +8,7 @@ pub mod http_client;
 pub mod llm_client;
 pub mod memory;
 pub mod plugin;
+pub mod plugin_contract;
 pub mod presence;
 pub mod process_registry;
 pub mod runtime;

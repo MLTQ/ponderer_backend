@@ -173,6 +173,7 @@ pub struct AgentRuntimeStatus {
     pub visual_state_since: Option<chrono::DateTime<chrono::Utc>>,
     /// Short description of what the agent is doing right now (e.g. "Calling LLM iteration 2").
     pub current_activity: Option<String>,
+    pub loose_mode: bool,
 }
 
 pub struct AgentState {
@@ -437,6 +438,7 @@ impl Agent {
 
     pub async fn runtime_status(&self) -> AgentRuntimeStatus {
         let state = self.state.read().await;
+        let loose_mode = self.config.read().await.loose_mode;
         AgentRuntimeStatus {
             paused: state.paused,
             visual_state: state.visual_state.clone(),
@@ -444,6 +446,7 @@ impl Agent {
             last_action_time: state.last_action_time,
             visual_state_since: state.visual_state_since,
             current_activity: state.current_activity.clone(),
+            loose_mode,
         }
     }
 

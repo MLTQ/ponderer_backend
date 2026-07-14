@@ -98,6 +98,11 @@ struct SetPauseRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct SetLooseModeRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct SetPrivateChatModeRequest {
     mode: String,
 }
@@ -126,6 +131,11 @@ struct SendMessageResponse {
 #[derive(Debug, Serialize)]
 struct PauseStateResponse {
     paused: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LooseModeResponse {
+    enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,6 +238,7 @@ pub async fn serve_backend(
             "/agent/private-chat-mode",
             get(get_private_chat_mode).put(set_private_chat_mode),
         )
+        .route("/agent/loose-mode", put(set_loose_mode))
         .route("/agent/pause", put(set_pause))
         .route("/agent/toggle-pause", post(toggle_pause))
         .route("/agent/stop", post(stop_agent_turn))
@@ -797,6 +808,23 @@ async fn get_agent_status(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<AgentRuntimeStatus>, (StatusCode, String)> {
     Ok(Json(state.agent.runtime_status().await))
+}
+
+async fn set_loose_mode(
+    State(state): State<Arc<ServerState>>,
+    Json(body): Json<SetLooseModeRequest>,
+) -> Result<Json<LooseModeResponse>, (StatusCode, String)> {
+    let mut config = state.config.read().await.clone();
+    config.loose_mode = body.enabled;
+    config.save().map_err(internal_error)?;
+    state.agent.reload_config(config.clone()).await;
+    {
+        let mut guard = state.config.write().await;
+        *guard = config;
+    }
+    Ok(Json(LooseModeResponse {
+        enabled: body.enabled,
+    }))
 }
 
 async fn get_private_chat_mode(

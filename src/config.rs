@@ -202,6 +202,14 @@ pub struct AgentConfig {
     pub memory_evolution_interval_hours: u64,
     #[serde(default)]
     pub memory_eval_trace_set_path: Option<String>,
+    #[serde(default)]
+    pub loose_mode: bool,
+    #[serde(default = "default_loose_episode_interval_secs")]
+    pub loose_episode_interval_secs: u64,
+    #[serde(default = "default_loose_max_consecutive_episodes")]
+    pub loose_max_consecutive_episodes: u32,
+    #[serde(default = "default_loose_cooldown_secs")]
+    pub loose_cooldown_secs: u64,
 
     #[serde(default)]
     pub respond_to: RespondTo,
@@ -370,6 +378,18 @@ fn default_memory_evolution_interval_hours() -> u64 {
     24
 }
 
+fn default_loose_episode_interval_secs() -> u64 {
+    5
+}
+
+fn default_loose_max_consecutive_episodes() -> u32 {
+    8
+}
+
+fn default_loose_cooldown_secs() -> u64 {
+    300
+}
+
 fn default_database_path() -> String {
     "ponderer_memory.db".to_string()
 }
@@ -412,6 +432,10 @@ impl Default for AgentConfig {
             enable_memory_evolution: false,
             memory_evolution_interval_hours: default_memory_evolution_interval_hours(),
             memory_eval_trace_set_path: None,
+            loose_mode: false,
+            loose_episode_interval_secs: default_loose_episode_interval_secs(),
+            loose_max_consecutive_episodes: default_loose_max_consecutive_episodes(),
+            loose_cooldown_secs: default_loose_cooldown_secs(),
             respond_to: RespondTo::default(),
             capability_profiles: CapabilityProfileConfig::default(),
             enable_self_reflection: false,
