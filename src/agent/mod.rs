@@ -4464,7 +4464,7 @@ impl Agent {
         let configured_private_chat_mode = self.private_chat_execution_mode(&config_snapshot).await;
 
         let chat_system_prompt = format!(
-            "{}\n\n{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nFocus on the operator's request; do not publish to external services unless explicitly asked.\nIf you detect persistent topics/projects/reminders, append a concerns block:\n{}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[\"optional-key\"]}}]\n{}\nUse an empty array when there are no concern updates.\nEvery response MUST end with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.\nWhen genuinely wrapping up a work session (decision=yield, task complete or naturally pausing), call write_session_handoff once with a concise note: what you worked on, how far you got, the immediate next step, and open questions. The note is one-shot: it will be injected at the top of the next session's context and then cleared automatically. Do NOT call it mid-task or on every turn.",
+            "{}\n\n{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nFocus on the operator's request; do not publish to external services unless explicitly asked.\nIf you detect persistent topics/projects/reminders, append a concerns block:\n{}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[\"optional-key\"]}}]\n{}\nUse an empty array when there are no concern updates.\nWrite the operator-facing reply as ordinary text, then end every response with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"fallback operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nThe user_message field is fallback-only. Leave it empty whenever ordinary reply text is present; populate it only when there is no ordinary reply text.\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.\nWhen genuinely wrapping up a work session (decision=yield, task complete or naturally pausing), call write_session_handoff once with a concise note: what you worked on, how far you got, the immediate next step, and open questions. The note is one-shot: it will be injected at the top of the next session's context and then cleared automatically. Do NOT call it mid-task or on every turn.",
             system_prompt,
             HISTORICAL_CONTEXT_SAFETY_INSTRUCTION,
             CHAT_CONCERNS_BLOCK_START,
@@ -5836,6 +5836,13 @@ struct TurnControlBlock {
     needs_user_input: Option<bool>,
     user_message: Option<String>,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StructuredTurnEnvelope {
+    #[serde(default)]
+    reply: Option<String>,
+    turn_control: TurnControlBlock,
 }
 
 #[derive(Clone)]
@@ -7567,7 +7574,16 @@ fn parse_turn_control(response: &str, tool_call_count: usize) -> ParsedTurnContr
     } else {
         (cleaned_response, block_json)
     };
-    let block_was_present = block_json.is_some();
+    // Some providers enforce a top-level JSON response shape and wrap the ordinary
+    // assistant reply alongside our nested turn-control object. Accept that shape
+    // only when the entire response is the envelope so arbitrary JSON in a normal
+    // reply is not accidentally consumed as control metadata.
+    let structured_envelope = if block_json.is_none() {
+        parse_structured_turn_envelope(&cleaned_response)
+    } else {
+        None
+    };
+    let block_was_present = block_json.is_some() || structured_envelope.is_some();
 
     // When no turn_control block was emitted, default to Yield regardless of whether
     // tools were called. The previous default of Continue-on-tool-use caused the agent
@@ -7580,7 +7596,12 @@ fn parse_turn_control(response: &str, tool_call_count: usize) -> ParsedTurnContr
     } else {
         None
     };
-    let cleaned_trimmed = cleaned_response.trim().to_string();
+    let cleaned_trimmed = if let Some(envelope) = structured_envelope.as_ref() {
+        envelope.reply.as_deref().unwrap_or_default().trim()
+    } else {
+        cleaned_response.trim()
+    }
+    .to_string();
 
     // Backward-compatible marker support while prompts transition.
     if cleaned_trimmed.starts_with(CHAT_CONTINUE_MARKER_LEGACY) {
@@ -7595,7 +7616,12 @@ fn parse_turn_control(response: &str, tool_call_count: usize) -> ParsedTurnContr
 
     let parsed_block = block_json
         .as_deref()
-        .and_then(parse_turn_control_block_json);
+        .and_then(parse_turn_control_block_json)
+        .or_else(|| {
+            structured_envelope
+                .as_ref()
+                .map(|envelope| envelope.turn_control.clone())
+        });
 
     let decision = parsed_block
         .as_ref()
@@ -7778,6 +7804,10 @@ fn parse_turn_control_block_json(raw: &str) -> Option<TurnControlBlock> {
 
     let extracted = extract_json_object_or_array(cleaned)?;
     serde_json::from_str::<TurnControlBlock>(extracted).ok()
+}
+
+fn parse_structured_turn_envelope(raw: &str) -> Option<StructuredTurnEnvelope> {
+    serde_json::from_str(strip_optional_json_fence(raw)).ok()
 }
 
 fn strip_optional_json_fence(raw: &str) -> &str {
@@ -8936,6 +8966,56 @@ not a checklist item
         let response = "[turn_control]\n{\"decision\":\"yield\",\"status\":\"done\",\"needs_user_input\":false,\"user_message\":\"Completed successfully.\",\"reason\":\"done\"}\n[/turn_control]";
         let parsed = parse_turn_control(response, 0);
         assert_eq!(parsed.operator_response, "Completed successfully.");
+    }
+
+    #[test]
+    fn bare_structured_envelope_uses_reply_and_nested_turn_control() {
+        let response = r#"{
+            "reply": "The structured metadata leaked into the visible response.",
+            "turn_control": {
+                "decision": "yield",
+                "status": "done",
+                "needs_user_input": true,
+                "user_message": "This fallback must not replace the reply."
+            }
+        }"#;
+        let parsed = parse_turn_control(response, 0);
+
+        assert!(parsed.block_was_present);
+        assert_eq!(parsed.decision, TurnDecision::Yield);
+        assert_eq!(parsed.status, "done");
+        assert!(parsed.needs_user_input);
+        assert_eq!(
+            parsed.operator_response,
+            "The structured metadata leaked into the visible response."
+        );
+    }
+
+    #[test]
+    fn bare_structured_envelope_uses_user_message_only_as_fallback() {
+        let response = r#"{
+            "turn_control": {
+                "decision": "yield",
+                "status": "done",
+                "needs_user_input": true,
+                "user_message": "What would you like me to do next?"
+            }
+        }"#;
+        let parsed = parse_turn_control(response, 0);
+
+        assert_eq!(
+            parsed.operator_response,
+            "What would you like me to do next?"
+        );
+    }
+
+    #[test]
+    fn ordinary_json_reply_without_turn_control_remains_visible() {
+        let response = r#"{"reply":"data","items":[1,2,3]}"#;
+        let parsed = parse_turn_control(response, 0);
+
+        assert!(!parsed.block_was_present);
+        assert_eq!(parsed.operator_response, response);
     }
 
     #[test]
