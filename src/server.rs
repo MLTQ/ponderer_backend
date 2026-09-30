@@ -40,6 +40,7 @@ pub struct ServerState {
     pub runtime_plugin_host: Arc<RuntimePluginHost>,
     pub ws_events: broadcast::Sender<ApiEventEnvelope>,
     pub telegram_bot: Arc<crate::telegram::TelegramBotManager>,
+    pub affect_lab: Arc<crate::affect_lab::AffectLabManager>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +196,9 @@ pub async fn serve_backend(
         runtime_plugin_host: runtime.runtime_plugin_host.clone(),
         ws_events: ws_events.clone(),
         telegram_bot: telegram_bot.clone(),
+        affect_lab: Arc::new(crate::affect_lab::AffectLabManager::new(
+            crate::affect_lab::AffectLabManager::default_data_dir(),
+        )),
     });
 
     spawn_event_bridge(event_rx, ws_events);
@@ -214,6 +218,11 @@ pub async fn serve_backend(
     let protected = Router::new()
         .route("/health", get(health))
         .route("/config", get(get_config).put(update_config))
+        .route("/affect-lab", get(affect_lab_status))
+        .route("/affect-lab/start", post(affect_lab_start))
+        .route("/affect-lab/stop", post(affect_lab_stop))
+        .route("/affect-lab/use-for-agent", post(affect_lab_use_for_agent))
+        .route("/affect-lab/:action", post(affect_lab_control))
         .route("/plugins", get(list_plugins))
         .route("/plugins/status", get(list_plugin_statuses))
         .route(
@@ -562,7 +571,8 @@ async fn update_config(
         new_config.enable_ambient_loop = true;
     }
     let previous_loose_mode = state.config.read().await.loose_mode;
-    if let Err(error) = new_config.save() {
+    let durable_config = state.affect_lab.config_to_save(&new_config).await;
+    if let Err(error) = durable_config.save() {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to save config: {error}"),
@@ -589,6 +599,67 @@ async fn update_config(
         )
         .await;
     Ok(Json(new_config))
+}
+
+async fn affect_lab_status(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .affect_lab
+        .status()
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn affect_lab_start(
+    State(state): State<Arc<ServerState>>,
+    Json(settings): Json<crate::affect_lab::AffectLabStart>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .affect_lab
+        .start(settings)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn affect_lab_control(
+    State(state): State<Arc<ServerState>>,
+    Path(action): Path<String>,
+    Json(values): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .affect_lab
+        .control(&action, values)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+async fn affect_lab_use_for_agent(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<AgentConfig>, (StatusCode, String)> {
+    state.agent.request_stop().await;
+    let mut config = state.config.write().await;
+    state
+        .affect_lab
+        .select_for_agent(&mut config)
+        .await
+        .map_err(internal_error)?;
+    state.agent.reload_config(config.clone()).await;
+    Ok(Json(config.clone()))
+}
+
+async fn affect_lab_stop(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<AgentConfig>, (StatusCode, String)> {
+    state.agent.request_stop().await;
+    let mut config = state.config.write().await;
+    state.affect_lab.restore_provider(&mut config).await;
+    state.agent.reload_config(config.clone()).await;
+    state.affect_lab.stop().await.map_err(internal_error)?;
+    Ok(Json(config.clone()))
 }
 
 async fn list_conversations(

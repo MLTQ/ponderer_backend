@@ -1,3 +1,4 @@
+pub mod affect_lab;
 pub mod agent;
 pub mod character_card;
 pub mod config;

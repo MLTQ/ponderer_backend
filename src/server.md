@@ -65,6 +65,10 @@ Runs the standalone backend HTTP surface for Ponderer. It exposes authenticated 
 | `agent/mod.rs` | `AgentEvent` variants can be mapped into API event payloads | Removing variants without updating mapping |
 
 ## Notes
+
+- Authenticated Affect Lab routes supervise a local GGUF provider owned by the UI's
+  backend. Session provider overrides are restored on Stop and excluded from saved
+  settings; see `affect_lab.md` and the frontend's `docs/AFFECT_LAB.md`.
 - `/v1/health` is authenticated in `required` mode, matching deny-by-default auth boundaries. Its body reports `ok` or `degraded` from live supervisor state while retaining HTTP 200 in either case.
 - `/v1/plugins` exposes built-ins and discovered protocol-v1 package manifests for client-side capability discovery, including optional settings-tab metadata and inline settings schemas for the desktop settings window.
 - `/v1/plugins` preserves built-in entries while querying protocol-v1 package manifests live; `/v1/plugins/status` returns live subprocess desired/actual state and restart diagnostics.
