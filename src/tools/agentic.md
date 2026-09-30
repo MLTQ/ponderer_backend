@@ -2,6 +2,9 @@
 
 ## Purpose
 Implements the multi-step tool-calling loop that drives autonomous and chat-mode execution. It repeatedly calls the LLM, executes requested tools, feeds tool output back, and stops when the model returns final text or iteration limits are reached. It now supports provider token streaming for OpenAI-compatible backends.
+Managed loopback GGUF requests use a bounded one-hour deadline to permit long
+prefill/generation; other providers retain 120 seconds. Turn cancellation and
+UI-owned process termination remain independent of that deadline.
 
 ## Components
 

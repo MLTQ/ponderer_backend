@@ -2,6 +2,26 @@ use std::time::Duration;
 
 /// Default deadline for ordinary backend HTTP requests, including LLM calls.
 pub const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Long prefill and generation are allowed only for the UI-owned GGUF provider.
+/// The deadline stays bounded; UI closure still kills the full inference chain.
+pub const LOCAL_GGUF_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
+
+fn llm_request_timeout(api_url: &str, model: &str) -> Duration {
+    let managed_local = model == crate::affect_lab::LOCAL_MODEL_ALIAS
+        && reqwest::Url::parse(api_url).is_ok_and(|url| {
+            url.scheme() == "http"
+                && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+        });
+    if managed_local {
+        LOCAL_GGUF_REQUEST_TIMEOUT
+    } else {
+        DEFAULT_HTTP_REQUEST_TIMEOUT
+    }
+}
+
+pub fn build_llm_http_client(api_url: &str, model: &str) -> reqwest::Client {
+    build_http_client_with_timeout(Some(llm_request_timeout(api_url, model)))
+}
 
 pub fn build_http_client() -> reqwest::Client {
     build_http_client_with_timeout(Some(DEFAULT_HTTP_REQUEST_TIMEOUT))
@@ -82,5 +102,26 @@ mod tests {
     fn ordinary_client_timeout_is_bounded_but_llm_friendly() {
         assert!(DEFAULT_HTTP_REQUEST_TIMEOUT >= Duration::from_secs(30));
         assert!(DEFAULT_HTTP_REQUEST_TIMEOUT <= Duration::from_secs(300));
+    }
+
+    #[test]
+    fn long_deadline_is_scoped_to_the_managed_loopback_model() {
+        let alias = crate::affect_lab::LOCAL_MODEL_ALIAS;
+        assert_eq!(
+            llm_request_timeout("http://127.0.0.1:12345/v1", alias),
+            LOCAL_GGUF_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            llm_request_timeout("https://provider.example/v1", alias),
+            DEFAULT_HTTP_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            llm_request_timeout("http://127.0.0.1:12345/v1", "other-model"),
+            DEFAULT_HTTP_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            llm_request_timeout("not a URL", alias),
+            DEFAULT_HTTP_REQUEST_TIMEOUT
+        );
     }
 }

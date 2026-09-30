@@ -17,6 +17,10 @@ use crate::config::AgentConfig;
 const WORKER: &str = include_str!("../resources/affect_lab/worker.py");
 const EXTRACTOR: &str = include_str!("../resources/affect_lab/extractor.cpp");
 pub const LOCAL_MODEL_ALIAS: &str = "ponderer-local-gguf";
+pub const MAX_CONTEXT_SIZE: u32 = 1_048_576;
+pub const CACHE_TYPES: &[&str] = &[
+    "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -25,6 +29,10 @@ pub struct AffectLabStart {
     pub gpu_layers: i32,
     pub threads: u32,
     pub context_size: u32,
+    pub unified_kv_cache: bool,
+    pub cache_type_k: String,
+    pub cache_type_v: String,
+    pub flash_attention: String,
     pub server_binary: String,
 }
 
@@ -35,12 +43,26 @@ impl Default for AffectLabStart {
             gpu_layers: 0,
             threads: 4,
             context_size: 16384,
+            unified_kv_cache: true,
+            cache_type_k: "f16".into(),
+            cache_type_v: "f16".into(),
+            flash_attention: "auto".into(),
             server_binary: "llama-server".into(),
         }
     }
 }
 
 impl AffectLabStart {
+    /// Match the requested LM Studio memory settings without changing device
+    /// placement or selecting an unverified engine executable.
+    pub fn apply_200k_preset(&mut self) {
+        self.context_size = 200_000;
+        self.unified_kv_cache = true;
+        self.cache_type_k = "q4_1".into();
+        self.cache_type_v = "q4_1".into();
+        self.flash_attention = "on".into();
+    }
+
     fn validate(&self) -> Result<()> {
         if self.model_path.trim().is_empty() || self.model_path.contains('\0') {
             bail!("Choose an existing GGUF model or model directory");
@@ -48,8 +70,21 @@ impl AffectLabStart {
         if !(0..=999).contains(&self.gpu_layers) || !(1..=128).contains(&self.threads) {
             bail!("GPU layers must be 0..999 and CPU threads 1..128");
         }
-        if !(1024..=65536).contains(&self.context_size) {
-            bail!("Context size must be 1024..65536");
+        if !(1024..=MAX_CONTEXT_SIZE).contains(&self.context_size) {
+            bail!("Context size must be 1024..{MAX_CONTEXT_SIZE}");
+        }
+        if !CACHE_TYPES.contains(&self.cache_type_k.as_str())
+            || !CACHE_TYPES.contains(&self.cache_type_v.as_str())
+        {
+            bail!("Choose a supported K/V cache type");
+        }
+        if !matches!(self.flash_attention.as_str(), "on" | "off" | "auto") {
+            bail!("Flash attention must be on, off or auto");
+        }
+        if self.flash_attention == "off"
+            && !matches!(self.cache_type_v.as_str(), "f32" | "f16" | "bf16")
+        {
+            bail!("Quantized V cache requires flash attention; select on or auto");
         }
         if self.server_binary.trim().is_empty() || self.server_binary.contains('\0') {
             bail!("Choose a llama-server executable");
@@ -170,6 +205,17 @@ impl AffectLabManager {
             .arg(settings.threads.to_string())
             .arg("--context-size")
             .arg(settings.context_size.to_string())
+            .arg("--cache-type-k")
+            .arg(settings.cache_type_k)
+            .arg("--cache-type-v")
+            .arg(settings.cache_type_v)
+            .arg("--flash-attn")
+            .arg(settings.flash_attention)
+            .arg(if settings.unified_kv_cache {
+                "--kv-unified"
+            } else {
+                "--no-kv-unified"
+            })
             .arg("--server-binary")
             .arg(settings.server_binary)
             .env("PONDERER_AFFECT_TOKEN", &token)
@@ -378,6 +424,43 @@ mod tests {
         settings.threads = 4;
         settings.gpu_layers = -1;
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn long_context_preset_validates_and_preserves_device_selection() {
+        let mut settings = AffectLabStart {
+            model_path: "/tmp/model.gguf".into(),
+            gpu_layers: 17,
+            server_binary: "/custom/llama-server".into(),
+            ..Default::default()
+        };
+        settings.apply_200k_preset();
+        assert!(settings.validate().is_ok());
+        assert_eq!(settings.context_size, 200_000);
+        assert_eq!(settings.cache_type_k, "q4_1");
+        assert_eq!(settings.cache_type_v, "q4_1");
+        assert_eq!(settings.flash_attention, "on");
+        assert!(settings.unified_kv_cache);
+        assert_eq!(settings.gpu_layers, 17);
+        assert_eq!(settings.server_binary, "/custom/llama-server");
+        settings.flash_attention = "off".into();
+        assert!(settings.validate().is_err());
+        settings.flash_attention = "on".into();
+        settings.context_size = MAX_CONTEXT_SIZE + 1;
+        assert!(settings.validate().is_err());
+        settings.context_size = 200_000;
+        settings.cache_type_k = "q4_k_m".into();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_start_requests_keep_conservative_cache_defaults() {
+        let settings: AffectLabStart =
+            serde_json::from_str(r#"{"model_path":"model.gguf"}"#).unwrap();
+        assert_eq!(settings.cache_type_k, "f16");
+        assert_eq!(settings.cache_type_v, "f16");
+        assert_eq!(settings.flash_attention, "auto");
+        assert!(settings.unified_kv_cache);
     }
 
     #[test]

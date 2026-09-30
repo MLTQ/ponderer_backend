@@ -60,10 +60,14 @@ def fake_server():
         return sys.argv[sys.argv.index(name) + 1]
     port = int(option("--port"))
     strength = option("--control-vector-scaled").rsplit(":", 1)[1] if "--control-vector-scaled" in sys.argv else "0"
+    # Record only memory settings, never process arguments containing API tokens.
+    settings = {key: option(key) for key in ("--ctx-size", "--cache-type-k", "--cache-type-v", "--flash-attn", "--timeout")}
+    settings["unified_kv_cache"] = "--kv-unified" in sys.argv
+    settings["context_shift"] = "--no-context-shift" not in sys.argv
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args): pass
         def do_GET(self):
-            data = b'{"status":"ok"}'
+            data = json.dumps({"status": "ok", "test_settings": settings}).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -117,6 +121,46 @@ class AffectLabTests(unittest.TestCase):
     def test_metadata_excludes_prediction_layer(self):
         self.assertEqual(self.lab.model["layers"], 4)
         self.assertEqual(self.lab.model["prediction_layers"], 1)
+
+    def test_long_context_settings_reach_the_native_engine_and_report(self):
+        self.lab.close()
+        self.lab = worker.AffectLab(self.model, self.path / "lab", server_binary=str(self.make_fake_server()), context_size=200_000, unified_kv_cache=True, cache_type_k="q4_1", cache_type_v="q4_1", flash_attention="on")
+        self.add_vector()
+        self.completion()
+        settings = self.lab.native_request("GET", "/health")["test_settings"]
+        self.assertEqual(settings, {"--ctx-size": "200000", "--cache-type-k": "q4_1", "--cache-type-v": "q4_1", "--flash-attn": "on", "--timeout": "3600", "unified_kv_cache": True, "context_shift": False})
+        report = self.lab.compare("contentment", [0, 0.1], "test", 4)
+        self.assertEqual(report["inference_settings"], self.lab.status()["inference_settings"])
+        self.assertEqual(report["inference_settings"]["context_size"], 200_000)
+        self.lab.unified_kv_cache = False
+        self.completion()
+        first = self.lab.child.pid
+        self.assertFalse(self.lab.native_request("GET", "/health")["test_settings"]["unified_kv_cache"])
+        self.lab.unified_kv_cache = True
+        self.completion()
+        self.assertNotEqual(first, self.lab.child.pid)
+
+    def test_invalid_memory_settings_are_rejected_before_launch(self):
+        defaults = dict(context_size=200_000, gpu_layers=0, threads=4, unified_kv_cache=True, cache_type_k="q4_1", cache_type_v="q4_1", flash_attention="on")
+        worker.validate_inference_settings(**defaults)
+        for changes in ({"context_size": worker.MAX_CONTEXT_SIZE + 1}, {"context_size": 0}, {"context_size": True}, {"unified_kv_cache": "true"}, {"cache_type_k": "q4_k_m"}, {"flash_attention": "off"}, {"flash_attention": "yes"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                worker.validate_inference_settings(**(defaults | changes))
+
+    def test_long_prompt_body_is_accepted_beyond_the_old_two_mib_limit(self):
+        server = worker.LabHTTPServer(("127.0.0.1", 0), worker.LabHandler)
+        server.lab, server.token = self.lab, "fixture-token" * 3
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            body = json.dumps({"model": worker.ALIAS, "messages": [{"role": "user", "content": "a" * (worker.MAX_BODY + 1)}]}).encode()
+            request = Request(f"http://127.0.0.1:{server.server_address[1]}/v1/chat/completions", body, {"Authorization": "Bearer " + server.token, "Content-Type": "application/json"})
+            with urlopen(request, timeout=10) as response:
+                self.assertEqual(json.load(response)["choices"][0]["message"]["content"], "0")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_extraction_describes_assistant_state_at_common_continuation(self):
         pair = worker.make_pairs("contentment")[0]

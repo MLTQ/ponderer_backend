@@ -11,6 +11,13 @@ descendants on owner death, including compiler subprocesses.
 
 `start` requires the desktop backend parent-pipe marker and Linux parent-death
 signaling. Worker startup loads metadata only; native weights load on demand.
+Startup options include context (1,024..1,048,576 tokens), unified KV, separate K/V
+types and flash attention. A 200k/Q4_1 preset leaves executable/device placement
+unchanged. Quantized V with flash attention off is rejected before launch.
+The private proxy accepts bounded 16 MiB request bodies; inference clients use a
+bounded one-hour deadline for the loopback local alias, leaving other clients at
+their existing deadlines. The same memory settings are retained across profile
+reloads and included in comparison reports.
 `select_for_agent` applies a session override and remembers the prior provider.
 `config_to_save` preserves the prior durable provider when unrelated settings are
 saved. `restore_provider` and `stop` return to it and reap the local worker.

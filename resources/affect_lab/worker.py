@@ -28,6 +28,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 VERSION = "1"
 ALIAS = "ponderer-local-gguf"
 MAX_BODY = 2 * 1024 * 1024
+MAX_REQUEST_BODY = 16 * 1024 * 1024
+MAX_CONTEXT_SIZE = 1_048_576
+INFERENCE_TIMEOUT = 3600
+CACHE_TYPES = ("f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1")
 MAX_STRENGTH = 1.0
 RECIPE_VERSION = "matched-assistant-reflection-v2"
 
@@ -138,6 +142,7 @@ def inspect_gguf(path, tensors=False):
         "layers": metadata.get(f"{arch}.block_count", 0) - metadata.get(f"{arch}.nextn_predict_layers", 0),
         "prediction_layers": metadata.get(f"{arch}.nextn_predict_layers", 0),
         "embedding": metadata.get(f"{arch}.embedding_length", 0),
+        "trained_context": metadata.get(f"{arch}.context_length", 0),
         "chat_template": metadata.get("tokenizer.chat_template", ""),
         "tensor_count": tensor_count, "metadata": metadata,
         "tensors": descriptions, "data_offset": data_offset,
@@ -304,8 +309,23 @@ def exec_child(arguments):
     raise SystemExit(code)
 
 
+def validate_inference_settings(context_size, gpu_layers, threads, unified_kv_cache, cache_type_k, cache_type_v, flash_attention):
+    for value, low, high, name in ((context_size, 1024, MAX_CONTEXT_SIZE, "Context"), (threads, 1, 128, "Threads"), (gpu_layers, 0, 999, "GPU layers")):
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise ValueError(f"{name} must be {low}..{high}")
+    if not isinstance(unified_kv_cache, bool):
+        raise ValueError("Unified KV cache must be a boolean")
+    if cache_type_k not in CACHE_TYPES or cache_type_v not in CACHE_TYPES:
+        raise ValueError("Choose a supported K/V cache type")
+    if flash_attention not in ("on", "off", "auto"):
+        raise ValueError("Flash attention must be on, off or auto")
+    if flash_attention == "off" and cache_type_v not in ("f32", "f16", "bf16"):
+        raise ValueError("Quantized V cache requires flash attention; select on or auto")
+
+
 class AffectLab:
-    def __init__(self, model, data_dir, server_binary="llama-server", generator_binary="bundled", gpu_layers=0, threads=4, context_size=16384):
+    def __init__(self, model, data_dir, server_binary="llama-server", generator_binary="bundled", gpu_layers=0, threads=4, context_size=16384, unified_kv_cache=True, cache_type_k="f16", cache_type_v="f16", flash_attention="auto"):
+        validate_inference_settings(context_size, gpu_layers, threads, unified_kv_cache, cache_type_k, cache_type_v, flash_attention)
         self.model_path = resolve_model(model)
         self.model = inspect_gguf(self.model_path)
         if self.model["metadata"].get("split.count", 1) > 1:
@@ -317,6 +337,9 @@ class AffectLab:
         self.server_binary, self.generator_binary = server_binary, generator_binary
         self.gpu_layers, self.threads = gpu_layers, threads
         self.context_size = context_size
+        self.unified_kv_cache = unified_kv_cache
+        self.cache_type_k, self.cache_type_v = cache_type_k, cache_type_v
+        self.flash_attention = flash_attention
         self.state_lock = threading.RLock()
         self.inference_lock = threading.Lock()
         self.child_lock = threading.Lock()
@@ -366,8 +389,9 @@ class AffectLab:
             applied = self.applied_profile if native_pid else None
             return {
                 "running": not self.closing.is_set(), "worker_pid": os.getpid(), "native_pid": native_pid,
-                "model": {k: self.model[k] for k in ("path", "name", "bytes", "architecture", "layers", "embedding")},
+                "model": {k: self.model[k] for k in ("path", "name", "bytes", "architecture", "layers", "embedding", "trained_context")},
                 "model_alias": ALIAS, "gpu_layers": self.gpu_layers, "context_size": self.context_size, "steerable_layer_end": self.model["layers"] - 2,
+                "inference_settings": self.inference_settings(),
                 "capabilities": {"activation_steering": True, "vector_build": True, "per_request_profile": True, "prompt_adapter": "chatml" if "<|im_start|>" in self.model["chat_template"] else "unsupported"},
                 "concepts": sorted(set(RECIPES) | set(self.artifacts)),
                 "vectors": [{"concept": v["concept"], "model_sha256": v["model_sha256"], "recipe_sha256": v["recipe_sha256"], "created_at": v["created_at"], "validation": "experimental", "vector_path": v["vector_path"]} for v in self.artifacts.values()],
@@ -526,7 +550,10 @@ class AffectLab:
             pending.replace(executable)
         return str(executable)
 
-    def native_request(self, method, path, body=None, timeout=180):
+    def inference_settings(self):
+        return {"server_binary": self.server_binary, "context_size": self.context_size, "unified_kv_cache": self.unified_kv_cache, "cache_type_k": self.cache_type_k, "cache_type_v": self.cache_type_v, "flash_attention": self.flash_attention, "gpu_layers": self.gpu_layers, "threads": self.threads, "inference_timeout_seconds": INFERENCE_TIMEOUT}
+
+    def native_request(self, method, path, body=None, timeout=INFERENCE_TIMEOUT):
         connection = http.client.HTTPConnection("127.0.0.1", self.native_port, timeout=timeout)
         headers = {"Authorization": "Bearer " + self.native_token}
         if body is not None:
@@ -548,7 +575,7 @@ class AffectLab:
         with self.state_lock:
             artifacts = {k: dict(v) for k, v in self.artifacts.items()}
         profile = validate_profile(profile, self.model["layers"], artifacts)
-        signature = {"profile": profile, "vectors": {k: artifacts[k]["vector_sha256"] for k in profile["strengths"]}, "model_identity": quick_identity(self.model_path)}
+        signature = {"profile": profile, "vectors": {k: artifacts[k]["vector_sha256"] for k in profile["strengths"]}, "model_identity": quick_identity(self.model_path), "inference_settings": self.inference_settings()}
         with self.child_lock:
             alive = self.child is not None and self.child.poll() is None
         if alive and signature == self.applied_signature:
@@ -563,6 +590,7 @@ class AffectLab:
                 validate_vector(artifact["vector_path"], self.model)
         log_path = self.data_dir / "inference.log"
         command = [self.server_binary, "--model", str(self.model_path), "--alias", ALIAS, "--host", "127.0.0.1", "--port", "0", "--api-key", self.native_token, "--ctx-size", str(self.context_size), "--parallel", "1", "--threads", str(self.threads), "--gpu-layers", str(self.gpu_layers), "--no-warmup", "--offline", "--jinja", "--reasoning", "off", "--no-webui"]
+        command += ["--kv-unified" if self.unified_kv_cache else "--no-kv-unified", "--cache-type-k", self.cache_type_k, "--cache-type-v", self.cache_type_v, "--flash-attn", self.flash_attention, "--timeout", str(INFERENCE_TIMEOUT), "--no-context-shift"]
         # Use an ephemeral port; a competing bind is surfaced as a startup error.
         import socket
         with socket.socket() as sock:
@@ -646,7 +674,7 @@ class AffectLab:
             # Test profiles never become the agent's persistent default. Clear native
             # caches; the next normal request reapplies the operator's selected state.
             self.stop_native()
-        report = {"concept": concept, "model_path": str(self.model_path), "model_sha256": self.hash_model(), "vector_sha256": self.artifacts[concept]["vector_sha256"], "recipe_sha256": self.artifacts[concept]["recipe_sha256"], "created_at": time.time(), "records": records, "interpretation": "Controlled completions for inspection; not evidence of subjective experience or a calibrated affect scale."}
+        report = {"concept": concept, "model_path": str(self.model_path), "model_sha256": self.hash_model(), "vector_sha256": self.artifacts[concept]["vector_sha256"], "recipe_sha256": self.artifacts[concept]["recipe_sha256"], "inference_settings": self.inference_settings(), "created_at": time.time(), "records": records, "interpretation": "Controlled completions for inspection; not evidence of subjective experience or a calibrated affect scale."}
         report_path = self.ensure_dir("comparisons") / f"{concept}-{time.time_ns()}.json"
         report["path"] = str(report_path)
         report_path.write_text(json.dumps(report, indent=2) + "\n")
@@ -716,8 +744,8 @@ class LabHandler(BaseHTTPRequestHandler):
 
     def body(self):
         length = int(self.headers.get("Content-Length", "0"))
-        if not 0 < length <= MAX_BODY:
-            raise ValueError("Request body must be between one byte and two MiB")
+        if not 0 < length <= MAX_REQUEST_BODY:
+            raise ValueError("Request body must be between one byte and sixteen MiB")
         value = json.loads(self.rfile.read(length))
         if not isinstance(value, dict):
             raise ValueError("Request must be a JSON object")
@@ -778,7 +806,7 @@ class LabHandler(BaseHTTPRequestHandler):
             values = dict(values)
             values.pop("ponderer_steering", None)
             values["model"] = ALIAS
-            connection = http.client.HTTPConnection("127.0.0.1", lab.native_port, timeout=180)
+            connection = http.client.HTTPConnection("127.0.0.1", lab.native_port, timeout=INFERENCE_TIMEOUT)
             try:
                 connection.request("POST", "/v1/chat/completions", json.dumps(values), {"Authorization": "Bearer " + lab.native_token, "Content-Type": "application/json"})
                 response = connection.getresponse()
@@ -819,15 +847,20 @@ def main():
     parser.add_argument("--gpu-layers", type=int, default=0)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--context-size", type=int, default=16384)
+    parser.add_argument("--cache-type-k", choices=CACHE_TYPES, default="f16")
+    parser.add_argument("--cache-type-v", choices=CACHE_TYPES, default="f16")
+    parser.add_argument("--flash-attn", choices=("on", "off", "auto"), default="auto")
+    unified = parser.add_mutually_exclusive_group()
+    unified.add_argument("--kv-unified", dest="unified_kv_cache", action="store_true")
+    unified.add_argument("--no-kv-unified", dest="unified_kv_cache", action="store_false")
+    parser.set_defaults(unified_kv_cache=True)
     parser.add_argument("--concept", default="contentment")
     parser.add_argument("--pairs", type=int)
     parser.add_argument("--strengths", default="0,0.25")
     parser.add_argument("--prompt")
     parser.add_argument("--max-tokens", type=int, default=32)
     args = parser.parse_args()
-    if not 1024 <= args.context_size <= 65536 or not 1 <= args.threads <= 128 or not 0 <= args.gpu_layers <= 999:
-        raise ValueError("Context must be 1024..65536, threads 1..128, GPU layers 0..999")
-    lab = AffectLab(args.model, args.data_dir, args.server_binary, args.generator_binary, args.gpu_layers, args.threads, args.context_size)
+    lab = AffectLab(args.model, args.data_dir, args.server_binary, args.generator_binary, args.gpu_layers, args.threads, args.context_size, args.unified_kv_cache, args.cache_type_k, args.cache_type_v, args.flash_attn)
     if args.mode == "serve":
         if os.environ.get("PONDERER_BACKEND_PARENT_PIPE") != "1" or not sys.platform.startswith("linux"):
             raise ValueError("Serve mode is internal to the Linux desktop UI's parent-pipe supervisor")

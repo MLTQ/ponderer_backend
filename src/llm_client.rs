@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::generation_telemetry::{
     GenerationObserver, GenerationOutcome, GenerationSession, TokenNoveltyTracker,
 };
-use crate::http_client::build_http_client;
+use crate::http_client::build_llm_http_client;
 
 const VISION_MAX_DIMENSION: u32 = 1280;
 const VISION_MAX_BYTES_MULTIMODAL: usize = 512 * 1024;
@@ -57,11 +57,12 @@ struct Choice {
 
 impl LlmClient {
     pub fn new(api_url: String, api_key: String, model: String) -> Self {
+        let client = build_llm_http_client(&api_url, &model);
         Self {
             api_url,
             api_key,
             model,
-            client: build_http_client(),
+            client,
             generation_observer: None,
         }
     }

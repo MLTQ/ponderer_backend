@@ -6,7 +6,7 @@ HTTP client for OpenAI-compatible chat completion APIs (Ollama, LM Studio, vLLM,
 ## Components
 
 ### `LlmClient`
-- **Does**: Wraps `reqwest::Client` with API URL, key, and model; provides async generation methods
+- **Does**: Wraps `reqwest::Client` with API URL, key, and model; provides async generation methods. Managed loopback GGUF calls get a bounded one-hour request deadline; other providers retain 120 seconds.
 - **Interacts with**: `agent::Agent` (all LLM calls go through this), `config::AgentConfig` (constructed from config fields)
 
 ### `LlmClient::generate(messages)`

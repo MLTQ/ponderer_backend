@@ -7,14 +7,18 @@ Provides panic-safe `reqwest::Client` constructors used across backend modules. 
 
 ### `build_http_client`
 - **Does**: Builds a default HTTP client with a 120-second request deadline and panic-safe fallback to `no_proxy`.
-- **Interacts with**: `llm_client.rs`, `tools/agentic.rs`, `agent/reasoning.rs`, and `agent/trajectory.rs`.
+- **Interacts with**: ordinary HTTP callers, `agent/reasoning.rs`, and `agent/trajectory.rs`.
+
+### `build_llm_http_client`
+- **Does**: Uses a bounded one-hour deadline only for the `ponderer-local-gguf` alias at a loopback HTTP URL, allowing long prefill and local generation. All other models/providers retain the ordinary deadline.
+- **Interacts with**: `llm_client.rs` and `tools/agentic.rs`; UI-owned shutdown remains enforced by Affect Lab's process chain.
 
 ### `build_http_client_with_timeout`
 - **Does**: Builds the same panic-safe client with an explicit optional request timeout; `None` intentionally preserves reqwest's no-deadline behavior for callers that opt into it.
 - **Interacts with**: `tools/http.rs`
 
 ### `DEFAULT_HTTP_REQUEST_TIMEOUT`
-- **Does**: Defines the bounded 120-second deadline used by ordinary backend and LLM HTTP clients.
+- **Does**: Defines the bounded 120-second deadline used by ordinary backend clients and non-managed LLM providers.
 - **Rationale**: Prevents a hung model connection from blocking the always-on loop indefinitely while leaving enough time for local inference.
 
 ### `attempt_build` (private)

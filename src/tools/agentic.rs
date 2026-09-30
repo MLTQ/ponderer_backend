@@ -16,7 +16,7 @@ use crate::generation_telemetry::{
     GenerationMetricSample, GenerationObserver, GenerationOutcome, ProviderToken,
     TokenNoveltyTracker,
 };
-use crate::http_client::build_http_client;
+use crate::http_client::build_llm_http_client;
 
 use super::safety;
 use super::{ToolCall, ToolContext, ToolDef, ToolOutput, ToolRegistry};
@@ -262,10 +262,11 @@ pub struct AgenticLoop {
 
 impl AgenticLoop {
     pub fn new(config: AgenticConfig, registry: Arc<ToolRegistry>) -> Self {
+        let client = build_llm_http_client(&config.api_url, &config.model);
         Self {
             config,
             registry,
-            client: build_http_client(),
+            client,
         }
     }
 
