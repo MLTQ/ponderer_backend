@@ -233,6 +233,70 @@ class AffectLabTests(unittest.TestCase):
         self.assertTrue(Path(report["path"]).is_file())
         self.assertEqual(self.completion()["choices"][0]["message"]["content"], "0.1")
 
+    def test_example_library_exposes_reviewable_starters_and_built_recipe(self):
+        self.add_vector()
+        directory = Path(self.lab.artifacts["contentment"]["vector_path"]).parent
+        recipe = {"pairs": worker.make_pairs("contentment")}
+        (directory / "recipe.json").write_text(json.dumps(recipe))
+        manifest = json.loads((directory / "manifest.json").read_text())
+        manifest["recipe_sha256"] = worker.hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+        self.lab.load_artifacts()
+        library = {v["concept"]: v for v in self.lab.status()["example_library"]}
+        self.assertEqual(library["contentment"]["source"], "built recipe")
+        self.assertEqual(library["contentment"]["pairs"], recipe["pairs"])
+        self.assertFalse(library["fear"]["built"])
+        self.assertEqual(len(library["curiosity"]["pairs"]), 8)
+        recipe["pairs"][0]["target"] = "tampered"
+        (directory / "recipe.json").write_text(json.dumps(recipe))
+        self.lab.load_artifacts()
+        self.assertNotIn("contentment", self.lab.recipes)
+
+    def test_mix_comparison_preserves_default_and_fingerprints_all_controls(self):
+        self.add_vector()
+        self.lab.artifacts["excitement"] = {**self.lab.artifacts["contentment"], "concept": "excitement"}
+        self.lab.set_profile({"strengths": {"contentment": 0.1}})
+        profile = {"strengths": {"contentment": 0.2, "excitement": 0.3}, "layer_start": 1, "layer_end": 2}
+        report = self.lab.compare_mix(profile, ["held-out task", worker.TEST_PROMPTS[3]], 4)
+        self.assertEqual([r["strength"] for r in report["records"]], [0, 0, 0.5, 0.5, 1, 1])
+        self.assertEqual(report["records"][-1]["profile"]["strengths"], profile["strengths"])
+        self.assertEqual(set(report["vectors"]), {"contentment", "excitement"})
+        self.assertEqual(report["generation"]["seed"], 42)
+        self.assertIsNone(report["records"][0]["integrity_pass"])
+        self.assertFalse(report["records"][1]["integrity_pass"])
+        self.assertEqual(self.lab.profile["strengths"], {"contentment": 0.1})
+        self.assertIsNone(self.lab.child)
+
+    def test_mix_validation_and_assessment_are_bounded_and_report_specific(self):
+        self.add_vector()
+        for profile, prompts in (({}, ["test"]), ({"strengths": {"contentment": 0.2}}, []), ({"strengths": {"contentment": 0.2}}, ["test"] * 7)):
+            with self.assertRaises(ValueError):
+                self.lab.compare_mix(profile, prompts, 4)
+        report = self.lab.compare_mix({"strengths": {"contentment": 0.2}}, ["test"], 4)
+        values = {"id": report["id"], "affect": "mixed", "quality": "yes", "notes": "Changed words, not enough evidence"}
+        self.lab.review_comparison(values)
+        saved = json.loads(Path(report["path"]).read_text())
+        self.assertEqual(saved["review"]["affect"], "mixed")
+        self.assertIn("operator judgment", saved["review"]["source"])
+        for changes in ({"id": "older-report"}, {"affect": "validated"}, {"notes": "x" * 4001}):
+            with self.assertRaises(ValueError):
+                self.lab.review_comparison(values | changes)
+
+    def test_explicit_load_job_allocates_and_cancelled_queued_load_stays_cancelled(self):
+        self.lab.start_job("load", {})
+        self.lab.job_thread.join(10)
+        self.assertEqual(self.lab.job["phase"], "complete")
+        time.sleep(0.2)
+        self.assertIsNotNone(self.lab.status()["native_pid"])
+        with self.lab.inference_lock:
+            self.lab.start_job("load", {})
+            self.lab.abort()
+            # An intervening normal request may clear the global cancel flag.
+            self.lab.cancel.clear()
+        self.lab.job_thread.join(10)
+        self.assertEqual(self.lab.job["phase"], "cancelled")
+        self.assertIsNone(self.lab.child)
+
     def test_http_authentication_and_streaming(self):
         server = worker.LabHTTPServer(("127.0.0.1", 0), worker.LabHandler)
         server.lab, server.token = self.lab, "test-token" * 4

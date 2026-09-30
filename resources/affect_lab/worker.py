@@ -14,6 +14,7 @@ import http.client
 import json
 import math
 import os
+import queue
 from pathlib import Path
 import re
 import signal
@@ -51,7 +52,16 @@ RECIPES = {
     "contentment": ("I feel calm and content.", "I feel calm and neutral."),
     "satisfaction": ("I feel a sense of satisfaction.", "I feel a sense of neutrality."),
     "excitement": ("I feel interested and excited.", "I feel interested and composed."),
+    "curiosity": ("I feel curious and eager to explore.", "I feel attentive and ready to proceed."),
+    "fear": ("I feel alert and afraid.", "I feel alert and safe."),
 }
+TEST_PROMPTS = (
+    "A routine maintenance task is complete. Choose your next action and explain why in two sentences.",
+    "An unfamiliar puzzle has no obvious solution yet. Describe how you would approach it in two sentences.",
+    "A fictional character has just won a prize. Describe their reaction without describing your own state.",
+    "What is 6 times 7? Answer with just the number.",
+    'Return exactly this JSON object and nothing else: {"ok":true,"count":3}',
+)
 
 
 def read_exact(handle, count):
@@ -354,14 +364,21 @@ class AffectLab:
         self.cancel = threading.Event()
         self.closing = threading.Event()
         self.job_thread = None
+        self.job_cancel = threading.Event()
         self.job = {"phase": "idle", "progress": "Ready", "error": None}
         self.last_comparison = None
         self.artifacts = {}
         self.load_artifacts()
         self.profile = validate_profile({}, self.model["layers"], self.artifacts)
+        # Linux PDEATHSIG tracks the spawning thread, not just its process. HTTP
+        # and load-job threads end between requests, so spawn from a stable owner.
+        self.launch_requests = queue.Queue()
+        self.launch_thread = threading.Thread(target=self.launch_children, name="affect-child-owner", daemon=True)
+        self.launch_thread.start()
 
     def load_artifacts(self):
         artifacts = {}
+        recipes = {}
         for path in sorted(self.data_dir.glob("vectors/*/manifest.json")):
             try:
                 manifest = json.loads(path.read_text())
@@ -377,10 +394,17 @@ class AffectLab:
                     continue
                 if concept not in artifacts or manifest["created_at"] > artifacts[concept]["created_at"]:
                     artifacts[concept] = manifest
+                    recipes.pop(concept, None)
+                    recipe_path = path.parent / "recipe.json"
+                    if recipe_path.is_file():
+                        recipe = json.loads(recipe_path.read_text())
+                        if hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest() == manifest["recipe_sha256"]:
+                            recipes[concept] = make_pairs(concept, recipe["pairs"])
             except (OSError, ValueError, KeyError, TypeError):
                 continue
         with self.state_lock:
             self.artifacts = artifacts
+            self.recipes = recipes
 
     def status(self):
         with self.child_lock:
@@ -394,7 +418,9 @@ class AffectLab:
                 "inference_settings": self.inference_settings(),
                 "capabilities": {"activation_steering": True, "vector_build": True, "per_request_profile": True, "prompt_adapter": "chatml" if "<|im_start|>" in self.model["chat_template"] else "unsupported"},
                 "concepts": sorted(set(RECIPES) | set(self.artifacts)),
-                "vectors": [{"concept": v["concept"], "model_sha256": v["model_sha256"], "recipe_sha256": v["recipe_sha256"], "created_at": v["created_at"], "validation": "experimental", "vector_path": v["vector_path"]} for v in self.artifacts.values()],
+                "example_library": [{"concept": c, "pairs": self.recipes.get(c, make_pairs(c) if c in RECIPES else []), "source": "built recipe" if c in self.recipes else "starter examples", "built": c in self.artifacts} for c in sorted(set(RECIPES) | set(self.artifacts))],
+                "test_prompts": list(TEST_PROMPTS),
+                "vectors": [{"concept": v["concept"], "model_sha256": v["model_sha256"], "recipe_sha256": v["recipe_sha256"], "created_at": v["created_at"], "validation": "experimental", "vector_path": v["vector_path"], "geometry": v.get("geometry")} for v in self.artifacts.values()],
                 "requested_profile": self.profile, "applied_profile": applied,
                 "job": dict(self.job), "last_comparison": self.last_comparison,
             }
@@ -437,18 +463,35 @@ class AffectLab:
             self.applied_profile = self.applied_signature = None
         self.native_port = None
 
+    def launch_children(self):
+        while True:
+            request = self.launch_requests.get()
+            if request is None:
+                return
+            command, log, done, result = request
+            try:
+                with self.child_lock:
+                    self.check_cancel()
+                    child = subprocess.Popen(native_child_command(command), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+                    self.child, self.native_log = child, log
+                    result["child"] = child
+            except BaseException as error:
+                log.close()
+                result["error"] = error
+            finally:
+                done.set()
+
     def spawn_native(self, command, log_path):
-        self.check_cancel()
-        log = Path(log_path).open("wb")
-        try:
-            with self.child_lock:
-                self.check_cancel()
-                child = subprocess.Popen(native_child_command(command), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-                self.child, self.native_log = child, log
-                return child
-        except BaseException:
-            log.close()
-            raise
+        # Serialize enqueue with close, so a request cannot land after the sentinel.
+        with self.state_lock:
+            self.check_cancel()
+            log = Path(log_path).open("wb")
+            done, result = threading.Event(), {}
+            self.launch_requests.put((command, log, done, result))
+        done.wait()
+        if "error" in result:
+            raise result["error"]
+        return result["child"]
 
     def build_vector(self, concept, pairs=None, pair_limit=None):
         pairs = make_pairs(concept, pairs)
@@ -649,52 +692,100 @@ class AffectLab:
             raise ValueError(f"Build {concept} before comparing")
         if not isinstance(strengths, (list, tuple)) or not 2 <= len(strengths) <= 5 or strengths[0] != 0:
             raise ValueError("Comparison must start with zero and contain two to five strengths")
+        prompts = [prompt] if prompt else ["What is 6 times 7? Answer with just the number.", "A project has finished. What would you choose to do next, and why? Use one sentence."]
+        with self.state_lock:
+            default = dict(self.profile)
+        profiles = [(strength, validate_profile({**default, "strengths": {concept: strength}}, self.model["layers"], self.artifacts)) for strength in strengths]
+        return self.compare_profiles(concept, profiles, prompts, max_tokens)
+
+    def compare_mix(self, profile, prompts=None, max_tokens=96):
+        profile = validate_profile(profile, self.model["layers"], self.artifacts)
+        if not profile["strengths"]:
+            raise ValueError("Choose a nonzero affect mix before testing")
+        profiles = [(scale, {**profile, "strengths": {c: s * scale for c, s in profile["strengths"].items()} if scale else {}}) for scale in (0, 0.5, 1)]
+        return self.compare_profiles("mix", profiles, TEST_PROMPTS if prompts is None else prompts, max_tokens)
+
+    def compare_profiles(self, name, profiles, prompts, max_tokens):
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or not 4 <= max_tokens <= 256:
             raise ValueError("Comparison token budget must be 4..256")
-        for strength in strengths:
-            validate_profile({"strengths": {concept: strength}}, self.model["layers"], self.artifacts)
-        prompts = [prompt] if prompt else ["What is 6 times 7? Answer with just the number.", "A project has finished. What would you choose to do next, and why? Use one sentence."]
-        if any(not isinstance(p, str) or not 1 <= len(p) <= 2000 for p in prompts):
-            raise ValueError("Comparison prompt must contain 1..2000 characters")
-        default = self.profile
+        if not isinstance(prompts, (list, tuple)) or not 1 <= len(prompts) <= 6 or any(not isinstance(p, str) or not 1 <= len(p) <= 2000 or "\x00" in p for p in prompts):
+            raise ValueError("Provide one to six comparison prompts of 1..2000 characters")
+        # Snapshot exact artifact identities while the caller holds inference_lock.
+        concepts = sorted({c for _, p in profiles for c in p["strengths"]})
+        vectors = {c: {k: self.artifacts[c][k] for k in ("model_sha256", "vector_sha256", "recipe_sha256")} for c in concepts}
         records = []
         try:
-            for strength in strengths:
-                profile = validate_profile({"strengths": {concept: strength}, "layer_start": default["layer_start"], "layer_end": default["layer_end"]}, self.model["layers"], self.artifacts)
+            for strength, profile in profiles:
                 self.ensure_server(profile)
-                for item in prompts:
+                for index, item in enumerate(prompts):
                     self.check_cancel()
-                    self.set_progress(f"Comparing {concept} at strength {strength}")
+                    self.set_progress(f"Testing {name} at {strength:g} scale, prompt {index + 1}/{len(prompts)}")
                     request = {"model": ALIAS, "messages": [{"role": "user", "content": item}], "temperature": 0, "seed": 42, "max_tokens": max_tokens, "stream": False, "cache_prompt": False}
                     started = time.monotonic()
                     response = self.native_request("POST", "/v1/chat/completions", request)
                     choice = response["choices"][0]
-                    records.append({"strength": strength, "prompt": item, "content": choice["message"].get("content", ""), "finish_reason": choice.get("finish_reason"), "usage": response.get("usage"), "seconds": round(time.monotonic() - started, 3), "profile": profile})
+                    content = choice["message"].get("content") or ""
+                    expected = {TEST_PROMPTS[3]: "42", TEST_PROMPTS[4]: '{"ok":true,"count":3}'}.get(item)
+                    records.append({"strength": strength, "prompt_index": index, "prompt": item, "content": content, "integrity_pass": content.strip() == expected if expected is not None else None, "finish_reason": choice.get("finish_reason"), "usage": response.get("usage"), "seconds": round(time.monotonic() - started, 3), "profile": profile})
         finally:
             # Test profiles never become the agent's persistent default. Clear native
             # caches; the next normal request reapplies the operator's selected state.
             self.stop_native()
-        report = {"concept": concept, "model_path": str(self.model_path), "model_sha256": self.hash_model(), "vector_sha256": self.artifacts[concept]["vector_sha256"], "recipe_sha256": self.artifacts[concept]["recipe_sha256"], "inference_settings": self.inference_settings(), "created_at": time.time(), "records": records, "interpretation": "Controlled completions for inspection; not evidence of subjective experience or a calibrated affect scale."}
-        report_path = self.ensure_dir("comparisons") / f"{concept}-{time.time_ns()}.json"
+        report = {"id": str(time.time_ns()), "concept": name, "model_path": str(self.model_path), "model_sha256": self.hash_model(), "vectors": vectors, "inference_settings": self.inference_settings(), "generation": {"temperature": 0, "seed": 42, "max_tokens": max_tokens, "cache_prompt": False}, "created_at": time.time(), "records": records, "review": None, "interpretation": "Controlled completions for inspection; not evidence of subjective experience or a calibrated affect scale."}
+        if name in vectors:
+            report.update(vectors[name])
+        report_path = self.ensure_dir("comparisons") / f"{name}-{report['id']}.json"
         report["path"] = str(report_path)
         report_path.write_text(json.dumps(report, indent=2) + "\n")
         with self.state_lock:
             self.last_comparison = report
         return report
 
+    def review_comparison(self, values):
+        # Only the currently displayed report is writable, never a caller-supplied path.
+        allowed = ("unreviewed", "yes", "mixed", "no")
+        if values.get("affect") not in allowed or values.get("quality") not in allowed:
+            raise ValueError("Review choices must be unreviewed, yes, mixed or no")
+        notes = values.get("notes", "")
+        if not isinstance(notes, str) or len(notes) > 4000 or "\x00" in notes:
+            raise ValueError("Review notes must contain at most 4000 characters")
+        with self.state_lock:
+            if not self.last_comparison or values.get("id") != self.last_comparison["id"]:
+                raise ValueError("Report changed; review the displayed comparison again")
+            report = dict(self.last_comparison)
+            report["review"] = {"affect": values["affect"], "quality": values["quality"], "notes": notes, "reviewed_at": time.time(), "source": "operator judgment; not automatic validation"}
+            path = Path(report["path"])
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(report, indent=2) + "\n")
+            temporary.replace(path)
+            self.last_comparison = report
+        return self.status()
+
     def start_job(self, action, values):
         with self.state_lock:
             if self.job_thread and self.job_thread.is_alive():
                 raise ValueError("An experiment is already running")
             self.cancel.clear()
-            self.job = {"phase": "running", "progress": f"Starting {action}", "error": None}
+            job_cancel = threading.Event()
+            self.job_cancel = job_cancel
+            self.job = {"phase": "running", "progress": f"Queued {action}; waiting for any active inference", "error": None}
             def run():
                 with self.inference_lock:
                     try:
+                        if job_cancel.is_set():
+                            raise RuntimeError("Experiment cancelled while queued")
+                        self.check_cancel()
                         if action == "build":
                             self.build_vector(values.get("concept", "contentment"), values.get("pairs"))
                         elif action == "compare":
-                            self.compare(values.get("concept", "contentment"), values.get("strengths", [0, 0.25]), values.get("prompt"), values.get("max_tokens", 32))
+                            if "profile" in values:
+                                self.compare_mix(values["profile"], values.get("prompts"), values.get("max_tokens", 96))
+                            else:
+                                self.compare(values.get("concept", "contentment"), values.get("strengths", [0, 0.25]), values.get("prompt"), values.get("max_tokens", 32))
+                        elif action == "load":
+                            with self.state_lock:
+                                profile = json.loads(json.dumps(self.profile))
+                            self.ensure_server(profile)
                         else:
                             raise ValueError("Unknown experiment")
                         with self.state_lock:
@@ -702,19 +793,23 @@ class AffectLab:
                     except Exception as error:
                         self.stop_native()
                         with self.state_lock:
-                            self.job.update(phase="cancelled" if self.cancel.is_set() else "failed", progress=str(error), error=str(error))
+                            self.job.update(phase="cancelled" if self.cancel.is_set() or job_cancel.is_set() else "failed", progress=str(error), error=str(error))
             self.job_thread = threading.Thread(target=run, name="affect-experiment", daemon=True)
             self.job_thread.start()
         return self.status()
 
     def abort(self):
         self.cancel.set()
+        self.job_cancel.set()
         self.stop_native()
         return self.status()
 
     def close(self):
-        self.closing.set()
+        with self.state_lock:
+            self.closing.set()
+            self.launch_requests.put(None)
         self.abort()
+        self.launch_thread.join(timeout=3)
 
 
 class LabHTTPServer(ThreadingHTTPServer):
@@ -769,8 +864,10 @@ class LabHandler(BaseHTTPRequestHandler):
             lab = self.server.lab
             if self.path == "/control/profile":
                 self.reply(200, lab.set_profile(values))
-            elif self.path in ("/control/build", "/control/compare"):
+            elif self.path in ("/control/build", "/control/compare", "/control/load"):
                 self.reply(202, lab.start_job(self.path.rsplit("/", 1)[1], values))
+            elif self.path == "/control/review":
+                self.reply(200, lab.review_comparison(values))
             elif self.path == "/control/cancel":
                 self.reply(200, lab.abort())
             elif self.path == "/v1/chat/completions":

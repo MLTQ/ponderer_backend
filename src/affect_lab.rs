@@ -270,7 +270,10 @@ impl AffectLabManager {
     }
 
     pub async fn control(&self, action: &str, values: Value) -> Result<Value> {
-        if !matches!(action, "build" | "compare" | "profile" | "cancel") {
+        if !matches!(
+            action,
+            "build" | "compare" | "profile" | "cancel" | "load" | "review"
+        ) {
             bail!("Unknown Affect Lab action");
         }
         let mut guard = self.worker.lock().await;
