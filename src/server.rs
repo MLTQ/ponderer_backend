@@ -248,6 +248,8 @@ pub async fn serve_backend(
         .route("/processes/:id", get(get_process))
         .route("/processes/:id/stop", post(stop_process))
         .route("/agent/status", get(get_agent_status))
+        .route("/agent/continuity", get(get_continuity))
+        .route("/agent/contacts/:id/feedback", post(contact_feedback))
         .route(
             "/agent/private-chat-mode",
             get(get_private_chat_mode).put(set_private_chat_mode),
@@ -905,6 +907,38 @@ async fn get_agent_status(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<AgentRuntimeStatus>, (StatusCode, String)> {
     Ok(Json(state.agent.runtime_status().await))
+}
+
+async fn get_continuity(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    Ok(Json(serde_json::json!({
+        "self_model": serde_json::from_str::<serde_json::Value>(&state.db.self_model_context(Utc::now()).map_err(internal_error)?).map_err(|e|internal_error(e.into()))?,
+        "latest_appraisal": state.db.latest_appraisal().map_err(internal_error)?,
+        "contacts": state.db.recent_contact_records().map_err(internal_error)?,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ContactFeedbackRequest {
+    feedback: String,
+}
+async fn contact_feedback(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ContactFeedbackRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !matches!(body.feedback.as_str(), "welcomed" | "dismissed") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "feedback must be welcomed or dismissed".into(),
+        ));
+    }
+    let recorded = state
+        .db
+        .record_contact_feedback(&id, &body.feedback, None, Utc::now())
+        .map_err(internal_error)?;
+    Ok(Json(serde_json::json!({"recorded":recorded})))
 }
 
 async fn get_private_chat_mode(

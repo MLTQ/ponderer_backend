@@ -7,6 +7,7 @@ const MAX_ITEM_CHARS: usize = 360;
 /// fabricated identity.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TemporalSelfContext {
+    pub self_model: Option<String>,
     pub current_self_description: Option<String>,
     pub latest_dream: Option<String>,
     pub open_intentions: Vec<String>,
@@ -19,6 +20,7 @@ impl TemporalSelfContext {
         self.current_self_description
             .as_deref()
             .is_none_or(str::is_empty)
+            && self.self_model.as_deref().is_none_or(str::is_empty)
             && self.latest_dream.as_deref().is_none_or(str::is_empty)
             && self.open_intentions.is_empty()
             && self.active_concerns.is_empty()
@@ -44,6 +46,12 @@ impl TemporalSelfContext {
             "Latest orientation",
             "latest_orientation",
             self.latest_orientation.as_deref(),
+        );
+        push_optional_section(
+            &mut output,
+            "Revisable self-model",
+            "self_model",
+            self.self_model.as_deref(),
         );
         push_items_section(
             &mut output,
@@ -145,6 +153,7 @@ mod tests {
     #[test]
     fn render_labels_context_as_revisable_and_preserves_temporal_sources() {
         let rendered = TemporalSelfContext {
+            self_model: None,
             current_self_description: Some("I tend to return to unfinished threads.".to_string()),
             latest_dream: Some("Care and curiosity kept recurring.".to_string()),
             open_intentions: vec!["Check whether the repair held.".to_string()],

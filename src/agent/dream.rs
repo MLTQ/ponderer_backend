@@ -15,6 +15,7 @@ const DREAM_SYSTEM_PROMPT: &str = "You are the private Dream process of a long-r
 /// Bounded, already-summarized material available to one private Dream pass.
 #[derive(Debug, Clone, Default)]
 pub struct DreamInput {
+    pub self_model: Option<String>,
     pub orientation: Option<String>,
     pub recent_journal: Vec<String>,
     pub active_concerns: Vec<String>,
@@ -93,6 +94,7 @@ impl DreamEngine {
              ## Open Intentions\n{}\n\n\
              ## Previous Dream Consolidation\n{}\n\n\
              ## Current Self-Description\n{}\n\n\
+             ## Revisable Self-Model\n{}\n\n\
              Return JSON:\n\
              {{\n\
                \"skip\": false,\n\
@@ -114,6 +116,7 @@ impl DreamEngine {
                 "current_self_description",
                 input.current_self_description.as_deref(),
             ),
+            format_untrusted_optional("self_model", input.self_model.as_deref()),
         )
     }
 }

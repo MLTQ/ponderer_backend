@@ -258,6 +258,7 @@ fn parse_journal_entry(
 
 fn summarize_user_state(state: &UserStateEstimate) -> String {
     match state {
+        UserStateEstimate::Unknown => "unknown".to_string(),
         UserStateEstimate::DeepWork { activity, .. } => format!("deep_work ({activity})"),
         UserStateEstimate::LightWork { activity, .. } => format!("light_work ({activity})"),
         UserStateEstimate::Idle { since_secs, .. } => format!("idle ({since_secs}s)"),

@@ -297,6 +297,25 @@ impl AgentDatabase {
         }
         let transitioned = query_intention_by_id(&tx, id)?
             .context("transitioned intention disappeared before transaction commit")?;
+        // Private operator turns stay scoped to their conversation. Only
+        // self-directed episodes feed the global continuity model.
+        if !matches!(
+            transitioned.origin,
+            IntentionOrigin::OperatorRequest | IntentionOrigin::UnfinishedGoal
+        ) {
+            super::continuity::record_outcome(
+                &tx,
+                &format!("intention:{id}:{}", transitioned.attempt_count),
+                "intention_outcome",
+                &format!(
+                    "{}: {:?}; {}",
+                    transitioned.summary,
+                    transitioned.status,
+                    transitioned.last_outcome.as_deref().unwrap_or("No outcome")
+                ),
+                now,
+            )?;
+        }
         tx.commit()?;
         Ok(Some(transitioned))
     }
@@ -311,7 +330,10 @@ impl AgentDatabase {
     }
 }
 
-fn insert_intention_record(conn: &Connection, intention: &AgentIntention) -> Result<usize> {
+pub(super) fn insert_intention_record(
+    conn: &Connection,
+    intention: &AgentIntention,
+) -> Result<usize> {
     intention.validate()?;
     let related_concern_ids_json = serde_json::to_string(&intention.related_concern_ids)
         .context("failed to serialize intention concern ids")?;

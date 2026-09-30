@@ -7,6 +7,20 @@ use std::time::{Duration, Instant};
 
 static LOCAL_TIME_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Missing Linux timeout support degrades to unavailable observations.
+fn probe_command(program: &str) -> Command {
+    #[cfg(target_os = "linux")]
+    {
+        let mut command = Command::new("timeout");
+        command.args(["-k", "0.1", "0.5", program]);
+        command
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Command::new(program)
+    }
+}
+
 /// Foundation-only presence monitor.
 ///
 /// ll.1 intentionally keeps this as a lightweight stub so schema/types can land
@@ -32,16 +46,18 @@ impl PresenceMonitor {
 
     pub fn sample(&mut self) -> PresenceState {
         let now = Instant::now();
-        let user_idle_seconds = self.get_user_idle_seconds().unwrap_or_else(|| {
-            self.last_interaction
-                .map(|instant| now.saturating_duration_since(instant).as_secs())
-                .unwrap_or(0)
-        });
-        let time_since_interaction = Duration::from_secs(user_idle_seconds);
+        let desktop_idle = self.get_user_idle_seconds();
+        let user_idle_seconds = desktop_idle.unwrap_or(0);
+        // Chat silence is not evidence that someone has left their desktop.
+        let time_since_interaction = self
+            .last_interaction
+            .map(|instant| now.saturating_duration_since(instant))
+            .unwrap_or_default();
         let active_processes = self.get_interesting_processes();
         let system_load = self.get_system_load();
 
         PresenceState {
+            idle_known: desktop_idle.is_some(),
             user_idle_seconds,
             time_since_interaction,
             session_duration: now.saturating_duration_since(self.session_start),
@@ -53,7 +69,7 @@ impl PresenceMonitor {
 
     #[cfg(target_os = "macos")]
     fn get_user_idle_seconds(&self) -> Option<u64> {
-        let output = Command::new("ioreg")
+        let output = probe_command("ioreg")
             .args(["-c", "IOHIDSystem"])
             .output()
             .ok()?;
@@ -73,7 +89,45 @@ impl PresenceMonitor {
 
     #[cfg(target_os = "linux")]
     fn get_user_idle_seconds(&self) -> Option<u64> {
-        let output = Command::new("xprintidle").output().ok()?;
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            let session = std::env::var("XDG_SESSION_ID").ok()?;
+            let output = probe_command("loginctl")
+                .args([
+                    "show-session",
+                    &session,
+                    "-p",
+                    "IdleHint",
+                    "-p",
+                    "IdleSinceHint",
+                ])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let text = String::from_utf8(output.stdout).ok()?;
+            // Some compositors never publish idle state. Default 'no' with no
+            // timestamp is UNKNOWN, not evidence of active work.
+            let since = text
+                .lines()
+                .find_map(|s| s.strip_prefix("IdleSinceHint="))?
+                .parse::<i64>()
+                .ok()?;
+            if since <= 0 {
+                return None;
+            }
+            return if text.lines().any(|s| s == "IdleHint=yes") {
+                Some(((Utc::now().timestamp_micros() - since).max(0) / 1_000_000) as u64)
+            } else if text.lines().any(|s| s == "IdleHint=no") {
+                Some(0)
+            } else {
+                None
+            };
+        }
+        if std::env::var_os("DISPLAY").is_none() {
+            return None;
+        }
+        let output = probe_command("xprintidle").output().ok()?;
         if !output.status.success() {
             return None;
         }
@@ -91,7 +145,7 @@ impl PresenceMonitor {
     }
 
     fn get_interesting_processes(&mut self) -> Vec<InterestingProcess> {
-        let output = match Command::new("ps")
+        let output = match probe_command("ps")
             .args(["-A", "-o", "pid=,pcpu=,comm=,args="])
             .output()
         {
@@ -157,7 +211,7 @@ impl PresenceMonitor {
     }
 
     fn sample_cpu_percent(&self) -> Option<f32> {
-        let output = Command::new("ps")
+        let output = probe_command("ps")
             .args(["-A", "-o", "pcpu="])
             .output()
             .ok()?;
@@ -174,7 +228,7 @@ impl PresenceMonitor {
     }
 
     fn sample_memory_percent(&self) -> Option<f32> {
-        let output = Command::new("ps")
+        let output = probe_command("ps")
             .args(["-A", "-o", "pmem="])
             .output()
             .ok()?;
@@ -192,7 +246,7 @@ impl PresenceMonitor {
     fn logical_core_count(&self) -> Option<u32> {
         #[cfg(target_os = "macos")]
         {
-            let output = Command::new("sysctl")
+            let output = probe_command("sysctl")
                 .args(["-n", "hw.logicalcpu"])
                 .output()
                 .ok()?;
@@ -207,7 +261,7 @@ impl PresenceMonitor {
         }
         #[cfg(target_os = "linux")]
         {
-            let output = Command::new("nproc").output().ok()?;
+            let output = probe_command("nproc").output().ok()?;
             if !output.status.success() {
                 return None;
             }
@@ -224,7 +278,7 @@ impl PresenceMonitor {
     }
 
     fn sample_gpu(&self) -> (Option<f32>, Option<f32>) {
-        let output = match Command::new("nvidia-smi")
+        let output = match probe_command("nvidia-smi")
             .args([
                 "--query-gpu=temperature.gpu,utilization.gpu",
                 "--format=csv,noheader,nounits",
@@ -263,6 +317,9 @@ impl Default for PresenceMonitor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresenceState {
+    /// False means desktop activity is unavailable, not zero seconds idle.
+    #[serde(default)]
+    pub idle_known: bool,
     pub user_idle_seconds: u64,
     #[serde(with = "duration_seconds")]
     pub time_since_interaction: Duration,

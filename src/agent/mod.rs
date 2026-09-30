@@ -1,5 +1,6 @@
 pub mod capability_profiles;
 pub mod concerns;
+pub mod continuity;
 pub mod dream;
 pub mod journal;
 pub mod loose_autonomy;
@@ -76,11 +77,6 @@ const PROCESSED_EVENT_IDS_STATE_KEY: &str = "living_loop.processed_event_ids";
 const MAX_DURABLE_PROCESSED_EVENT_IDS: usize = 1_024;
 const SELF_DIRECTIVE_CLAIM_OWNER: &str = "ambient-self-directive";
 const SELF_DIRECTIVE_CLAIM_LEASE_MINS: i64 = 60;
-const SOCIAL_LAST_POST_STATE_KEY: &str = "social_last_post_at";
-/// How long the agent waits before reaching out unprompted when the user is idle/away (seconds).
-const SOCIAL_IDLE_INTERVAL_SECS: u64 = 7200; // 2 hours
-/// Minimum interval even when the user is actively working (seconds).
-const SOCIAL_WORK_INTERVAL_SECS: u64 = 14400; // 4 hours
 const CHAT_TOOL_BLOCK_START: &str = "[tool_calls]";
 const CHAT_TOOL_BLOCK_END: &str = "[/tool_calls]";
 const CHAT_THINKING_BLOCK_START: &str = "[thinking]";
@@ -312,7 +308,7 @@ impl Agent {
             config.llm_api_url.clone(),
             config.llm_model.clone(),
             config.llm_api_key.clone(),
-            config.system_prompt.clone(),
+            config.identity_context(),
         )
         .with_generation_observer(GenerationObserver::new(
             GenerationSource::Reasoning,
@@ -438,7 +434,7 @@ impl Agent {
             new_config.llm_api_url.clone(),
             new_config.llm_model.clone(),
             new_config.llm_api_key.clone(),
-            new_config.system_prompt.clone(),
+            new_config.identity_context(),
         )
         .with_generation_observer(self.generation_observer(GenerationSource::Reasoning, None));
         let new_orientation = OrientationEngine::new(
@@ -513,6 +509,9 @@ impl Agent {
     pub async fn toggle_pause(&self) {
         let mut state = self.state.write().await;
         state.paused = !state.paused;
+        if state.paused {
+            self.stop_generation.fetch_add(1, Ordering::SeqCst);
+        }
         let new_state = if state.paused {
             AgentVisualState::Paused
         } else {
@@ -523,6 +522,7 @@ impl Agent {
         drop(state);
 
         let _ = self.event_tx.send(AgentEvent::StateChanged(new_state));
+        self.request_wake("pause_changed");
     }
 
     pub async fn set_paused(&self, paused: bool) -> bool {
@@ -532,6 +532,9 @@ impl Agent {
         }
 
         state.paused = paused;
+        if paused {
+            self.stop_generation.fetch_add(1, Ordering::SeqCst);
+        }
         let new_state = if paused {
             AgentVisualState::Paused
         } else {
@@ -542,6 +545,7 @@ impl Agent {
         drop(state);
 
         let _ = self.event_tx.send(AgentEvent::StateChanged(new_state));
+        self.request_wake("pause_changed");
         paused
     }
 
@@ -563,7 +567,9 @@ impl Agent {
                         intentions
                             .iter()
                             .find(|item| {
-                                item.claimed_by.as_deref() == Some(SELF_DIRECTIVE_CLAIM_OWNER)
+                                item.claimed_by.as_deref().is_some_and(|owner| {
+                                    owner.starts_with(SELF_DIRECTIVE_CLAIM_OWNER)
+                                })
                             })
                             .or_else(|| {
                                 loose_mode
@@ -946,6 +952,7 @@ impl Agent {
 
         let db_lock = self.database.read().await;
         if let Some(db) = db_lock.as_ref() {
+            context.self_model = db.self_model_context(Utc::now()).ok();
             context.current_self_description =
                 db.get_latest_persona().ok().flatten().map(|persona| {
                     match persona.inferred_trajectory.as_deref() {
@@ -1284,6 +1291,24 @@ impl Agent {
             }
         };
 
+        let ambient = self.config.read().await.enable_ambient_loop;
+        let adjusted = if ambient {
+            let guard = self.database.read().await;
+            guard
+                .as_ref()
+                .and_then(|db| db.next_appraisal_wake().ok().flatten())
+                .map(|due| {
+                    adjusted.min(
+                        (due - Utc::now())
+                            .to_std()
+                            .unwrap_or(Duration::from_secs(1))
+                            .max(Duration::from_secs(1)),
+                    )
+                })
+                .unwrap_or(adjusted)
+        } else {
+            adjusted
+        };
         let woken = self.wait_for_wake_or_timeout(adjusted).await;
         if woken {
             self.emit(AgentEvent::Observation(format!(
@@ -1342,13 +1367,11 @@ impl Agent {
 
         loop {
             // Check if paused
-            {
-                let state = self.state.read().await;
-                if state.paused {
-                    self.wait_with_interruptible_sleep(Duration::from_secs(5), "paused-state")
-                        .await;
-                    continue;
-                }
+            let paused = self.state.read().await.paused;
+            if paused {
+                self.wait_with_interruptible_sleep(Duration::from_secs(5), "paused-state")
+                    .await;
+                continue;
             }
 
             self.set_state(AgentVisualState::Idle).await;
@@ -1610,6 +1633,7 @@ impl Agent {
             }
         };
 
+        let claim_owner = format!("{SELF_DIRECTIVE_CLAIM_OWNER}:{}", uuid::Uuid::new_v4());
         let adopted = {
             let db_lock = self.database.read().await;
             let db = db_lock.as_ref()?;
@@ -1624,13 +1648,17 @@ impl Agent {
                 now.timestamp_millis(),
                 stable_text_fingerprint(&format!("{} {}", seed.summary, seed.motivation))
             ));
-            if let Err(error) = db.create_intention(draft, now) {
-                tracing::warn!("Failed to persist adopted Loose goal: {}", error);
-                return None;
-            }
-            db.claim_next_intention(
+            let created = match db.create_intention(draft, now) {
+                Ok(created) => created,
+                Err(error) => {
+                    tracing::warn!("Failed to persist adopted Loose goal: {}", error);
+                    return None;
+                }
+            };
+            db.claim_intention(
+                &created.id,
                 now,
-                SELF_DIRECTIVE_CLAIM_OWNER,
+                &claim_owner,
                 ChronoDuration::minutes(SELF_DIRECTIVE_CLAIM_LEASE_MINS),
             )
             .unwrap_or_else(|error| {
@@ -1646,7 +1674,7 @@ impl Agent {
         .await;
         Some(DurableIntentionClaim {
             intention: adopted,
-            owner: SELF_DIRECTIVE_CLAIM_OWNER.to_string(),
+            owner: claim_owner,
         })
     }
 
@@ -1663,7 +1691,10 @@ impl Agent {
         config_snapshot: &AgentConfig,
         pending_events: &[SkillEvent],
     ) {
-        if !config_snapshot.enable_ambient_loop || !pending_events.is_empty() {
+        if !config_snapshot.enable_ambient_loop
+            || !pending_events.is_empty()
+            || self.state.read().await.paused
+        {
             return;
         }
         if self.has_pending_operator_messages().await {
@@ -1677,6 +1708,7 @@ impl Agent {
         }
 
         let directive_interval_secs = configured_self_directive_interval_secs(config_snapshot);
+        let claim_owner = format!("{SELF_DIRECTIVE_CLAIM_OWNER}:{}", uuid::Uuid::new_v4());
         let (should_run, concern_hints, memory_hints, claimed_intention) = {
             let db_lock = self.database.read().await;
             let Some(db) = db_lock.as_ref() else {
@@ -1726,7 +1758,7 @@ impl Agent {
                 let intention = db
                     .claim_next_intention(
                         now,
-                        SELF_DIRECTIVE_CLAIM_OWNER,
+                        &claim_owner,
                         ChronoDuration::minutes(SELF_DIRECTIVE_CLAIM_LEASE_MINS),
                     )
                     .unwrap_or_else(|error| {
@@ -1735,7 +1767,7 @@ impl Agent {
                     })
                     .map(|intention| DurableIntentionClaim {
                         intention,
-                        owner: SELF_DIRECTIVE_CLAIM_OWNER.to_string(),
+                        owner: claim_owner.clone(),
                     });
                 (true, concerns, hints, intention)
             }
@@ -1755,6 +1787,9 @@ impl Agent {
             }
         }
 
+        if claimed_intention.is_none() {
+            return;
+        }
         self.emit(AgentEvent::CycleStart {
             label: if config_snapshot.loose_mode {
                 "🜁 Loose episode".to_string()
@@ -1820,10 +1855,9 @@ impl Agent {
             ));
         }
 
-        if config_snapshot.loose_mode
-            && claimed_intention
-                .as_ref()
-                .is_some_and(|claim| claim.intention.origin == IntentionOrigin::SelfAuthored)
+        if claimed_intention
+            .as_ref()
+            .is_some_and(|claim| claim.intention.origin == IntentionOrigin::SelfAuthored)
         {
             user_message.push_str(
                 "\n\nThis is one bounded episode in a potentially long project. End your narrative with exactly one private lifecycle block:\n\
@@ -1892,7 +1926,7 @@ impl Agent {
         let self_directive_system_prompt = format!(
             "{}\n\n{}\n\nYou are in bounded autonomous self-directed mode. \
              Follow your curiosity within the tools and approvals available to this mode. Act on what matters to you and report what you did.\n{}",
-            config_snapshot.system_prompt,
+            config_snapshot.identity_context(),
             HISTORICAL_CONTEXT_SAFETY_INSTRUCTION,
             source_authority_guidance,
         );
@@ -1905,10 +1939,9 @@ impl Agent {
                 self.record_successful_outbound_actions(&result.tool_calls_made)
                     .await;
                 let raw_summary = result.response.unwrap_or_default().trim().to_string();
-                let is_loose_goal = config_snapshot.loose_mode
-                    && claimed_intention.as_ref().is_some_and(|claim| {
-                        claim.intention.origin == IntentionOrigin::SelfAuthored
-                    });
+                let is_loose_goal = claimed_intention
+                    .as_ref()
+                    .is_some_and(|claim| claim.intention.origin == IntentionOrigin::SelfAuthored);
                 let (summary, loose_decision) = if is_loose_goal {
                     split_episode_report(&raw_summary)
                 } else {
@@ -2002,7 +2035,8 @@ impl Agent {
                                 .unwrap_or(1);
                             let episode_limit =
                                 config_snapshot.loose_max_consecutive_episodes.max(1);
-                            let cooling_down = attempts % episode_limit == 0;
+                            let cooling_down =
+                                !config_snapshot.loose_mode || attempts % episode_limit == 0;
                             request_loose_continuation = !cooling_down;
                             IntentionAttemptOutcome::Retry {
                                 outcome: format!(
@@ -2162,120 +2196,159 @@ impl Agent {
         }
     }
 
-    /// Check whether the social drive should fire — if enough time has passed since the
-    /// agent last spoke unprompted AND the orientation contains something worth saying,
-    /// generate a short natural message and post it to chat.
-    async fn maybe_post_social_message(
+    /// Appraise lived evidence, then pass any chosen communication through the
+    /// same durable host policy. A wake is an opportunity to think, never a send.
+    async fn maybe_appraise_continuity(
         &self,
-        config_snapshot: &AgentConfig,
-        orientation: &Orientation,
+        config: &AgentConfig,
+        orientation: Option<&Orientation>,
     ) {
-        if !config_snapshot.enable_ambient_loop {
+        use continuity::{fingerprint, Evidence};
+        if !config.enable_ambient_loop
+            || self.has_pending_operator_messages().await
+            || self.state.read().await.paused
+        {
             return;
         }
-        // Don't interrupt when the user is actively chatting.
-        if self.has_pending_operator_messages().await {
-            return;
-        }
-        // Nothing interesting in the orientation → no reason to reach out.
-        let has_content = !orientation.pending_thoughts.is_empty()
-            || !orientation.anomalies.is_empty()
-            || !orientation.salience_map.is_empty();
-        if !has_content {
-            return;
-        }
-
-        // Choose the minimum quiet interval based on user state.
-        let min_interval_secs = match orientation.user_state {
-            orientation::UserStateEstimate::DeepWork { .. } => SOCIAL_WORK_INTERVAL_SECS,
-            _ => SOCIAL_IDLE_INTERVAL_SECS,
-        };
-
-        let is_due = {
-            let db_lock = self.database.read().await;
-            let Some(db) = db_lock.as_ref() else {
+        let now = Utc::now();
+        let input = {
+            let guard = self.database.read().await;
+            let Some(db) = guard.as_ref() else {
                 return;
             };
+            let mut evidence = match db.continuity_evidence(now) {
+                Ok(e) => e,
+                Err(error) => {
+                    tracing::warn!("Continuity evidence unavailable: {error}");
+                    return;
+                }
+            };
+            if let Some(o) = orientation {
+                evidence.push(Evidence {
+                    id: format!("orientation:{}", o.generated_at.to_rfc3339()),
+                    content: serde_json::to_string(o).unwrap_or_default(),
+                });
+            }
+            let model = db.self_model_context(now).unwrap_or_default();
+            let signature = fingerprint(&serde_json::to_string(&evidence).unwrap_or_default());
+            let next = db.next_appraisal_wake().ok().flatten();
             let last = db
-                .get_state(SOCIAL_LAST_POST_STATE_KEY)
+                .get_state("continuity.last_attempt_at")
                 .ok()
                 .flatten()
-                .and_then(|raw| raw.parse::<chrono::DateTime<Utc>>().ok());
-            last.map(|t| Utc::now() - t >= ChronoDuration::seconds(min_interval_secs as i64))
-                .unwrap_or(false) // Don't fire on very first boot — wait for first real interaction.
+                .and_then(|t| t.parse::<chrono::DateTime<Utc>>().ok());
+            let changed = db
+                .get_state("continuity.input_signature")
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some(&signature);
+            let due = next.is_none_or(|t| t <= now);
+            if (changed || due) && last.is_none_or(|t| now - t >= ChronoDuration::seconds(60)) {
+                // Back off failed/aborted appraisals across restarts, too.
+                if db
+                    .set_state("continuity.last_attempt_at", &now.to_rfc3339())
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = db.set_state(
+                    "continuity.next_wake_at",
+                    &(now + ChronoDuration::minutes(2)).to_rfc3339(),
+                );
+                Some((
+                    evidence,
+                    model,
+                    signature,
+                    format!("{}:{}", now.to_rfc3339(), uuid::Uuid::new_v4()),
+                ))
+            } else {
+                None
+            }
         };
-
-        if !is_due {
-            return;
-        }
-
-        // Build a minimal context snapshot to ground the message.
-        let thought_text = orientation
-            .pending_thoughts
-            .first()
-            .map(|t| t.content.as_str())
-            .or_else(|| {
-                orientation
-                    .anomalies
-                    .first()
-                    .map(|a| a.description.as_str())
-            })
-            .unwrap_or("");
-
-        let social_system_prompt = format!(
-            "{}\n\nYou are speaking to {} unprompted — you have something on your mind and decided to say it. \
-             Write one short, natural, direct message (1-3 sentences). \
-             No greetings, no 'just checking in', no formalities. Just say the thing.",
-            config_snapshot.system_prompt,
-            config_snapshot.username
-        );
-        let social_user_message = format!(
-            "What you have on your mind right now:\n{}\n\nWrite your message.",
-            thought_text
-        );
-
-        let client = crate::llm_client::LlmClient::new(
-            agentic_api_url(&config_snapshot.llm_api_url),
-            config_snapshot.llm_api_key.clone().unwrap_or_default(),
-            config_snapshot.llm_model.clone(),
-        )
-        .with_generation_observer(self.generation_observer(GenerationSource::Social, None));
-        let messages = vec![
-            crate::llm_client::Message {
-                role: "system".to_string(),
-                content: social_system_prompt,
-            },
-            crate::llm_client::Message {
-                role: "user".to_string(),
-                content: social_user_message,
-            },
-        ];
-
-        match client.generate(messages).await {
-            Ok(response) => {
-                let message = response.trim().to_string();
-                if !message.is_empty() {
-                    self.emit(AgentEvent::Observation(format!(
-                        "Social drive: posting to chat: {}",
-                        truncate_for_event(&message, 120)
-                    )))
-                    .await;
-                    self.post_ambient_chat_message(&message).await;
-
-                    // Record this so we don't fire again too soon.
-                    let db_lock = self.database.read().await;
-                    if let Some(db) = db_lock.as_ref() {
-                        let _ = db.set_state(SOCIAL_LAST_POST_STATE_KEY, &Utc::now().to_rfc3339());
+        if let Some((evidence, model, signature, source)) = input {
+            let generation = self.stop_generation.load(Ordering::SeqCst);
+            let client = crate::llm_client::LlmClient::new(
+                agentic_api_url(&config.llm_api_url),
+                config.llm_api_key.clone().unwrap_or_default(),
+                config.llm_model.clone(),
+            )
+            .with_generation_observer(self.generation_observer(GenerationSource::Appraisal, None));
+            let decision = tokio::select! {
+                result = tokio::time::timeout(Duration::from_secs(45),
+                    continuity::appraise(&client,config,&evidence,&model,now)) => result.ok(),
+                _ = self.wake_notify.notified() => None,
+            };
+            if self.stop_generation.load(Ordering::SeqCst) != generation
+                || self.has_pending_operator_messages().await
+                || self.state.read().await.paused
+            {
+                return;
+            }
+            match decision {
+                Some(Ok(decision)) => {
+                    let guard = self.database.read().await;
+                    if let Some(db) = guard.as_ref() {
+                        match db.save_appraisal(&source, &decision, &evidence, now) {
+                            Ok(true) => {
+                                let _ = db.set_state("continuity.input_signature", &signature);
+                            }
+                            Ok(false) => {}
+                            Err(error) => tracing::warn!("Appraisal commit failed: {error}"),
+                        }
                     }
                 }
+                Some(Err(error)) => tracing::warn!("Appraisal rejected: {error}"),
+                None => tracing::debug!("Appraisal timed out or was interrupted"),
             }
-            Err(e) => {
-                tracing::warn!("Social drive LLM call failed: {}", e);
+        }
+        let current = self.config.read().await.clone();
+        if !current.enable_ambient_loop
+            || self.state.read().await.paused
+            || self.has_pending_operator_messages().await
+        {
+            return;
+        }
+        let busy = orientation.is_some_and(|o| {
+            matches!(
+                o.user_state,
+                orientation::UserStateEstimate::DeepWork { .. }
+            )
+        });
+        let conversations = {
+            let guard = self.database.read().await;
+            guard
+                .as_ref()
+                .map(|db| {
+                    db.release_communication_intents(
+                        &current.outreach,
+                        busy,
+                        chrono::Timelike::hour(&chrono::Local::now()) as u8,
+                        Utc::now(),
+                    )
+                })
+                .transpose()
+        };
+        match conversations {
+            Ok(Some(conversations)) => {
+                for conversation_id in conversations {
+                    self.emit(AgentEvent::ChatStreaming {
+                        conversation_id,
+                        content: String::new(),
+                        done: true,
+                    })
+                    .await;
+                }
             }
+            Err(error) => tracing::warn!("Contact policy evaluation failed: {error}"),
+            _ => {}
         }
     }
 
     async fn maybe_run_heartbeat(&self) {
+        if self.state.read().await.paused {
+            return;
+        }
         let config_snapshot = { self.config.read().await.clone() };
         let enabled = config_snapshot.enable_heartbeat;
         let heartbeat_interval_mins = config_snapshot.heartbeat_interval_mins.max(1);
@@ -2283,7 +2356,7 @@ impl Agent {
         let llm_api_url = config_snapshot.llm_api_url.clone();
         let llm_model = config_snapshot.llm_model.clone();
         let llm_api_key = config_snapshot.llm_api_key.clone();
-        let system_prompt = config_snapshot.system_prompt.clone();
+        let system_prompt = config_snapshot.identity_context();
         let username = config_snapshot.username.clone();
 
         if !enabled {
@@ -2747,7 +2820,7 @@ impl Agent {
             .clone()
             .unwrap_or_else(|| config.llm_model.clone());
         let api_key = config.llm_api_key.clone();
-        let system_prompt = config.system_prompt.clone();
+        let system_prompt = config.identity_context();
         let guiding_principles = config.guiding_principles.clone();
         drop(config);
 
@@ -2857,6 +2930,14 @@ impl Agent {
         };
 
         let context = OrientationContext {
+            identity_context: config_snapshot.identity_context(),
+            self_model: {
+                let guard = self.database.read().await;
+                guard
+                    .as_ref()
+                    .and_then(|db| db.self_model_context(Utc::now()).ok())
+                    .unwrap_or_default()
+            },
             presence,
             concerns,
             recent_journal,
@@ -3240,36 +3321,6 @@ impl Agent {
         }
     }
 
-    /// Post an unprompted agent message to the default conversation so the user
-    /// can see it when they next open the chat. Used by Surface and Interrupt
-    /// dispositions to let the agent speak without waiting to be asked.
-    async fn post_ambient_chat_message(&self, content: &str) {
-        let saved = {
-            let db_lock = self.database.read().await;
-            if let Some(ref db) = *db_lock {
-                db.add_chat_message_in_conversation(
-                    crate::database::DEFAULT_CHAT_CONVERSATION_ID,
-                    "agent",
-                    content,
-                )
-                .is_ok()
-            } else {
-                false
-            }
-        };
-        if saved {
-            // Notify the frontend that a new message is ready.
-            self.emit(AgentEvent::ChatStreaming {
-                conversation_id: crate::database::DEFAULT_CHAT_CONVERSATION_ID.to_string(),
-                content: String::new(),
-                done: true,
-            })
-            .await;
-        } else {
-            tracing::warn!("post_ambient_chat_message: failed to persist message to DB");
-        }
-    }
-
     async fn apply_chat_concern_updates(
         &self,
         conversation_id: &str,
@@ -3609,7 +3660,7 @@ impl Agent {
         let llm_api_url = config_snapshot.llm_api_url.clone();
         let llm_model = config_snapshot.llm_model.clone();
         let llm_api_key = config_snapshot.llm_api_key.clone();
-        let system_prompt = config_snapshot.system_prompt.clone();
+        let system_prompt = config_snapshot.identity_context();
         let loop_config = AgenticConfig {
             max_iterations: configured_agentic_max_iterations(&config_snapshot),
             api_url: agentic_api_url(&llm_api_url),
@@ -3748,7 +3799,7 @@ impl Agent {
     async fn run_ambient_tick(&self, pending_events: &[SkillEvent]) -> Option<Orientation> {
         // If operator messages arrived while the engaged tick was running, skip the
         // ambient work entirely — they'll be processed first on the next iteration.
-        if self.has_pending_operator_messages().await {
+        if self.has_pending_operator_messages().await || self.state.read().await.paused {
             return None;
         }
         self.emit(AgentEvent::CycleStart {
@@ -3774,16 +3825,13 @@ impl Agent {
             .await;
         }
 
+        self.maybe_appraise_continuity(&config_snapshot, orientation.as_ref())
+            .await;
         self.maybe_run_self_directive(&config_snapshot, pending_events)
             .await;
 
         if config_snapshot.enable_heartbeat {
             self.maybe_run_heartbeat().await;
-        }
-
-        // Social drive: check if it's time to reach out to the user unprompted.
-        if let Some(ref o) = orientation {
-            self.maybe_post_social_message(&config_snapshot, o).await;
         }
 
         orientation
@@ -3815,48 +3863,11 @@ impl Agent {
                     self.maybe_decay_concerns().await;
                 }
             }
-            Disposition::Surface => {
-                if let Some(thought) = orientation.pending_thoughts.first() {
-                    self.emit(AgentEvent::Observation(format!(
-                        "Surfacing thought to chat: {}",
-                        truncate_for_event(&thought.content, 180)
-                    )))
-                    .await;
-                    self.post_ambient_chat_message(&thought.content).await;
-                } else if let Some(anomaly) = orientation.anomalies.first() {
-                    self.emit(AgentEvent::Observation(format!(
-                        "Surfacing anomaly to chat: {}",
-                        truncate_for_event(&anomaly.description, 180)
-                    )))
-                    .await;
-                    self.post_ambient_chat_message(&anomaly.description).await;
-                }
-            }
-            Disposition::Interrupt => {
-                // Interrupt is higher urgency — post the most salient item to chat
-                // so the user sees it immediately when they look, plus log it.
-                let message = if let Some(thought) = orientation.pending_thoughts.first() {
-                    Some(thought.content.clone())
-                } else if let Some(anomaly) = orientation.anomalies.first() {
-                    Some(anomaly.description.clone())
-                } else {
-                    None
-                };
-                if let Some(msg) = message {
-                    self.emit(AgentEvent::Observation(format!(
-                        "Interrupt: posting to chat: {}",
-                        truncate_for_event(&msg, 180)
-                    )))
-                    .await;
-                    self.post_ambient_chat_message(&msg).await;
-                } else {
-                    self.emit(AgentEvent::Observation(
-                        "Interrupt disposition with no pending thoughts or anomalies.".to_string(),
-                    ))
-                    .await;
-                }
-            }
-            Disposition::Observe | Disposition::Idle => {}
+            // Advisory dispositions are appraised once; never directly publish cached thoughts.
+            Disposition::Surface
+            | Disposition::Interrupt
+            | Disposition::Observe
+            | Disposition::Idle => {}
         }
     }
 
@@ -3877,6 +3888,9 @@ impl Agent {
     }
 
     async fn should_dream(&self, config: &AgentConfig, orientation: Option<&Orientation>) -> bool {
+        if self.state.read().await.paused {
+            return false;
+        }
         if !config.enable_dream_cycle {
             return false;
         }
@@ -4010,6 +4024,7 @@ impl Agent {
             });
 
             DreamInput {
+                self_model: db.self_model_context(Utc::now()).ok(),
                 orientation: orientation.map(format_orientation_for_context),
                 recent_journal,
                 active_concerns,
@@ -4235,7 +4250,7 @@ impl Agent {
         let llm_api_url = config_snapshot.llm_api_url.clone();
         let llm_model = config_snapshot.llm_model.clone();
         let llm_api_key = config_snapshot.llm_api_key.clone();
-        let system_prompt = config_snapshot.system_prompt.clone();
+        let system_prompt = config_snapshot.identity_context();
         let loop_config = AgenticConfig {
             max_iterations: configured_agentic_max_iterations(&config_snapshot),
             api_url: agentic_api_url(&llm_api_url),
@@ -4406,7 +4421,21 @@ impl Agent {
 
         let mut messages_by_conversation: Vec<(String, Vec<crate::database::ChatMessage>)> =
             Vec::new();
+        let telegram_owner = self.config.read().await.telegram_chat_id;
         for msg in unprocessed_messages {
+            if msg.conversation_id == "telegram" || msg.conversation_id.starts_with("telegram:") {
+                let guard = self.database.read().await;
+                let Some(db) = guard.as_ref() else {
+                    continue;
+                };
+                if !db
+                    .telegram_message_is_authorized(&msg.id, telegram_owner)
+                    .unwrap_or(false)
+                {
+                    db.mark_message_processed(&msg.id)?;
+                    continue;
+                }
+            }
             let conversation_id = msg.conversation_id.clone();
             if let Some((_, bucket)) = messages_by_conversation
                 .iter_mut()
@@ -4455,7 +4484,7 @@ impl Agent {
         let llm_api_url = config_snapshot.llm_api_url.clone();
         let llm_model = config_snapshot.llm_model.clone();
         let llm_api_key = config_snapshot.llm_api_key.clone();
-        let system_prompt = config_snapshot.system_prompt.clone();
+        let system_prompt = config_snapshot.identity_context();
         let username = config_snapshot.username.clone();
         let working_directory = std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -5178,8 +5207,6 @@ impl Agent {
                                 tracing::warn!("Failed to save agent chat reply: {}", e);
                             }
                         }
-                        // Reset the social drive clock — we just spoke to the user.
-                        let _ = db.set_state(SOCIAL_LAST_POST_STATE_KEY, &Utc::now().to_rfc3339());
                     }
                 }
 
@@ -7931,6 +7958,7 @@ fn adaptive_tick_secs(
 ) -> u64 {
     let base = ambient_min_interval_secs.max(5);
     match user_state {
+        Some(orientation::UserStateEstimate::Unknown) => base.max(120),
         Some(orientation::UserStateEstimate::DeepWork { .. }) => base.max(120),
         Some(orientation::UserStateEstimate::LightWork { .. }) => base.max(45),
         Some(orientation::UserStateEstimate::Idle { .. }) => base.max(30),
@@ -7949,6 +7977,7 @@ fn should_trigger_dream_with_signals(
 
 fn summarize_user_state(state: &orientation::UserStateEstimate) -> String {
     match state {
+        orientation::UserStateEstimate::Unknown => "unknown".to_string(),
         orientation::UserStateEstimate::DeepWork { activity, .. } => {
             format!("deep_work({})", truncate_for_event(activity, 32))
         }
@@ -7962,6 +7991,7 @@ fn summarize_user_state(state: &orientation::UserStateEstimate) -> String {
 
 fn summarize_private_user_state(state: &orientation::UserStateEstimate) -> String {
     match state {
+        orientation::UserStateEstimate::Unknown => "unknown".to_string(),
         orientation::UserStateEstimate::DeepWork { .. } => "deep_work".to_string(),
         orientation::UserStateEstimate::LightWork { .. } => "light_work".to_string(),
         orientation::UserStateEstimate::Idle { since_secs, .. } => format!("idle({since_secs}s)"),

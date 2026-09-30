@@ -18,6 +18,7 @@ pub enum GenerationSource {
     Journal,
     Dream,
     Social,
+    Appraisal,
     Reasoning,
     PersonaTrajectory,
     PersonaSnapshot,

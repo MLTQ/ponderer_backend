@@ -44,6 +44,10 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 | TOML file | Serde field names and aliases (`agent_name` -> `username`, `check_interval_seconds` -> `poll_interval_secs`) | Removing serde aliases breaks existing config files |
 
 ## Notes
+
+- Identity distinguishes `username` (agent) from `operator_name`, `relationship_description`, and operator-owned `identity_boundaries`. Learned continuity never mutates these settings.
+- `outreach` is a serde-defaulted policy table, not a schedule: enabled/Telegram-enabled, one-hour minimum spacing, three contacts per rolling day, 24-hour topic cooldown, 22–08 local quiet hours, no urgent quiet-hour bypass, and 0.7 minimum confidence by default.
+- Telegram fails closed without both a token and a positive private owner ID. Credentials never appear in transport logs.
 - Config save path targets an executable-root directory; for Cargo `target/*/deps` runs, the `deps` parent is used so state lives in `target/{debug|release}` instead of hash subfolders.
 - Load discovery scans that executable-root directory plus working directory candidates and picks the newest valid file.
 - When both `ponderer_config.toml` and `agent_config.toml` exist, the newest file wins to avoid stale-file precedence surprises.

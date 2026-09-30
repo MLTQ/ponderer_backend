@@ -10,11 +10,16 @@ use crate::memory::{KvMemoryBackend, MemoryBackend, MemoryMigrationRegistry};
 mod helpers;
 
 pub mod chat;
+pub mod communications;
 pub mod concerns;
+pub mod continuity;
+#[cfg(test)]
+mod continuity_tests;
 pub mod dream;
 pub mod intentions;
 pub mod journal;
 pub mod memory;
+mod migrations;
 pub mod orientation;
 pub mod persona;
 pub mod plugins;
@@ -59,6 +64,7 @@ impl AgentDatabase {
             migration_registry: MemoryMigrationRegistry::default(),
         };
         db.ensure_schema()?;
+        db.migrate_continuity_schema()?;
         db.ensure_memory_design_state()?;
         Ok(db)
     }
@@ -524,7 +530,7 @@ impl AgentDatabase {
                 id TEXT PRIMARY KEY,
                 origin TEXT NOT NULL CHECK(origin IN (
                     'orientation_thought', 'unfinished_goal', 'operator_request',
-                    'external_event', 'heartbeat', 'dream', 'system'
+                    'external_event', 'heartbeat', 'dream', 'system', 'self_authored'
                 )),
                 status TEXT NOT NULL CHECK(status IN (
                     'pending', 'claimed', 'blocked', 'completed', 'abandoned'

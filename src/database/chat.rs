@@ -138,6 +138,50 @@ pub struct OodaTurnPacketRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// Shared atomic insertion boundary for UI turns, connector receipts and replies.
+pub(super) fn insert_chat_message(
+    conn: &rusqlite::Connection,
+    id: &str,
+    conversation: &str,
+    role: &str,
+    content: &str,
+    turn: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let timestamp = now.to_rfc3339();
+    conn.execute("INSERT OR IGNORE INTO chat_sessions (id,label,created_at,updated_at) VALUES (?1,'Default session',?2,?2)",
+        params![DEFAULT_CHAT_SESSION_ID,timestamp])?;
+    conn.execute("INSERT OR IGNORE INTO chat_conversations (id,session_id,title,created_at,updated_at,runtime_state,active_turn_id)
+        VALUES (?1,?2,'Conversation',?3,?3,'idle',NULL)", params![conversation,DEFAULT_CHAT_SESSION_ID,timestamp])?;
+    conn.execute(
+        "INSERT INTO chat_messages (id,conversation_id,role,content,created_at,processed,turn_id)
+        VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            id,
+            conversation,
+            role,
+            content,
+            timestamp,
+            !role.eq_ignore_ascii_case("operator"),
+            turn
+        ],
+    )?;
+    conn.execute(
+        "UPDATE chat_conversations SET updated_at=?2,
+        runtime_state=CASE WHEN ?3 THEN 'idle' ELSE runtime_state END,
+        active_turn_id=CASE WHEN ?3 THEN NULL ELSE active_turn_id END WHERE id=?1",
+        params![
+            conversation,
+            timestamp,
+            role.eq_ignore_ascii_case("operator")
+        ],
+    )?;
+    if role.eq_ignore_ascii_case("agent") {
+        super::communications::enqueue_reply(conn, id, conversation, content, now)?;
+    }
+    Ok(())
+}
+
 impl AgentDatabase {
     /// Add a chat message
     pub fn add_chat_message(&self, role: &str, content: &str) -> Result<String> {
@@ -157,54 +201,18 @@ impl AgentDatabase {
         } else {
             conversation_id.trim()
         };
-        let now = Utc::now().to_rfc3339();
-        let processed = if role.eq_ignore_ascii_case("operator") {
-            0
-        } else {
-            1
-        };
-        let conn = self.lock_conn()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO chat_sessions (id, label, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                DEFAULT_CHAT_SESSION_ID,
-                "Default session",
-                now.clone(),
-                now.clone()
-            ],
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        insert_chat_message(
+            &tx,
+            &id,
+            conversation_id,
+            role,
+            content,
+            turn_id,
+            Utc::now(),
         )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO chat_conversations (id, session_id, title, created_at, updated_at, runtime_state, active_turn_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-            params![
-                conversation_id,
-                DEFAULT_CHAT_SESSION_ID,
-                "Conversation",
-                now.clone(),
-                now.clone(),
-                ChatTurnPhase::Idle.as_db_str(),
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO chat_messages (id, conversation_id, role, content, created_at, processed, turn_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, conversation_id, role, content, now.clone(), processed, turn_id],
-        )?;
-        if role.eq_ignore_ascii_case("operator") {
-            conn.execute(
-                "UPDATE chat_conversations
-                 SET runtime_state = ?2, active_turn_id = NULL, updated_at = ?3
-                 WHERE id = ?1",
-                params![conversation_id, ChatTurnPhase::Idle.as_db_str(), now],
-            )?;
-        } else {
-            conn.execute(
-                "UPDATE chat_conversations
-                 SET updated_at = ?2
-                 WHERE id = ?1",
-                params![conversation_id, now],
-            )?;
-        }
+        tx.commit()?;
         Ok(id)
     }
 

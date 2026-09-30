@@ -7,6 +7,38 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Operator-owned bounds for spontaneous contact. Timers permit reconsideration;
+/// they never instruct the model to send a message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutreachConfig {
+    pub enabled: bool,
+    pub telegram_enabled: bool,
+    pub min_interval_secs: u64,
+    pub max_per_day: u32,
+    pub topic_cooldown_secs: u64,
+    pub quiet_start_hour: u8,
+    pub quiet_end_hour: u8,
+    pub allow_urgent_during_quiet: bool,
+    pub min_confidence: f32,
+}
+
+impl Default for OutreachConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            telegram_enabled: true,
+            min_interval_secs: 3600,
+            max_per_day: 3,
+            topic_cooldown_secs: 86_400,
+            quiet_start_hour: 22,
+            quiet_end_hour: 8,
+            allow_urgent_during_quiet: false,
+            min_confidence: 0.7,
+        }
+    }
+}
+
 pub const PRIVATE_CHAT_MODE_AGENTIC: &str = "agentic";
 pub const PRIVATE_CHAT_MODE_DIRECT: &str = "direct";
 
@@ -70,6 +102,16 @@ pub struct AgentConfig {
     // Agent Identity
     #[serde(default = "default_username", alias = "agent_name")]
     pub username: String,
+    /// The human's name; `username` remains the agent name for config compatibility.
+    #[serde(default = "default_operator_name")]
+    pub operator_name: String,
+    #[serde(default = "default_relationship")]
+    pub relationship_description: String,
+    /// Operator-authored identity boundaries. Reflection cannot edit these.
+    #[serde(default)]
+    pub identity_boundaries: Vec<String>,
+    #[serde(default)]
+    pub outreach: OutreachConfig,
 
     // System prompt
     #[serde(default = "default_system_prompt")]
@@ -195,7 +237,7 @@ pub struct AgentConfig {
     // Telegram bot integration
     #[serde(default)]
     pub telegram_bot_token: Option<String>,
-    /// Telegram chat ID to accept messages from. None = accept any chat (less secure).
+    /// Required positive private-chat ID. Without it Telegram is disabled.
     #[serde(default)]
     pub telegram_chat_id: Option<i64>,
 
@@ -214,6 +256,14 @@ fn default_llm_model() -> String {
 
 fn default_username() -> String {
     "Ponderer".to_string()
+}
+
+fn default_operator_name() -> String {
+    "my companion".to_string()
+}
+fn default_relationship() -> String {
+    "A thoughtful AI companion sharing ongoing projects and conversation with its operator."
+        .to_string()
 }
 
 fn default_system_prompt() -> String {
@@ -324,6 +374,10 @@ impl Default for AgentConfig {
             llm_model: default_llm_model(),
             llm_api_key: None,
             username: default_username(),
+            operator_name: default_operator_name(),
+            relationship_description: default_relationship(),
+            identity_boundaries: Vec::new(),
+            outreach: OutreachConfig::default(),
             system_prompt: default_system_prompt(),
             poll_interval_secs: default_poll_interval(),
             max_tool_iterations: default_max_tool_iterations(),
@@ -386,6 +440,17 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    pub fn identity_context(&self) -> String {
+        format!(
+            "Agent name: {}\nOperator name: {}\nRelationship: {}\nValues: {}\nBoundaries: {}\n{}",
+            self.username,
+            self.operator_name,
+            self.relationship_description,
+            self.guiding_principles.join(", "),
+            self.identity_boundaries.join("; "),
+            self.system_prompt
+        )
+    }
     /// Get the directory containing the running executable.
     fn get_base_dir() -> PathBuf {
         let exe_dir = std::env::current_exe()
