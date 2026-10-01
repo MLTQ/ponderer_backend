@@ -74,6 +74,7 @@ def fake_server():
             self.wfile.write(data)
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            time.sleep(min(2, max(0, float(os.environ.get("PONDERER_AFFECT_TEST_DELAY", "0")))))
             data = {"choices": [{"message": {"role": "assistant", "content": strength}, "finish_reason": "stop"}], "usage": {"completion_tokens": 1}}
             if body.get("stream"):
                 data = 'data: ' + json.dumps({"choices": [{"delta": {"content": strength}}]}) + '\n\ndata: [DONE]\n\n'
@@ -178,7 +179,7 @@ class AffectLabTests(unittest.TestCase):
             worker.resolve_model(self.path)
 
     def test_invalid_profiles_are_rejected(self):
-        for strengths in ({"contentment": math.nan}, {"contentment": math.inf}, {"contentment": True}, {"contentment": -0.1}, {"contentment": 1.1}, {"contentment": 0.6, "excitement": 0.6}):
+        for strengths in ({"contentment": math.nan}, {"contentment": math.inf}, {"contentment": True}, {"contentment": -1.1}, {"contentment": 1.1}, {"contentment": 0.6, "excitement": 0.6}, {"contentment": -0.6, "excitement": 0.6}):
             with self.subTest(strengths=strengths), self.assertRaises(ValueError):
                 worker.validate_profile({"strengths": strengths}, 4, {"contentment": {}, "excitement": {}})
         with self.assertRaises(ValueError):

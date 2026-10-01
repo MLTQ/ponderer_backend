@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::config::AgentConfig;
 
 const WORKER: &str = include_str!("../resources/affect_lab/worker.py");
+const DISCOVERY: &str = include_str!("../resources/affect_lab/affect_discovery.py");
 const EXTRACTOR: &str = include_str!("../resources/affect_lab/extractor.cpp");
 pub const LOCAL_MODEL_ALIAS: &str = "ponderer-local-gguf";
 pub const MAX_CONTEXT_SIZE: u32 = 1_048_576;
@@ -187,6 +188,7 @@ impl AffectLabManager {
         tokio::fs::create_dir_all(&resources).await?;
         let worker_path = resources.join("worker.py");
         tokio::fs::write(&worker_path, WORKER).await?;
+        tokio::fs::write(resources.join("affect_discovery.py"), DISCOVERY).await?;
         tokio::fs::write(resources.join("extractor.cpp"), EXTRACTOR).await?;
         let log_file = std::fs::File::create(self.data_dir.join("worker.log"))?;
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
@@ -272,7 +274,7 @@ impl AffectLabManager {
     pub async fn control(&self, action: &str, values: Value) -> Result<Value> {
         if !matches!(
             action,
-            "build" | "compare" | "profile" | "cancel" | "load" | "review"
+            "build" | "compare" | "profile" | "cancel" | "load" | "review" | "discover" | "study"
         ) {
             bail!("Unknown Affect Lab action");
         }

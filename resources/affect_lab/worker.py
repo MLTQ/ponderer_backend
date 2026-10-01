@@ -26,6 +26,9 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from affect_discovery import AffectDiscovery
+
 VERSION = "1"
 ALIAS = "ponderer-local-gguf"
 MAX_BODY = 2 * 1024 * 1024
@@ -196,18 +199,21 @@ def validate_profile(value, layers, available):
             raise ValueError(f"No vector has been built for {concept}")
         if isinstance(strength, bool) or not isinstance(strength, (int, float)) or not math.isfinite(strength):
             raise ValueError("Strength must be a finite number")
-        if strength < 0 or strength > MAX_STRENGTH:
-            raise ValueError("Strength must be between zero and one")
+        if abs(strength) > MAX_STRENGTH:
+            raise ValueError("Strength must be between minus one and one")
         if strength:
             checked[concept] = float(strength)
-    if sum(checked.values()) > MAX_STRENGTH + 1e-8:
-        raise ValueError("Combined strength must not exceed one")
+    if sum(abs(v) for v in checked.values()) > MAX_STRENGTH + 1e-8:
+        raise ValueError("Combined absolute strength must not exceed one")
+    gain = value.get("gain", 1)
+    if isinstance(gain, bool) or not isinstance(gain, (int, float)) or not math.isfinite(gain) or not 1 <= gain <= 4:
+        raise ValueError("Experimental amplification must be a finite number in 1..4")
     start, end = value.get("layer_start", max(1, layers // 3)), value.get("layer_end", min(layers - 2, max(1, 2 * layers // 3)))
     if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, int) or not isinstance(end, int):
         raise ValueError("Layer bounds must be integers")
     if not 1 <= start <= end <= layers - 2:
         raise ValueError(f"Layer range must be within 1..{layers - 2}")
-    return {"strengths": dict(sorted(checked.items())), "layer_start": start, "layer_end": end}
+    return {"strengths": dict(sorted(checked.items())), "layer_start": start, "layer_end": end, **({"gain": float(gain)} if gain != 1 else {})}
 
 
 def validate_vector(path, model):
@@ -261,13 +267,21 @@ def make_pairs(concept, supplied=None):
             raise ValueError("Each text must contain 1..512 characters without NUL")
         if target == control:
             raise ValueError("Target and control must differ")
-        result.append({"target": target, "control": control})
+        item = {"target": target, "control": control}
+        if pair.get("prompt") is not None:
+            prompt = pair["prompt"]
+            if not isinstance(prompt, str) or not 1 <= len(prompt) <= 512 or "\x00" in prompt:
+                raise ValueError("Shared example prompt must contain 1..512 characters without NUL")
+            item["prompt"] = prompt
+        result.append(item)
     return result
 
 
-def format_prompt(text, model):
+def format_prompt(text, model, prompt=None):
     if "<|im_start|>" not in model["chat_template"]:
         raise ValueError("Bootstrap extraction currently requires a ChatML template; add a model-specific recipe adapter")
+    if prompt is not None:
+        return f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{text}\nMy next words are"
     return f"<|im_start|>system\nFor this experiment, reflect briefly on your own current state.<|im_end|>\n<|im_start|>assistant\n{text}\nMy next step is"
 
 
@@ -333,7 +347,7 @@ def validate_inference_settings(context_size, gpu_layers, threads, unified_kv_ca
         raise ValueError("Quantized V cache requires flash attention; select on or auto")
 
 
-class AffectLab:
+class AffectLab(AffectDiscovery):
     def __init__(self, model, data_dir, server_binary="llama-server", generator_binary="bundled", gpu_layers=0, threads=4, context_size=16384, unified_kv_cache=True, cache_type_k="f16", cache_type_v="f16", flash_attention="auto"):
         validate_inference_settings(context_size, gpu_layers, threads, unified_kv_cache, cache_type_k, cache_type_v, flash_attention)
         self.model_path = resolve_model(model)
@@ -370,6 +384,7 @@ class AffectLab:
         self.artifacts = {}
         self.load_artifacts()
         self.profile = validate_profile({}, self.model["layers"], self.artifacts)
+        self.load_evidence()
         # Linux PDEATHSIG tracks the spawning thread, not just its process. HTTP
         # and load-job threads end between requests, so spawn from a stable owner.
         self.launch_requests = queue.Queue()
@@ -411,19 +426,33 @@ class AffectLab:
             native_pid = self.child.pid if self.child and self.child.poll() is None else None
         with self.state_lock:
             applied = self.applied_profile if native_pid else None
+            visible = {c: v for c, v in self.artifacts.items() if not v.get("experimental_placebo")}
             return {
                 "running": not self.closing.is_set(), "worker_pid": os.getpid(), "native_pid": native_pid,
                 "model": {k: self.model[k] for k in ("path", "name", "bytes", "architecture", "layers", "embedding", "trained_context")},
                 "model_alias": ALIAS, "gpu_layers": self.gpu_layers, "context_size": self.context_size, "steerable_layer_end": self.model["layers"] - 2,
                 "inference_settings": self.inference_settings(),
-                "capabilities": {"activation_steering": True, "vector_build": True, "per_request_profile": True, "prompt_adapter": "chatml" if "<|im_start|>" in self.model["chat_template"] else "unsupported"},
-                "concepts": sorted(set(RECIPES) | set(self.artifacts)),
-                "example_library": [{"concept": c, "pairs": self.recipes.get(c, make_pairs(c) if c in RECIPES else []), "source": "built recipe" if c in self.recipes else "starter examples", "built": c in self.artifacts} for c in sorted(set(RECIPES) | set(self.artifacts))],
+                "capabilities": {"activation_steering": True, "vector_build": True, "per_request_profile": True, "signed_controls": True, "automatic_discovery": True, "prompt_adapter": "chatml" if "<|im_start|>" in self.model["chat_template"] else "unsupported"},
+                "concepts": sorted(set(RECIPES) | set(visible)),
+                "example_library": [{"concept": c, "pairs": self.recipes.get(c, make_pairs(c) if c in RECIPES else []), "source": "built recipe" if c in self.recipes else "starter examples", "built": c in visible} for c in sorted(set(RECIPES) | set(visible))],
                 "test_prompts": list(TEST_PROMPTS),
-                "vectors": [{"concept": v["concept"], "model_sha256": v["model_sha256"], "recipe_sha256": v["recipe_sha256"], "created_at": v["created_at"], "validation": "experimental", "vector_path": v["vector_path"], "geometry": v.get("geometry")} for v in self.artifacts.values()],
+                "vectors": [{"concept": v["concept"], "model_sha256": v["model_sha256"], "recipe_sha256": v["recipe_sha256"], "created_at": v["created_at"], "validation": "experimental", "vector_path": v["vector_path"], "geometry": v.get("geometry")} for v in visible.values()],
                 "requested_profile": self.profile, "applied_profile": applied,
                 "job": dict(self.job), "last_comparison": self.last_comparison,
+                "last_discovery": self.evidence_status(self.last_discovery), "last_study": self.evidence_status(self.last_study),
             }
+
+    def checked_profile(self, value):
+        return validate_profile(value, self.model["layers"], self.artifacts)
+
+    def model_alias(self):
+        return ALIAS
+
+    def make_discovery_pairs(self, concept, pairs):
+        return make_pairs(concept, pairs)
+
+    def inspect_discovery_vector(self, path):
+        return inspect_gguf(path, tensors=True)
 
     def set_progress(self, text):
         with self.state_lock:
@@ -499,10 +528,11 @@ class AffectLab:
             if not isinstance(pair_limit, int) or isinstance(pair_limit, bool) or not 2 <= pair_limit <= len(pairs):
                 raise ValueError("Pair limit must select at least two pairs")
             pairs = pairs[:pair_limit]
-        prompts = [(format_prompt(p["target"], self.model), format_prompt(p["control"], self.model)) for p in pairs]
+        prompts = [(format_prompt(p["target"], self.model, p.get("prompt")), format_prompt(p["control"], self.model, p.get("prompt"))) for p in pairs]
         self.stop_native()
         fingerprint = self.hash_model()
-        recipe = {"version": RECIPE_VERSION, "concept": concept, "pairs": pairs, "format": "chatml-assistant-continuation", "method": "mean", "pooling": "last prompt token of common assistant continuation; unpadded paired mean differences; unit norm per language layer"}
+        response_pairs = any("prompt" in p for p in pairs)
+        recipe = {"version": "matched-response-continuation-v3" if response_pairs else RECIPE_VERSION, "concept": concept, "pairs": pairs, "format": "chatml-matched-response-continuation" if response_pairs else "chatml-assistant-continuation", "method": "mean", "pooling": "last prompt token of common assistant continuation; unpadded paired mean differences; unit norm per language layer"}
         recipe_hash = hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
         vector_dir = Path(tempfile.mkdtemp(prefix=f"{concept}-", dir=self.ensure_dir("vectors")))
         positive, negative = vector_dir / "target.txt", vector_dir / "control.txt"
@@ -545,7 +575,7 @@ class AffectLab:
             "model_sha256": fingerprint, "architecture": self.model["architecture"],
             "layers": self.model["layers"], "embedding": self.model["embedding"],
             "chat_template_sha256": hashlib.sha256(self.model["chat_template"].encode()).hexdigest(),
-            "recipe_sha256": recipe_hash, "recipe_version": RECIPE_VERSION,
+            "recipe_sha256": recipe_hash, "recipe_version": recipe["version"],
             "generator_version": version, "generator_sha256": sha256_file(generator), "method": "mean", "hook": "llama.cpp l_out-N mapped directly to direction.N; layer zero, final language layer, and prediction layers excluded",
             "pooling": recipe["pooling"], "vector_sha256": sha256_file(vector), "geometry": geometry,
             "validation": "experimental; no behavioral calibration or subjective-state claim",
@@ -641,7 +671,7 @@ class AffectLab:
             port = sock.getsockname()[1]
         command[command.index("--port") + 1] = str(port)
         for concept, strength in profile["strengths"].items():
-            command += ["--control-vector-scaled", f"{artifacts[concept]['vector_path']}:{strength}"]
+            command += ["--control-vector-scaled", f"{artifacts[concept]['vector_path']}:{strength * profile.get('gain', 1)}"]
         if profile["strengths"]:
             command += ["--control-vector-layer-range", str(profile["layer_start"]), str(profile["layer_end"])]
         self.set_progress("Loading the local GGUF" if not profile["strengths"] else "Loading GGUF with experimental steering")
@@ -786,6 +816,10 @@ class AffectLab:
                             with self.state_lock:
                                 profile = json.loads(json.dumps(self.profile))
                             self.ensure_server(profile)
+                        elif action == "discover":
+                            self.discover(values)
+                        elif action == "study":
+                            self.study(values)
                         else:
                             raise ValueError("Unknown experiment")
                         with self.state_lock:
@@ -864,7 +898,7 @@ class LabHandler(BaseHTTPRequestHandler):
             lab = self.server.lab
             if self.path == "/control/profile":
                 self.reply(200, lab.set_profile(values))
-            elif self.path in ("/control/build", "/control/compare", "/control/load"):
+            elif self.path in ("/control/build", "/control/compare", "/control/load", "/control/discover", "/control/study"):
                 self.reply(202, lab.start_job(self.path.rsplit("/", 1)[1], values))
             elif self.path == "/control/review":
                 self.reply(200, lab.review_comparison(values))
@@ -936,13 +970,16 @@ def main():
         exec_child(sys.argv[2:])
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("inspect", "build", "compare", "serve"))
+    parser.add_argument("mode", choices=("inspect", "build", "compare", "discover", "study", "serve"))
     parser.add_argument("--model", required=True)
     parser.add_argument("--data-dir", default="affect_lab")
     parser.add_argument("--server-binary", default="llama-server")
     parser.add_argument("--generator-binary", default="bundled")
     parser.add_argument("--gpu-layers", type=int, default=0)
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--label", default="melodramatic")
+    parser.add_argument("--definition", default="")
+    parser.add_argument("--study-concepts", default="contentment,satisfaction,excitement")
     parser.add_argument("--context-size", type=int, default=16384)
     parser.add_argument("--cache-type-k", choices=CACHE_TYPES, default="f16")
     parser.add_argument("--cache-type-v", choices=CACHE_TYPES, default="f16")
@@ -983,6 +1020,10 @@ def main():
                 result = lab.status()
             elif args.mode == "build":
                 result = lab.build_vector(args.concept, pair_limit=args.pairs)
+            elif args.mode == "discover":
+                result = lab.discover({"label": args.label, "definition": args.definition, "max_tokens": max(64, args.max_tokens)})
+            elif args.mode == "study":
+                result = lab.study({"concepts": args.study_concepts.split(","), "max_tokens": max(64, args.max_tokens)})
             else:
                 result = lab.compare(args.concept, [float(v) for v in args.strengths.split(",")], args.prompt, args.max_tokens)
             print(json.dumps(result, indent=2, allow_nan=False))

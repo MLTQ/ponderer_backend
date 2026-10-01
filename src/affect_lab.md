@@ -1,7 +1,7 @@
 # affect_lab.rs
 
 Supervises the optional local GGUF provider and its experimental vector compiler.
-The manager embeds the standard-library Python host and public-API C++ extractor,
+The manager embeds the standard-library Python host, discovery module and public-API C++ extractor,
 deploys them into the artifact directory, and starts the worker with a private token.
 
 The worker serializes inference and extraction. It snapshots manual or request-local
@@ -27,13 +27,25 @@ reloads and included in comparison reports.
 saved. `restore_provider` and `stop` return to it and reap the local worker.
 
 Authenticated routes are `GET /v1/affect-lab` and POST actions `start`, `stop`,
-`use-for-agent`, `build`, `compare`, `profile`, `load`, `review`, and `cancel`. Status
+`use-for-agent`, `build`, `compare`, `profile`, `load`, `review`, `discover`, `study`, and `cancel`. Status
 includes editable starter/verified built recipes and held-out test prompts. Compare
 accepts either the legacy single-concept experiment or a bounded full profile and
 one to six prompts, testing neutral/half/full mixes. Reports retain all vector/
 recipe/model identities, generation settings, raw outputs and strict smoke-check
 results. Review writes only the current report by matching its ID, never a submitted
 path, with bounded notes and independent operator affect/quality judgments.
+Profiles support signed coefficients with an absolute budget of one and explicit
+whole-profile amplification in 1..4 (default one). Discovery uses actual matched
+responses to fixed training tasks, scans signs/ranges/amplification, then tests
+untouched confirmation tasks with repeated seeds and matched shuffled-vector
+controls. Rubric scores are schema-constrained, anonymous, neutral same-model
+judgments, not independent validation. Task-clustered bootstrap intervals and
+quality/integrity gates fail closed. Ordinary and mildly elicited probes are
+reported separately. Studies test up to four controls and signed combinations.
+Reports checkpoint partial evidence, fingerprint recipes/vectors/model/pipeline,
+restore matching history, and mark changed artifacts/settings as historical.
+Retest accepts only the latest matching unchanged concept, not a caller-supplied
+report path. Neither discovery nor study mutates the requested agent mix.
 The compatible inference
 API is private loopback HTTP. Both the simple client and agentic streaming client
 reach it through their existing URL/model/key configuration.
