@@ -25,6 +25,10 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 - **Does**: Controls response behavior (`response_type`: "all" or "selective") with optional separate `decision_model`
 - **Interacts with**: `agent::reasoning` for deciding whether to reply
 
+### `AppearanceConfig`
+- **Does**: Stores operator-selected `base_color` (sRGB `[u8; 3]`) and `dark` mode under `[appearance]`. Older files default to Moss `[168, 209, 139]` and dark mode. JSON/TOML round-trip through the ordinary config API/save path.
+- **Interacts with**: Native Settings live preview and `ui/theme.rs`; it does not alter model state or runtime permissions.
+
 ### `CapabilityProfileConfig` / `CapabilityProfileOverride`
 - **Does**: Declares optional per-loop tool policy overrides (`private_chat`, `scheduled`, `background`, `self_directed`, `loose`, `skill_events`, `heartbeat`, `ambient`, `dream`) for allowlist/denylist replacement
 - **Interacts with**: `agent::capability_profiles` policy resolver used by loop-level `ToolContext` construction

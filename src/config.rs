@@ -89,8 +89,27 @@ pub struct CapabilityProfileConfig {
     pub dream: CapabilityProfileOverride,
 }
 
+/// Desktop appearance is operator configuration, never model-authored state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppearanceConfig {
+    pub base_color: [u8; 3],
+    pub dark: bool,
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            base_color: [168, 209, 139],
+            dark: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
+    #[serde(default)]
+    pub appearance: AppearanceConfig,
     // LLM configuration (OpenAI-compatible: Ollama, LM Studio, vLLM, OpenAI, etc.)
     #[serde(default = "default_llm_url")]
     pub llm_api_url: String,
@@ -370,6 +389,7 @@ fn default_max_important_posts() -> u32 {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            appearance: AppearanceConfig::default(),
             llm_api_url: default_llm_url(),
             llm_model: default_llm_model(),
             llm_api_key: None,
@@ -871,5 +891,24 @@ mod tests {
         assert!(config.enable_concerns);
         assert!(config.enable_dream_cycle);
         assert!(!config.loose_mode);
+    }
+
+    #[test]
+    fn appearance_is_backward_compatible_and_round_trips() {
+        let mut config: AgentConfig = toml::from_str("").unwrap();
+        assert_eq!(config.appearance, AppearanceConfig::default());
+        let partial: AgentConfig = toml::from_str("[appearance]\ndark = false").unwrap();
+        assert_eq!(
+            partial.appearance.base_color,
+            AppearanceConfig::default().base_color
+        );
+        assert!(!partial.appearance.dark);
+        config.appearance.base_color = [140, 110, 220];
+        config.appearance.dark = false;
+        let restored: AgentConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.appearance, config.appearance);
+        let json: AgentConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(json.appearance, config.appearance);
     }
 }
