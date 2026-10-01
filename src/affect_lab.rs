@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -27,7 +27,9 @@ pub const CACHE_TYPES: &[&str] = &[
 #[serde(default)]
 pub struct AffectLabStart {
     pub model_path: String,
+    /// -1 is explicit full offload (native `all`), 0 is CPU, positive is partial.
     pub gpu_layers: i32,
+    pub gpu_device: Option<String>,
     pub threads: u32,
     pub context_size: u32,
     pub unified_kv_cache: bool,
@@ -41,7 +43,8 @@ impl Default for AffectLabStart {
     fn default() -> Self {
         Self {
             model_path: String::new(),
-            gpu_layers: 0,
+            gpu_layers: -1,
+            gpu_device: None,
             threads: 4,
             context_size: 16384,
             unified_kv_cache: true,
@@ -68,8 +71,18 @@ impl AffectLabStart {
         if self.model_path.trim().is_empty() || self.model_path.contains('\0') {
             bail!("Choose an existing GGUF model or model directory");
         }
-        if !(0..=999).contains(&self.gpu_layers) || !(1..=128).contains(&self.threads) {
-            bail!("GPU layers must be 0..999 and CPU threads 1..128");
+        if !(-1..=999).contains(&self.gpu_layers) || !(1..=128).contains(&self.threads) {
+            bail!("GPU layers must be -1 (all), 0 (CPU), or 1..999; CPU threads 1..128");
+        }
+        if self
+            .gpu_device
+            .as_deref()
+            .is_some_and(|id| !valid_device_id(id))
+        {
+            bail!("Choose one device ID reported by the selected llama-server");
+        }
+        if self.gpu_layers != 0 && self.gpu_device.is_none() {
+            bail!("Scan GPUs and choose a device before loading; automatic multi-GPU placement is disabled");
         }
         if !(1024..=MAX_CONTEXT_SIZE).contains(&self.context_size) {
             bail!("Context size must be 1024..{MAX_CONTEXT_SIZE}");
@@ -225,6 +238,9 @@ impl AffectLabManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log_file))
             .kill_on_drop(true);
+        if let Some(device) = settings.gpu_device {
+            command.arg("--gpu-device").arg(device);
+        }
         set_parent_death_signal(&mut command);
         let mut child = command
             .spawn()
@@ -272,6 +288,17 @@ impl AffectLabManager {
     }
 
     pub async fn control(&self, action: &str, values: Value) -> Result<Value> {
+        if action == "devices" {
+            if std::env::var("PONDERER_BACKEND_PARENT_PIPE").as_deref() != Ok("1")
+                || !cfg!(target_os = "linux")
+            {
+                bail!("Scan GPUs from the desktop UI; device probes require its process-lifetime safeguard");
+            }
+            let executable = values["server_binary"]
+                .as_str()
+                .context("Choose a llama-server executable")?;
+            return probe_devices(executable).await;
+        }
         if !matches!(
             action,
             "build" | "compare" | "profile" | "cancel" | "load" | "review" | "discover" | "study"
@@ -392,6 +419,126 @@ impl AffectLabManager {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GpuDevice {
+    pub id: String,
+    pub name: String,
+    pub memory_total_mib: Option<u64>,
+    pub memory_free_mib: Option<u64>,
+}
+
+fn valid_device_id(id: &str) -> bool {
+    id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && id.len() <= 64
+        && id != "none"
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+}
+
+fn parse_devices(output: &str) -> Vec<GpuDevice> {
+    let mut devices = Vec::new();
+    for line in output.lines() {
+        let Some((id, description)) = line.trim().split_once(':') else {
+            continue;
+        };
+        let id = id.trim();
+        if !valid_device_id(id)
+            || id == "Available devices"
+            || devices.iter().any(|d: &GpuDevice| d.id == id)
+        {
+            continue;
+        }
+        let description = description.trim();
+        if description.is_empty() {
+            continue;
+        }
+        let (name, total, free) = if let Some((name, memory)) = description
+            .rsplit_once(" (")
+            .filter(|(_, memory)| memory.ends_with(')') && memory.contains("MiB"))
+        {
+            let number = |text: &str| {
+                text.split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<u64>().ok())
+            };
+            let mut values = memory.trim_end_matches(')').split(',');
+            (
+                name,
+                values.next().and_then(number),
+                values.next().and_then(number),
+            )
+        } else {
+            (description, None, None)
+        };
+        devices.push(GpuDevice {
+            id: id.into(),
+            name: name.into(),
+            memory_total_mib: total,
+            memory_free_mib: free,
+        });
+    }
+    devices
+}
+
+async fn read_probe_output(mut reader: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
+    const LIMIT: u64 = 64 * 1024;
+    let mut bytes = Vec::new();
+    (&mut reader)
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > LIMIT {
+        bail!("GPU probe output exceeded 64 KiB");
+    }
+    Ok(bytes)
+}
+
+async fn probe_devices(executable: &str) -> Result<Value> {
+    probe_devices_with_timeout(executable, Duration::from_secs(10)).await
+}
+
+async fn probe_devices_with_timeout(executable: &str, timeout: Duration) -> Result<Value> {
+    if executable.trim().is_empty() || executable.contains('\0') {
+        bail!("Choose a llama-server executable");
+    }
+    let mut command = Command::new(executable);
+    command
+        .arg("--list-devices")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    set_parent_death_signal(&mut command);
+    let mut child = command
+        .spawn()
+        .context("Cannot scan GPUs with this llama-server")?;
+    let stdout = child.stdout.take().context("Missing device probe stdout")?;
+    let stderr = child.stderr.take().context("Missing device probe stderr")?;
+    let (stdout, stderr, status) = tokio::time::timeout(timeout, async {
+        tokio::try_join!(
+            read_probe_output(stdout),
+            read_probe_output(stderr),
+            async { Ok::<_, anyhow::Error>(child.wait().await?) }
+        )
+    })
+    .await
+    .with_context(|| format!("GPU scan timed out after {} seconds", timeout.as_secs_f32()))??;
+    if !status.success() {
+        bail!(
+            "llama-server GPU scan failed ({status}): {}",
+            String::from_utf8_lossy(&stderr)
+                .chars()
+                .take(1000)
+                .collect::<String>()
+        );
+    }
+    let mut text = String::from_utf8_lossy(&stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&stderr));
+    Ok(json!({"server_binary":executable,"devices":parse_devices(&text)}))
+}
+
 fn set_parent_death_signal(command: &mut Command) {
     #[cfg(target_os = "linux")]
     {
@@ -421,13 +568,23 @@ mod tests {
     fn experiment_settings_reject_invalid_resources() {
         let mut settings = AffectLabStart {
             model_path: "/tmp/model.gguf".into(),
+            gpu_device: Some("CUDA0".into()),
             ..Default::default()
         };
         assert!(settings.validate().is_ok());
         settings.threads = 0;
         assert!(settings.validate().is_err());
         settings.threads = 4;
+        settings.gpu_layers = -2;
+        assert!(settings.validate().is_err());
         settings.gpu_layers = -1;
+        settings.gpu_device = None;
+        assert!(settings.validate().is_err());
+        settings.gpu_layers = 0;
+        assert!(settings.validate().is_ok());
+        settings.gpu_device = Some("CUDA0,CUDA1".into());
+        assert!(settings.validate().is_err());
+        settings.gpu_device = Some("--list-devices".into());
         assert!(settings.validate().is_err());
     }
 
@@ -436,6 +593,7 @@ mod tests {
         let mut settings = AffectLabStart {
             model_path: "/tmp/model.gguf".into(),
             gpu_layers: 17,
+            gpu_device: Some("CUDA1".into()),
             server_binary: "/custom/llama-server".into(),
             ..Default::default()
         };
@@ -447,6 +605,7 @@ mod tests {
         assert_eq!(settings.flash_attention, "on");
         assert!(settings.unified_kv_cache);
         assert_eq!(settings.gpu_layers, 17);
+        assert_eq!(settings.gpu_device.as_deref(), Some("CUDA1"));
         assert_eq!(settings.server_binary, "/custom/llama-server");
         settings.flash_attention = "off".into();
         assert!(settings.validate().is_err());
@@ -466,6 +625,70 @@ mod tests {
         assert_eq!(settings.cache_type_v, "f16");
         assert_eq!(settings.flash_attention, "auto");
         assert!(settings.unified_kv_cache);
+        assert_eq!(settings.gpu_layers, -1);
+        assert_eq!(settings.gpu_device, None);
+    }
+
+    #[test]
+    fn engine_inventory_preserves_native_ids_not_nvidia_order() {
+        let devices=parse_devices("Available devices:\n  CUDA0: NVIDIA GeForce RTX 4090 (24107 MiB, 15344 MiB free)\n  CUDA1: NVIDIA GeForce RTX 2070 SUPER (7794 MiB, 2212 MiB free)\nCUDA0: duplicate\n0.00.123 I log: ignored\n");
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].id, "CUDA0");
+        assert_eq!(devices[0].name, "NVIDIA GeForce RTX 4090");
+        assert_eq!(devices[0].memory_total_mib, Some(24107));
+        assert_eq!(devices[1].memory_free_mib, Some(2212));
+        assert!(parse_devices("Available devices:\n(none)").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn device_probe_runs_only_list_devices_and_bounds_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("probe");
+        std::fs::write(&executable,"#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --list-devices ] || exit 7\nprintf 'Available devices:\\nCUDA0: Fixture GPU (24000 MiB, 20000 MiB free)\\n'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = probe_devices(executable.to_str().unwrap()).await.unwrap();
+        assert_eq!(result["server_binary"], executable.to_str().unwrap());
+        assert_eq!(result["devices"][0]["id"], "CUDA0");
+        assert_eq!(result["devices"][0]["memory_free_mib"], 20000);
+        assert!(
+            read_probe_output(std::io::Cursor::new(vec![b'x'; 64 * 1024 + 1]))
+                .await
+                .is_err()
+        );
+        assert!(probe_devices("").await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_out_gpu_probe_is_terminated() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("slow-probe");
+        let pid_file = temp.path().join("probe.pid");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error =
+            probe_devices_with_timeout(executable.to_str().unwrap(), Duration::from_millis(200))
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        for _ in 0..100 {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("Timed-out probe {pid} survived");
     }
 
     #[test]

@@ -333,10 +333,14 @@ def exec_child(arguments):
     raise SystemExit(code)
 
 
-def validate_inference_settings(context_size, gpu_layers, threads, unified_kv_cache, cache_type_k, cache_type_v, flash_attention):
-    for value, low, high, name in ((context_size, 1024, MAX_CONTEXT_SIZE, "Context"), (threads, 1, 128, "Threads"), (gpu_layers, 0, 999, "GPU layers")):
+def validate_inference_settings(context_size, gpu_layers, threads, unified_kv_cache, cache_type_k, cache_type_v, flash_attention, gpu_device=None):
+    for value, low, high, name in ((context_size, 1024, MAX_CONTEXT_SIZE, "Context"), (threads, 1, 128, "Threads"), (gpu_layers, -1, 999, "GPU layers")):
         if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
             raise ValueError(f"{name} must be {low}..{high}")
+    if gpu_device is not None and (not isinstance(gpu_device, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", gpu_device) or gpu_device == "none"):
+        raise ValueError("Choose one device ID reported by llama-server")
+    if gpu_layers != 0 and gpu_device is None:
+        raise ValueError("Choose a GPU device; automatic multi-GPU placement is disabled")
     if not isinstance(unified_kv_cache, bool):
         raise ValueError("Unified KV cache must be a boolean")
     if cache_type_k not in CACHE_TYPES or cache_type_v not in CACHE_TYPES:
@@ -348,8 +352,8 @@ def validate_inference_settings(context_size, gpu_layers, threads, unified_kv_ca
 
 
 class AffectLab(AffectDiscovery):
-    def __init__(self, model, data_dir, server_binary="llama-server", generator_binary="bundled", gpu_layers=0, threads=4, context_size=16384, unified_kv_cache=True, cache_type_k="f16", cache_type_v="f16", flash_attention="auto"):
-        validate_inference_settings(context_size, gpu_layers, threads, unified_kv_cache, cache_type_k, cache_type_v, flash_attention)
+    def __init__(self, model, data_dir, server_binary="llama-server", generator_binary="bundled", gpu_layers=0, threads=4, context_size=16384, unified_kv_cache=True, cache_type_k="f16", cache_type_v="f16", flash_attention="auto", gpu_device=None):
+        validate_inference_settings(context_size, gpu_layers, threads, unified_kv_cache, cache_type_k, cache_type_v, flash_attention, gpu_device)
         self.model_path = resolve_model(model)
         self.model = inspect_gguf(self.model_path)
         if self.model["metadata"].get("split.count", 1) > 1:
@@ -360,6 +364,7 @@ class AffectLab(AffectDiscovery):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.server_binary, self.generator_binary = server_binary, generator_binary
         self.gpu_layers, self.threads = gpu_layers, threads
+        self.gpu_device = gpu_device
         self.context_size = context_size
         self.unified_kv_cache = unified_kv_cache
         self.cache_type_k, self.cache_type_v = cache_type_k, cache_type_v
@@ -551,7 +556,8 @@ class AffectLab(AffectDiscovery):
         version = version_log.read_text().strip()
         if version_code != 0 or not version.startswith("ponderer-cvector/1"):
             raise ValueError("Extractor must implement Ponderer's final-token/native-layer-index contract")
-        command = [generator, "--model", str(self.model_path), "--positive-file", str(positive), "--negative-file", str(negative), "--output", str(vector), "--method", "mean", "--ctx-size", "1024", "--batch-size", "1024", "--ubatch-size", "1024", "--threads", str(self.threads), "--gpu-layers", str(self.gpu_layers), "--offline"]
+        # Bundled activation extraction uses its separate CPU-only runtime.
+        command = [generator, "--model", str(self.model_path), "--positive-file", str(positive), "--negative-file", str(negative), "--output", str(vector), "--method", "mean", "--ctx-size", "1024", "--batch-size", "1024", "--ubatch-size", "1024", "--threads", str(self.threads), "--gpu-layers", "0", "--offline"]
         self.set_progress(f"Extracting {concept} from {len(pairs)} matched pairs")
         child = self.spawn_native(command, log_path)
         deadline = time.monotonic() + 3600
@@ -624,7 +630,7 @@ class AffectLab(AffectDiscovery):
         return str(executable)
 
     def inference_settings(self):
-        return {"server_binary": self.server_binary, "context_size": self.context_size, "unified_kv_cache": self.unified_kv_cache, "cache_type_k": self.cache_type_k, "cache_type_v": self.cache_type_v, "flash_attention": self.flash_attention, "gpu_layers": self.gpu_layers, "threads": self.threads, "inference_timeout_seconds": INFERENCE_TIMEOUT}
+        return {"server_binary": self.server_binary, "context_size": self.context_size, "unified_kv_cache": self.unified_kv_cache, "cache_type_k": self.cache_type_k, "cache_type_v": self.cache_type_v, "flash_attention": self.flash_attention, "gpu_layers": self.gpu_layers, "gpu_device": self.gpu_device, "gpu_offload": "all" if self.gpu_layers == -1 else "cpu" if self.gpu_layers == 0 else "partial", "threads": self.threads, "inference_timeout_seconds": INFERENCE_TIMEOUT}
 
     def native_request(self, method, path, body=None, timeout=INFERENCE_TIMEOUT):
         connection = http.client.HTTPConnection("127.0.0.1", self.native_port, timeout=timeout)
@@ -662,7 +668,8 @@ class AffectLab(AffectDiscovery):
                     raise ValueError("Vector fingerprint does not match this exact checkpoint/artifact")
                 validate_vector(artifact["vector_path"], self.model)
         log_path = self.data_dir / "inference.log"
-        command = [self.server_binary, "--model", str(self.model_path), "--alias", ALIAS, "--host", "127.0.0.1", "--port", "0", "--api-key", self.native_token, "--ctx-size", str(self.context_size), "--parallel", "1", "--threads", str(self.threads), "--gpu-layers", str(self.gpu_layers), "--no-warmup", "--offline", "--jinja", "--reasoning", "off", "--no-webui"]
+        layers = "all" if self.gpu_layers == -1 else str(self.gpu_layers)
+        command = [self.server_binary, "--model", str(self.model_path), "--alias", ALIAS, "--host", "127.0.0.1", "--port", "0", "--api-key", self.native_token, "--ctx-size", str(self.context_size), "--parallel", "1", "--threads", str(self.threads), "--gpu-layers", layers, "--device", self.gpu_device if self.gpu_layers != 0 else "none", "--split-mode", "none", "--main-gpu", "0", "--fit", "off", "--no-warmup", "--offline", "--jinja", "--reasoning", "off", "--no-webui"]
         command += ["--kv-unified" if self.unified_kv_cache else "--no-kv-unified", "--cache-type-k", self.cache_type_k, "--cache-type-v", self.cache_type_v, "--flash-attn", self.flash_attention, "--timeout", str(INFERENCE_TIMEOUT), "--no-context-shift"]
         # Use an ephemeral port; a competing bind is surfaced as a startup error.
         import socket
@@ -682,7 +689,14 @@ class AffectLab(AffectDiscovery):
             self.check_cancel()
             if child.poll() is not None:
                 self.stop_native()
-                raise RuntimeError(f"llama-server exited during startup. See {log_path}")
+                with log_path.open("rb") as log:
+                    log.seek(0, os.SEEK_END)
+                    log.seek(max(0, log.tell() - 4000))
+                    details = log.read(4000).decode(errors="replace").replace(self.native_token, "[redacted]")
+                device = self.gpu_device if self.gpu_layers else "CPU"
+                if "out of memory" in details.lower() or "cudamalloc failed" in details.lower():
+                    raise RuntimeError(f"GPU memory exhausted on {device} with {layers} GPU layers and {self.context_size} context tokens. Free VRAM or explicitly choose partial offload. No CPU fallback or context reduction was applied. See {log_path}")
+                raise RuntimeError(f"llama-server exited during startup on {device}. See {log_path}. {details[-1200:]}")
             try:
                 self.native_request("GET", "/health", timeout=1)
                 with self.state_lock:
@@ -976,6 +990,7 @@ def main():
     parser.add_argument("--server-binary", default="llama-server")
     parser.add_argument("--generator-binary", default="bundled")
     parser.add_argument("--gpu-layers", type=int, default=0)
+    parser.add_argument("--gpu-device")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--label", default="melodramatic")
     parser.add_argument("--definition", default="")
@@ -994,7 +1009,7 @@ def main():
     parser.add_argument("--prompt")
     parser.add_argument("--max-tokens", type=int, default=32)
     args = parser.parse_args()
-    lab = AffectLab(args.model, args.data_dir, args.server_binary, args.generator_binary, args.gpu_layers, args.threads, args.context_size, args.unified_kv_cache, args.cache_type_k, args.cache_type_v, args.flash_attn)
+    lab = AffectLab(args.model, args.data_dir, args.server_binary, args.generator_binary, args.gpu_layers, args.threads, args.context_size, args.unified_kv_cache, args.cache_type_k, args.cache_type_v, args.flash_attn, args.gpu_device)
     if args.mode == "serve":
         if os.environ.get("PONDERER_BACKEND_PARENT_PIPE") != "1" or not sys.platform.startswith("linux"):
             raise ValueError("Serve mode is internal to the Linux desktop UI's parent-pipe supervisor")

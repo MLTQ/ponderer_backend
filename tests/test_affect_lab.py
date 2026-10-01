@@ -51,11 +51,14 @@ def inactive(pid):
     try:
         state = Path(f"/proc/{pid}/stat").read_text().split(")", 1)[1].split()[0]
         return state == "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return True
 
 
 def fake_server():
+    if "--list-devices" in sys.argv:
+        print("Available devices:\n  CUDA0: Fixture GPU (24000 MiB, 20000 MiB free)\n  CUDA1: Fixture small GPU (8000 MiB, 2000 MiB free)")
+        return
     def option(name):
         return sys.argv[sys.argv.index(name) + 1]
     port = int(option("--port"))
@@ -64,10 +67,11 @@ def fake_server():
     settings = {key: option(key) for key in ("--ctx-size", "--cache-type-k", "--cache-type-v", "--flash-attn", "--timeout")}
     settings["unified_kv_cache"] = "--kv-unified" in sys.argv
     settings["context_shift"] = "--no-context-shift" not in sys.argv
+    placement = {key: option(key) for key in ("--gpu-layers", "--device", "--split-mode", "--main-gpu", "--fit")}
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args): pass
         def do_GET(self):
-            data = json.dumps({"status": "ok", "test_settings": settings}).encode()
+            data = json.dumps({"status": "ok", "test_settings": settings, "test_placement": placement}).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -144,9 +148,51 @@ class AffectLabTests(unittest.TestCase):
     def test_invalid_memory_settings_are_rejected_before_launch(self):
         defaults = dict(context_size=200_000, gpu_layers=0, threads=4, unified_kv_cache=True, cache_type_k="q4_1", cache_type_v="q4_1", flash_attention="on")
         worker.validate_inference_settings(**defaults)
-        for changes in ({"context_size": worker.MAX_CONTEXT_SIZE + 1}, {"context_size": 0}, {"context_size": True}, {"unified_kv_cache": "true"}, {"cache_type_k": "q4_k_m"}, {"flash_attention": "off"}, {"flash_attention": "yes"}):
+        for changes in ({"context_size": worker.MAX_CONTEXT_SIZE + 1}, {"context_size": 0}, {"context_size": True}, {"unified_kv_cache": "true"}, {"cache_type_k": "q4_k_m"}, {"flash_attention": "off"}, {"flash_attention": "yes"}, {"gpu_layers": -2}, {"gpu_layers": -1}, {"gpu_layers": 100}, {"gpu_device": "CUDA0,CUDA1"}, {"gpu_device": "none"}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 worker.validate_inference_settings(**(defaults | changes))
+
+    def test_all_gpu_placement_reaches_native_without_fallback_and_survives_reload(self):
+        self.lab.close()
+        self.lab = worker.AffectLab(self.model, self.path / "lab", server_binary=str(self.make_fake_server()), gpu_layers=-1, gpu_device="CUDA0", context_size=200_000, cache_type_k="q4_1", cache_type_v="q4_1", flash_attention="on")
+        self.add_vector()
+        for strength in (0, 0.25):
+            self.lab.set_profile({"strengths": {"contentment": strength}})
+            self.completion()
+            health = self.lab.native_request("GET", "/health")
+            self.assertEqual(health["test_placement"], {"--gpu-layers": "all", "--device": "CUDA0", "--split-mode": "none", "--main-gpu": "0", "--fit": "off"})
+            self.assertEqual(health["test_settings"]["--ctx-size"], "200000")
+            self.assertEqual(health["test_settings"]["--cache-type-k"], "q4_1")
+        self.assertEqual(self.lab.inference_settings()["gpu_offload"], "all")
+        self.assertEqual(self.lab.inference_settings()["gpu_device"], "CUDA0")
+        previous = self.lab.child.pid
+        self.lab.gpu_device = "CUDA1"
+        self.completion()
+        self.assertNotEqual(previous, self.lab.child.pid)
+        self.assertEqual(self.lab.native_request("GET", "/health")["test_placement"]["--device"], "CUDA1")
+
+    def test_cpu_mode_and_explicit_partial_offload_remain_available(self):
+        self.completion()
+        self.assertEqual(self.lab.native_request("GET", "/health")["test_placement"]["--device"], "none")
+        self.lab.close()
+        self.lab = worker.AffectLab(self.model, self.path / "lab", server_binary=str(self.make_fake_server()), gpu_layers=17, gpu_device="CUDA1")
+        self.completion()
+        placement = self.lab.native_request("GET", "/health")["test_placement"]
+        self.assertEqual(placement["--gpu-layers"], "17")
+        self.assertEqual(placement["--device"], "CUDA1")
+        self.assertEqual(placement["--fit"], "off")
+
+    def test_oom_reports_selected_gpu_and_preserves_requested_settings(self):
+        self.lab.close()
+        failing=self.path / "oom-server"
+        failing.write_text("#!/bin/sh\nprintf 'cudaMalloc failed: out of memory\\n' >&2\nexit 1\n")
+        failing.chmod(0o700)
+        self.lab = worker.AffectLab(self.model, self.path / "lab", server_binary=str(failing), gpu_layers=-1, gpu_device="CUDA0", context_size=200_000)
+        with self.assertRaisesRegex(RuntimeError, "GPU memory exhausted on CUDA0 with all GPU layers and 200000 context tokens"):
+            self.completion()
+        self.assertEqual(self.lab.gpu_layers, -1)
+        self.assertEqual(self.lab.context_size, 200_000)
+        self.assertIsNone(self.lab.child)
 
     def test_long_prompt_body_is_accepted_beyond_the_old_two_mib_limit(self):
         server = worker.LabHTTPServer(("127.0.0.1", 0), worker.LabHandler)

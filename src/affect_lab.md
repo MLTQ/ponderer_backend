@@ -18,6 +18,19 @@ remains effective even if a later completion clears the global cancellation flag
 Startup options include context (1,024..1,048,576 tokens), unified KV, separate K/V
 types and flash attention. A 200k/Q4_1 preset leaves executable/device placement
 unchanged. Quantized V with flash attention off is rejected before launch.
+GPU placement defaults to `gpu_layers=-1` (native `--gpu-layers all`), requires a
+single validated `gpu_device`, and explicitly passes `--device`, `--split-mode
+none`, `--main-gpu 0` and `--fit off`. Zero selects CPU (`--device none`); positive
+counts permit explicit partial offload. No automatic device split or context/CPU
+fallback occurs. Device placement is retained across steering reloads and recorded
+in evidence signatures; startup OOM errors identify the requested device/settings.
+Extraction remains an explicitly CPU-only separate runtime.
+
+`POST /v1/affect-lab/devices` accepts `server_binary`, runs only `--list-devices`,
+and returns that engine's IDs/names and optional total/free MiB. It requires the same
+UI-parent/Linux safeguard, loads no weights, is limited to ten seconds and 64 KiB
+per output stream, and kills the probe on timeout/drop/owner death. The UI does not
+query GPUs periodically. Engine inventory IDs are not `nvidia-smi` indices.
 The private proxy accepts bounded 16 MiB request bodies; inference clients use a
 bounded one-hour deadline for the loopback local alias, leaving other clients at
 their existing deadlines. The same memory settings are retained across profile
@@ -27,7 +40,7 @@ reloads and included in comparison reports.
 saved. `restore_provider` and `stop` return to it and reap the local worker.
 
 Authenticated routes are `GET /v1/affect-lab` and POST actions `start`, `stop`,
-`use-for-agent`, `build`, `compare`, `profile`, `load`, `review`, `discover`, `study`, and `cancel`. Status
+`use-for-agent`, `devices`, `build`, `compare`, `profile`, `load`, `review`, `discover`, `study`, and `cancel`. Status
 includes editable starter/verified built recipes and held-out test prompts. Compare
 accepts either the legacy single-concept experiment or a bounded full profile and
 one to six prompts, testing neutral/half/full mixes. Reports retain all vector/
