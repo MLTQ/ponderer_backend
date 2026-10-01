@@ -17,6 +17,8 @@ use crate::config::AgentConfig;
 const WORKER: &str = include_str!("../resources/affect_lab/worker.py");
 const DISCOVERY: &str = include_str!("../resources/affect_lab/affect_discovery.py");
 const EXTRACTOR: &str = include_str!("../resources/affect_lab/extractor.cpp");
+const QWEN35_TEMPLATE: &str = include_str!("../resources/affect_lab/qwen35-tools.jinja");
+const TEMPLATE_LICENSE: &str = include_str!("../resources/affect_lab/LLAMA_TEMPLATE_LICENSE");
 pub const LOCAL_MODEL_ALIAS: &str = "ponderer-local-gguf";
 pub const MAX_CONTEXT_SIZE: u32 = 1_048_576;
 pub const CACHE_TYPES: &[&str] = &[
@@ -203,6 +205,8 @@ impl AffectLabManager {
         tokio::fs::write(&worker_path, WORKER).await?;
         tokio::fs::write(resources.join("affect_discovery.py"), DISCOVERY).await?;
         tokio::fs::write(resources.join("extractor.cpp"), EXTRACTOR).await?;
+        tokio::fs::write(resources.join("qwen35-tools.jinja"), QWEN35_TEMPLATE).await?;
+        tokio::fs::write(resources.join("LLAMA_TEMPLATE_LICENSE"), TEMPLATE_LICENSE).await?;
         let log_file = std::fs::File::create(self.data_dir.join("worker.log"))?;
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let mut command = Command::new("python3");

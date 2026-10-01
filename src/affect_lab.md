@@ -26,6 +26,14 @@ fallback occurs. Device placement is retained across steering reloads and record
 in evidence signatures; startup OOM errors identify the requested device/settings.
 Extraction remains an explicitly CPU-only separate runtime.
 
+For `qwen35` architecture the worker deploys a bundled, MIT-licensed upstream
+Qwen3.5 tool-capable Jinja template. This replaces tool-blind GGUF conversion
+templates without modifying weights; other families retain embedded templates.
+The template SHA-256 is recorded in inference fingerprints. All active control
+vectors are passed in one comma-separated `--control-vector-scaled` argument:
+recent engines silently retain only the last value when this flag is repeated.
+Old-format evidence becomes historical and must be retested before adoption.
+
 `POST /v1/affect-lab/devices` accepts `server_binary`, runs only `--list-devices`,
 and returns that engine's IDs/names and optional total/free MiB. It requires the same
 UI-parent/Linux safeguard, loads no weights, is limited to ten seconds and 64 KiB

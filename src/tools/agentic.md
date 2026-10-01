@@ -1,5 +1,12 @@
 # agentic.rs
 
+Every streamed/non-streamed terminal message now passes visible-answer validation
+after removing thought tags. Empty/thought-only outputs, a standalone `Thinking:`,
+and unparsed native tool-call markup cannot complete a turn as normal answers.
+They produce actionable errors; valid structured tool calls remain accepted even
+with placeholder content. Invalid nonempty replies are not regenerated via an
+expensive non-streaming fallback, and raw markup never executes a tool.
+
 ## Purpose
 Implements the multi-step tool-calling loop that drives autonomous and chat-mode execution. It repeatedly calls the LLM, executes requested tools, feeds tool output back, and stops when the model returns final text or iteration limits are reached. It now supports provider token streaming for OpenAI-compatible backends.
 Managed loopback GGUF requests use a bounded one-hour deadline to permit long

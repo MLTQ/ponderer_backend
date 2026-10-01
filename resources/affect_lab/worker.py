@@ -369,6 +369,11 @@ class AffectLab(AffectDiscovery):
         self.unified_kv_cache = unified_kv_cache
         self.cache_type_k, self.cache_type_v = cache_type_k, cache_type_v
         self.flash_attention = flash_attention
+        # Some Qwen GGUF conversions ship a plain chat template which silently
+        # drops tools and tool-result roles. Use the family-native tool template.
+        self.chat_template_path = Path(__file__).with_name("qwen35-tools.jinja") if self.model["architecture"] == "qwen35" else None
+        if self.chat_template_path and not self.chat_template_path.is_file():
+            raise ValueError("The bundled Qwen tool template is missing; rebuild Ponderer")
         self.state_lock = threading.RLock()
         self.inference_lock = threading.Lock()
         self.child_lock = threading.Lock()
@@ -630,7 +635,7 @@ class AffectLab(AffectDiscovery):
         return str(executable)
 
     def inference_settings(self):
-        return {"server_binary": self.server_binary, "context_size": self.context_size, "unified_kv_cache": self.unified_kv_cache, "cache_type_k": self.cache_type_k, "cache_type_v": self.cache_type_v, "flash_attention": self.flash_attention, "gpu_layers": self.gpu_layers, "gpu_device": self.gpu_device, "gpu_offload": "all" if self.gpu_layers == -1 else "cpu" if self.gpu_layers == 0 else "partial", "threads": self.threads, "inference_timeout_seconds": INFERENCE_TIMEOUT}
+        return {"server_binary": self.server_binary, "context_size": self.context_size, "unified_kv_cache": self.unified_kv_cache, "cache_type_k": self.cache_type_k, "cache_type_v": self.cache_type_v, "flash_attention": self.flash_attention, "gpu_layers": self.gpu_layers, "gpu_device": self.gpu_device, "gpu_offload": "all" if self.gpu_layers == -1 else "cpu" if self.gpu_layers == 0 else "partial", "threads": self.threads, "inference_timeout_seconds": INFERENCE_TIMEOUT, "chat_template": "qwen35-tools" if self.chat_template_path else "embedded", "chat_template_sha256": sha256_file(self.chat_template_path) if self.chat_template_path else None}
 
     def native_request(self, method, path, body=None, timeout=INFERENCE_TIMEOUT):
         connection = http.client.HTTPConnection("127.0.0.1", self.native_port, timeout=timeout)
@@ -671,15 +676,21 @@ class AffectLab(AffectDiscovery):
         layers = "all" if self.gpu_layers == -1 else str(self.gpu_layers)
         command = [self.server_binary, "--model", str(self.model_path), "--alias", ALIAS, "--host", "127.0.0.1", "--port", "0", "--api-key", self.native_token, "--ctx-size", str(self.context_size), "--parallel", "1", "--threads", str(self.threads), "--gpu-layers", layers, "--device", self.gpu_device if self.gpu_layers != 0 else "none", "--split-mode", "none", "--main-gpu", "0", "--fit", "off", "--no-warmup", "--offline", "--jinja", "--reasoning", "off", "--no-webui"]
         command += ["--kv-unified" if self.unified_kv_cache else "--no-kv-unified", "--cache-type-k", self.cache_type_k, "--cache-type-v", self.cache_type_v, "--flash-attn", self.flash_attention, "--timeout", str(INFERENCE_TIMEOUT), "--no-context-shift"]
+        if self.chat_template_path:
+            command += ["--chat-template-file", str(self.chat_template_path)]
         # Use an ephemeral port; a competing bind is surfaced as a startup error.
         import socket
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         command[command.index("--port") + 1] = str(port)
-        for concept, strength in profile["strengths"].items():
-            command += ["--control-vector-scaled", f"{artifacts[concept]['vector_path']}:{strength * profile.get('gain', 1)}"]
         if profile["strengths"]:
+            # Current llama.cpp accepts one comma-separated list; repeated flags
+            # silently keep only the last control, invalidating requested mixes.
+            vectors = [f"{artifacts[concept]['vector_path']}:{strength * profile.get('gain', 1)}" for concept, strength in profile["strengths"].items()]
+            if any("," in artifacts[concept]["vector_path"] for concept in profile["strengths"]):
+                raise ValueError("Control-vector paths must not contain commas")
+            command += ["--control-vector-scaled", ",".join(vectors)]
             command += ["--control-vector-layer-range", str(profile["layer_start"]), str(profile["layer_end"])]
         self.set_progress("Loading the local GGUF" if not profile["strengths"] else "Loading GGUF with experimental steering")
         child = self.spawn_native(command, log_path)

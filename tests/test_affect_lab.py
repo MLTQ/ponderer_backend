@@ -27,12 +27,12 @@ def gguf_string(text):
     return struct.pack("<Q", len(data)) + data
 
 
-def make_gguf(path, vector=False, values=(1.0, 0.0, 0.0)):
-    metadata = {"general.architecture": "controlvector" if vector else "qwen35"}
+def make_gguf(path, vector=False, values=(1.0, 0.0, 0.0), architecture="qwen35"):
+    metadata = {"general.architecture": "controlvector" if vector else architecture}
     if vector:
         metadata["controlvector.model_hint"] = "qwen35"
     else:
-        metadata.update({"qwen35.block_count": 5, "qwen35.nextn_predict_layers": 1, "qwen35.embedding_length": 3, "tokenizer.chat_template": "<|im_start|>user", "general.name": "Test model"})
+        metadata.update({f"{architecture}.block_count": 5, f"{architecture}.nextn_predict_layers": 1, f"{architecture}.embedding_length": 3, "tokenizer.chat_template": "<|im_start|>user", "general.name": "Test model"})
     data = b"GGUF" + struct.pack("<IQQ", 3, 2 if vector else 0, len(metadata))
     for key, value in metadata.items():
         kind = 8 if isinstance(value, str) else 4
@@ -68,10 +68,12 @@ def fake_server():
     settings["unified_kv_cache"] = "--kv-unified" in sys.argv
     settings["context_shift"] = "--no-context-shift" not in sys.argv
     placement = {key: option(key) for key in ("--gpu-layers", "--device", "--split-mode", "--main-gpu", "--fit")}
+    template = option("--chat-template-file") if "--chat-template-file" in sys.argv else None
+    controls = option("--control-vector-scaled").split(",") if "--control-vector-scaled" in sys.argv else []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args): pass
         def do_GET(self):
-            data = json.dumps({"status": "ok", "test_settings": settings, "test_placement": placement}).encode()
+            data = json.dumps({"status": "ok", "test_settings": settings, "test_placement": placement, "test_chat_template": template, "test_control_vectors": controls, "test_control_flag_count": sys.argv.count("--control-vector-scaled")}).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -110,12 +112,12 @@ class AffectLabTests(unittest.TestCase):
         path.chmod(0o700)
         return path
 
-    def add_vector(self):
-        directory = self.path / "lab/vectors/contentment-test"
+    def add_vector(self, concept="contentment"):
+        directory = self.path / f"lab/vectors/{concept}-test"
         directory.mkdir(parents=True)
         vector = directory / "vector.gguf"
         make_gguf(vector, vector=True)
-        manifest = {"concept": "contentment", "created_at": time.time(), "model_path": str(self.model), "model_identity": worker.quick_identity(self.model), "model_sha256": worker.sha256_file(self.model), "recipe_sha256": "recipe", "vector_sha256": worker.sha256_file(vector)}
+        manifest = {"concept": concept, "created_at": time.time(), "model_path": str(self.model), "model_identity": worker.quick_identity(self.model), "model_sha256": worker.sha256_file(self.model), "recipe_sha256": "recipe", "vector_sha256": worker.sha256_file(vector)}
         (directory / "manifest.json").write_text(json.dumps(manifest))
         self.lab.load_artifacts()
         return vector
@@ -126,6 +128,32 @@ class AffectLabTests(unittest.TestCase):
     def test_metadata_excludes_prediction_layer(self):
         self.assertEqual(self.lab.model["layers"], 4)
         self.assertEqual(self.lab.model["prediction_layers"], 1)
+
+    def test_qwen_tool_template_is_forwarded_and_fingerprinted(self):
+        self.completion()
+        health = self.lab.native_request("GET", "/health")
+        self.assertEqual(health["test_chat_template"], str(self.lab.chat_template_path))
+        template = self.lab.chat_template_path.read_text()
+        self.assertIn('message.role == "tool"', template)
+        self.assertIn('message.tool_calls', template)
+        self.assertIn('enable_thinking', template)
+        self.assertEqual(self.lab.inference_settings()["chat_template_sha256"], worker.sha256_file(self.lab.chat_template_path))
+        self.lab.close()
+        model = self.path / "other.gguf"
+        make_gguf(model, architecture="llama")
+        self.lab = worker.AffectLab(model, self.path / "other-lab", server_binary=str(self.make_fake_server()))
+        self.completion()
+        self.assertIsNone(self.lab.native_request("GET", "/health")["test_chat_template"])
+        self.assertEqual(self.lab.inference_settings()["chat_template"], "embedded")
+
+    def test_all_mix_controls_use_one_native_flag(self):
+        vectors = [self.add_vector(concept) for concept in ("contentment", "excitement", "fear")]
+        self.lab.set_profile({"strengths": {"contentment": 0.2, "excitement": -0.3, "fear": 0.1}, "gain": 2})
+        self.completion()
+        health = self.lab.native_request("GET", "/health")
+        self.assertEqual(health["test_control_flag_count"], 1)
+        expected = {f"{path}:{strength}" for path, strength in zip(vectors, (0.4, -0.6, 0.2))}
+        self.assertEqual(set(health["test_control_vectors"]), expected)
 
     def test_long_context_settings_reach_the_native_engine_and_report(self):
         self.lab.close()

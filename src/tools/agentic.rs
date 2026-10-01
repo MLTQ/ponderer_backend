@@ -218,11 +218,20 @@ fn select_verified_response(message: Message) -> Result<Message> {
         .tool_calls
         .as_ref()
         .is_some_and(|calls| !calls.is_empty());
-    let has_visible_text = message
+    let visible = message
         .content
         .as_deref()
-        .map(str::trim)
-        .is_some_and(|text| !text.is_empty());
+        .map(|text| split_visible_and_thinking(text).0)
+        .unwrap_or_default();
+    let has_visible_text = !visible.is_empty();
+    if !has_tool_calls {
+        if visible.eq_ignore_ascii_case("thinking:") {
+            anyhow::bail!("The model returned only a thinking label, not an answer. Reset experimental steering to neutral and retry.");
+        }
+        if visible.starts_with("<tool_call>") || visible.starts_with("<function=") {
+            anyhow::bail!("The provider returned an unparsed tool call instead of structured tool_calls. Check its tool-capable chat template.");
+        }
+    }
     if has_tool_calls || has_visible_text {
         return Ok(message);
     }
@@ -599,7 +608,7 @@ impl AgenticLoop {
                         .map(str::trim)
                         .is_some_and(|text| !text.is_empty());
                     if has_tool_calls || has_visible_text {
-                        return Ok(message);
+                        return select_verified_response(message);
                     }
 
                     tracing::debug!(
@@ -620,7 +629,8 @@ impl AgenticLoop {
             }
         }
 
-        let message = self.call_llm_non_streaming(messages, tool_defs).await?;
+        let message =
+            select_verified_response(self.call_llm_non_streaming(messages, tool_defs).await?)?;
         emit_message_as_stream_update(on_text_stream, &message);
         Ok(message)
     }
@@ -1101,6 +1111,91 @@ mod tests {
         .expect_err("empty verification must fail closed");
 
         assert!(error.to_string().contains("no visible text or tool calls"));
+    }
+
+    #[tokio::test]
+    async fn nonanswers_fail_in_streaming_and_non_streaming_without_repeating_generation() {
+        use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+        use std::sync::atomic::AtomicUsize;
+        async fn completion(
+            State((text, requests)): State<(String, Arc<AtomicUsize>)>,
+            Json(body): Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            requests.fetch_add(1, Ordering::SeqCst);
+            if body["stream"] == true {
+                let payload = serde_json::json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]});
+                return (
+                    [("content-type", "text/event-stream")],
+                    format!("data: {payload}\n\ndata: [DONE]\n\n"),
+                )
+                    .into_response();
+            }
+            Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}]})).into_response()
+        }
+        for text in [
+            "Thinking:",
+            "<think>no answer</think>",
+            "<tool_call>\n<function=unknown>\n</function>\n</tool_call>",
+        ] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let router = Router::new()
+                .route("/chat/completions", post(completion))
+                .with_state((text.to_string(), Arc::clone(&requests)));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let runner = AgenticLoop::new(
+                AgenticConfig {
+                    api_url: format!("http://{address}"),
+                    ..Default::default()
+                },
+                Arc::new(ToolRegistry::new()),
+            );
+            let messages = [Message {
+                role: "user".into(),
+                content: Some("Hello".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }];
+            let callback = |_: &StreamingUpdate| {};
+            assert!(
+                runner
+                    .call_llm(&messages, &[], Some(&callback))
+                    .await
+                    .is_err(),
+                "accepted streaming nonanswer {text}"
+            );
+            assert!(
+                runner.call_llm(&messages, &[], None).await.is_err(),
+                "accepted non-streaming nonanswer {text}"
+            );
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                2,
+                "repeated generation for {text}"
+            );
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn structured_tool_calls_are_not_rejected_for_placeholder_content() {
+        let message = Message {
+            role: "assistant".into(),
+            content: Some("Thinking:".into()),
+            tool_calls: Some(vec![LlmToolCall {
+                id: "fixture".into(),
+                call_type: "function".into(),
+                function: LlmFunctionCall {
+                    name: "fixture".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+        };
+        assert!(select_verified_response(message).is_ok());
     }
 
     #[tokio::test]
