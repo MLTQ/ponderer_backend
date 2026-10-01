@@ -1,5 +1,21 @@
 # mod.rs
 
+Operator/background continuations now respect inner repetition/cancellation/
+budget stops and successful session handoffs regardless of model turn-control
+claims. A saved handoff forces yield instead of starting another pass. Chat
+instructions distinguish ordinary replies from actual session wrap-ups, avoiding
+unnecessary handoff writes during conversation; model instructions supplement
+the host-owned inner guard, not replace it.
+
+Orientation honors disabled ambient cognition and pending operator messages.
+Attempts (including failures/preemption) are paced to at most once per minute;
+managed-local orientation has a 120-second rather than eight-second deadline.
+Operator/config wakes preempt the orientation future, and config reload wakes
+before acquiring the engine write lock. These prevent background retry storms
+from monopolizing the serialized GGUF host. Zero-tool completed replies settle
+their durable request; lexical action-request warnings cannot enqueue retries
+of answered conversation/creative work.
+
 ## Purpose
 Coordinates the core autonomous agent loop with explicit three-loop architecture (Ambient/Engaged/Dream): polling protocol-v1 plugins, reasoning over normalized events, managing visual state, running periodic ambient maintenance, handling private operator chat, and persisting long-lived behavior through the shared database. It binds the supervised plugin host, tools, reasoning, memory, and UI events.
 

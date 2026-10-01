@@ -13,6 +13,21 @@ Managed loopback GGUF requests use a bounded one-hour deadline to permit long
 prefill/generation; other providers retain 120 seconds. Turn cancellation and
 UI-owned process termination remain independent of that deadline.
 
+An independent inner no-progress guard stops three consecutive identical
+call/result patterns (including cycles up to eight calls), even with unlimited
+iterations. Changing results or intervening different work reset the pattern.
+It requests one tool-free final reply and reports `RepetitionLimit`; even a
+provider ignoring `tool_choice=none` cannot execute further tools. A successful
+`write_session_handoff` writes once (duplicates in a batch are skipped), then
+requests one tool-free final reply. Final-reply errors do not retry saved side
+effects. Outer operator/background continuations must yield after either stop
+or a successful handoff. This is a no-progress backstop, not a global time cap.
+
+Empty `done` packets do not mean the operator turn is durably complete. Tool
+rounds no longer emit an extra blank completion that clears the chat preview.
+Unsupported token-logprob probes recognize `not supported` and are remembered
+for the executor lifetime, retaining streaming without repeated rejected probes.
+
 ## Components
 
 ### `AgenticConfig`
@@ -49,7 +64,7 @@ UI-owned process termination remain independent of that deadline.
 - **Interacts with**: `call_llm_streaming` and the non-streaming fallback path.
 
 ### `AgenticResult`
-- **Does**: Returns the visible response, extracted thinking blocks, tool calls made, iteration count, compatibility limit flag, and explicit `AgenticTermination` (`Completed`, `Cancelled`, or `IterationLimit`)
+- **Does**: Returns the visible response, extracted thinking blocks, tool calls made, iteration count, compatibility limit flag, and explicit `AgenticTermination` (`Completed`, `Cancelled`, `IterationLimit`, or `RepetitionLimit`)
 - **Interacts with**: Chat formatting and UI rendering in `../agent/mod.rs` and `../ui/chat.rs`
 - **Rationale**: Synthetic cancellation/limit messages must not be mistaken for normally accepted cognition at durable-work boundaries
 

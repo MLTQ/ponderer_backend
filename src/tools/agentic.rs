@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::generation_telemetry::{
@@ -97,6 +97,8 @@ pub enum AgenticTermination {
     Cancelled,
     /// The configured tool-calling iteration budget was exhausted.
     IterationLimit,
+    /// Repeated identical tool work was stopped, regardless of iteration budget.
+    RepetitionLimit,
 }
 
 /// The outcome of running the agentic loop
@@ -207,6 +209,7 @@ fn logprob_request_unsupported(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     (lower.contains("logprobs") || lower.contains("top_logprobs"))
         && (lower.contains("unsupported")
+            || lower.contains("not supported")
             || lower.contains("unknown")
             || lower.contains("invalid")
             || lower.contains("unexpected")
@@ -267,6 +270,31 @@ pub struct AgenticLoop {
     config: AgenticConfig,
     registry: Arc<ToolRegistry>,
     client: reqwest::Client,
+    logprobs_supported: AtomicBool,
+}
+
+/// Compare both intent and result: repeated reads that return changing data are
+/// progress, while repeated errors/approval requests and identical writes are not.
+/// JSON values canonicalize object key order, independent of provider call IDs.
+fn repeated_tool_work(records: &[ToolCallRecord]) -> bool {
+    let Some(latest) = records.last() else {
+        return false;
+    };
+    let same = |a: &ToolCallRecord, b: &ToolCallRecord| {
+        a.tool_name == b.tool_name
+            && a.arguments == b.arguments
+            && a.output.to_llm_string() == b.output.to_llm_string()
+    };
+    // Catch A/A/A and cycles such as A/B/A/B/A/B, but don't accumulate
+    // unchanged checks across intervening meaningful work.
+    (1..=8).any(|period| {
+        let Some(start) = records.len().checked_sub(period * 3) else {
+            return false;
+        };
+        let tail = &records[start..];
+        same(latest, &tail[period - 1])
+            && (period..tail.len()).all(|i| same(&tail[i], &tail[i % period]))
+    })
 }
 
 impl AgenticLoop {
@@ -276,6 +304,7 @@ impl AgenticLoop {
             config,
             registry,
             client,
+            logprobs_supported: AtomicBool::new(true),
         }
     }
 
@@ -411,6 +440,8 @@ impl AgenticLoop {
 
         let mut tool_calls_made = Vec::new();
         let mut iterations = 0;
+        let mut finalizing_handoff = false;
+        let mut stopping_repetition = false;
 
         loop {
             if self.is_cancelled() {
@@ -420,7 +451,7 @@ impl AgenticLoop {
             iterations += 1;
 
             if let Some(max_iterations) = self.config.max_iterations {
-                if iterations > max_iterations {
+                if iterations > max_iterations && !finalizing_handoff && !stopping_repetition {
                     tracing::warn!("Agentic loop hit iteration limit ({})", max_iterations);
                     return Ok(AgenticResult {
                         response: Some(format!(
@@ -445,16 +476,62 @@ impl AgenticLoop {
                     token_metrics: Vec::new(),
                 });
             }
-            let llm_response = self
-                .call_llm(&messages, &tool_defs, on_text_stream)
-                .await
-                .context("LLM call failed in agentic loop")?;
+            let finalizing = finalizing_handoff || stopping_repetition;
+            let answer = self
+                .call_llm_with_tools_enabled(&messages, &tool_defs, on_text_stream, !finalizing)
+                .await;
+            // Never retry a completed side effect because its final reply failed.
+            let llm_response = match answer {
+                Ok(message) => message,
+                Err(error) if finalizing && !self.is_cancelled() => {
+                    tracing::warn!("Final tool-free reply failed: {error:#}");
+                    Message {
+                        role: "assistant".into(),
+                        content: Some(if stopping_repetition {
+                            "I stopped because the same tool call kept returning the same result. Please send a follow-up to continue."
+                        } else {
+                            "The session handoff was saved, but I couldn't generate the final reply. Please send a follow-up to continue."
+                        }.into()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    }
+                }
+                Err(error) => return Err(error.context("LLM call failed in agentic loop")),
+            };
             // Streaming/non-streaming request helpers use a synthetic assistant
             // message to unwind promptly on cancellation. Re-check the generation
             // here so that message cannot be classified as normal completion.
             if self.is_cancelled() {
                 tracing::info!("Agentic loop cancelled during LLM execution");
                 return Ok(self.cancelled_result(iterations, tool_calls_made));
+            }
+
+            if finalizing {
+                let ignored_tool_choice = llm_response
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty());
+                let (visible, thinking_blocks) = llm_response
+                    .content
+                    .as_deref()
+                    .map(split_visible_and_thinking)
+                    .unwrap_or_default();
+                return Ok(AgenticResult {
+                    response: Some(if ignored_tool_choice || visible.is_empty() {
+                        "I stopped repeated tool work. Please send a follow-up to continue.".into()
+                    } else {
+                        visible
+                    }),
+                    thinking_blocks,
+                    tool_calls_made,
+                    iterations,
+                    termination: if stopping_repetition || ignored_tool_choice {
+                        AgenticTermination::RepetitionLimit
+                    } else {
+                        AgenticTermination::Completed
+                    },
+                    hit_limit: false,
+                });
             }
 
             // Check if LLM returned tool calls
@@ -477,6 +554,24 @@ impl AgenticLoop {
                                 serde_json::json!({})
                             });
 
+                        // A handoff is one write per pass, even if the provider
+                        // returns duplicate calls in the same assistant message.
+                        if stopping_repetition
+                            || (tc.function.name == "write_session_handoff" && finalizing_handoff)
+                        {
+                            messages.push(Message {
+                                role: "tool".into(),
+                                content: Some(if stopping_repetition {
+                                    "Repeated tool work stopped; remaining calls skipped. Reply to the operator now."
+                                } else {
+                                    "Handoff already saved; duplicate write skipped. Reply to the operator now."
+                                }.into()),
+                                tool_calls: None,
+                                tool_call_id: Some(tc.id.clone()),
+                            });
+                            continue;
+                        }
+
                         // Validate input
                         match safety::validate_input(&arguments) {
                             safety::SafetyVerdict::Block(reason) => {
@@ -489,6 +584,7 @@ impl AgenticLoop {
                                     arguments: arguments.clone(),
                                     output: output.clone(),
                                 });
+                                stopping_repetition |= repeated_tool_work(&tool_calls_made);
                                 messages.push(Message {
                                     role: "tool".to_string(),
                                     content: Some(output.to_llm_string()),
@@ -545,6 +641,11 @@ impl AgenticLoop {
                             callback(&record);
                         }
                         tool_calls_made.push(record);
+                        finalizing_handoff |= tc.function.name == "write_session_handoff"
+                            && tool_calls_made
+                                .last()
+                                .is_some_and(|record| record.output.is_success());
+                        stopping_repetition |= repeated_tool_work(&tool_calls_made);
 
                         // Add tool result message
                         messages.push(Message {
@@ -556,11 +657,16 @@ impl AgenticLoop {
                     }
 
                     // Continue loop — LLM will see tool results
-                    if let Some(callback) = on_text_stream {
-                        callback(&StreamingUpdate {
-                            content: String::new(),
-                            done: true,
-                            token_metrics: Vec::new(),
+                    if finalizing_handoff || stopping_repetition {
+                        messages.push(Message {
+                            role: "user".into(),
+                            content: Some(if stopping_repetition {
+                                "The same tool call and result have repeated without progress. Tools are now disabled for this pass. Explain the obstacle briefly, answer what you can, and yield to the operator. Do not claim the task succeeded."
+                            } else {
+                                "The session handoff has been saved. Tools are now disabled for this pass. Give the operator your final reply and yield; do not continue autonomous work or write another handoff."
+                            }.into()),
+                            tool_calls: None,
+                            tool_call_id: None,
                         });
                     }
                     continue;
@@ -588,15 +694,27 @@ impl AgenticLoop {
     }
 
     /// Call the LLM with the current messages and tool definitions.
+    #[cfg(test)]
     async fn call_llm(
         &self,
         messages: &[Message],
         tool_defs: &[ToolDef],
         on_text_stream: Option<&dyn Fn(&StreamingUpdate)>,
     ) -> Result<Message> {
+        self.call_llm_with_tools_enabled(messages, tool_defs, on_text_stream, true)
+            .await
+    }
+
+    async fn call_llm_with_tools_enabled(
+        &self,
+        messages: &[Message],
+        tool_defs: &[ToolDef],
+        on_text_stream: Option<&dyn Fn(&StreamingUpdate)>,
+        tools_enabled: bool,
+    ) -> Result<Message> {
         if on_text_stream.is_some() {
             match self
-                .call_llm_streaming(messages, tool_defs, on_text_stream)
+                .call_llm_streaming(messages, tool_defs, on_text_stream, tools_enabled)
                 .await
             {
                 Ok(message) => {
@@ -615,7 +733,9 @@ impl AgenticLoop {
                         "Streaming returned no visible text or tool calls; \
                          retrying non-streaming to recover the response"
                     );
-                    let ns_message = self.call_llm_non_streaming(messages, tool_defs).await?;
+                    let ns_message = self
+                        .call_llm_non_streaming(messages, tool_defs, tools_enabled)
+                        .await?;
                     let recovered = select_verified_response(ns_message)?;
                     emit_message_as_stream_update(on_text_stream, &recovered);
                     return Ok(recovered);
@@ -629,8 +749,10 @@ impl AgenticLoop {
             }
         }
 
-        let message =
-            select_verified_response(self.call_llm_non_streaming(messages, tool_defs).await?)?;
+        let message = select_verified_response(
+            self.call_llm_non_streaming(messages, tool_defs, tools_enabled)
+                .await?,
+        )?;
         emit_message_as_stream_update(on_text_stream, &message);
         Ok(message)
     }
@@ -639,6 +761,7 @@ impl AgenticLoop {
         &self,
         messages: &[Message],
         tool_defs: &[ToolDef],
+        tools_enabled: bool,
     ) -> Result<Message> {
         if self.is_cancelled() {
             return Ok(self.cancelled_message());
@@ -660,6 +783,9 @@ impl AgenticLoop {
         // Only include tools if we have any
         if !tool_defs.is_empty() {
             body["tools"] = serde_json::to_value(tool_defs)?;
+            if !tools_enabled {
+                body["tool_choice"] = serde_json::json!("none");
+            }
         }
 
         let mut req = self.client.post(&url).json(&body);
@@ -725,6 +851,7 @@ impl AgenticLoop {
         messages: &[Message],
         tool_defs: &[ToolDef],
         on_text_stream: Option<&dyn Fn(&StreamingUpdate)>,
+        tools_enabled: bool,
     ) -> Result<Message> {
         #[derive(Debug, Clone, Default)]
         struct ToolCallAccumulator {
@@ -754,15 +881,24 @@ impl AgenticLoop {
 
         if !tool_defs.is_empty() {
             body["tools"] = serde_json::to_value(tool_defs)?;
+            if !tools_enabled {
+                body["tool_choice"] = serde_json::json!("none");
+            }
         }
 
         let mut body_with_metrics = body.clone();
         body_with_metrics["logprobs"] = serde_json::json!(true);
         body_with_metrics["top_logprobs"] = serde_json::json!(5);
 
-        let mut response = match self.send_streaming_request(&url, &body_with_metrics).await {
+        let requested_body = if self.logprobs_supported.load(Ordering::Relaxed) {
+            &body_with_metrics
+        } else {
+            &body
+        };
+        let mut response = match self.send_streaming_request(&url, requested_body).await {
             Ok(response) => response,
             Err(error) if logprob_request_unsupported(&error.to_string()) => {
+                self.logprobs_supported.store(false, Ordering::Relaxed);
                 tracing::debug!(
                     "Streaming provider rejected logprob request; retrying without token logprobs: {}",
                     error
@@ -1028,6 +1164,215 @@ fn split_visible_and_thinking(input: &str) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FixtureTool {
+        name: &'static str,
+        executions: Arc<AtomicU64>,
+        changing: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::Tool for FixtureTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Inert regression fixture"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object", "properties":{}})
+        }
+        async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<ToolOutput> {
+            let count = self.executions.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(ToolOutput::Text(if self.changing {
+                count.to_string()
+            } else {
+                "unchanged".into()
+            }))
+        }
+    }
+
+    async fn exercise_tool_loop(
+        handoff: bool,
+        changing: bool,
+        ignores_choice: bool,
+    ) -> (AgenticResult, u64, u64) {
+        use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+        #[derive(Clone)]
+        struct Fixture {
+            name: &'static str,
+            changing: bool,
+            ignores_choice: bool,
+            requests: Arc<AtomicU64>,
+            probes: Arc<AtomicU64>,
+        }
+        async fn completion(
+            State(fixture): State<Fixture>,
+            Json(body): Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            if body.get("logprobs").is_some() {
+                fixture.probes.fetch_add(1, Ordering::SeqCst);
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "logprobs is not supported with tools + stream",
+                )
+                    .into_response();
+            }
+            let request = fixture.requests.fetch_add(1, Ordering::SeqCst) + 1;
+            let final_reply = (body["tool_choice"] == "none" && !fixture.ignores_choice)
+                || (fixture.changing && request == 5);
+            let delta = if final_reply {
+                serde_json::json!({"content":"Final reply"})
+            } else {
+                // Duplicate handoff calls in one message must still write once.
+                let call = serde_json::json!({"index":0, "id":format!("call-{request}"), "type":"function", "function":{"name":fixture.name, "arguments":"{\"content\":\"fixture\"}"}});
+                let calls = if fixture.name == "write_session_handoff" {
+                    let mut duplicate = call.clone();
+                    duplicate["index"] = 1.into();
+                    duplicate["id"] = "duplicate".into();
+                    vec![call, duplicate]
+                } else {
+                    vec![call]
+                };
+                serde_json::json!({"content":"Here, still here", "tool_calls":calls})
+            };
+            (
+                [("content-type", "text/event-stream")],
+                format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    serde_json::json!({"choices":[{"delta":delta}]})
+                ),
+            )
+                .into_response()
+        }
+        let requests = Arc::new(AtomicU64::new(0));
+        let executions = Arc::new(AtomicU64::new(0));
+        let probes = Arc::new(AtomicU64::new(0));
+        let name = if handoff {
+            "write_session_handoff"
+        } else {
+            "fixture"
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route("/chat/completions", post(completion))
+            .with_state(Fixture {
+                name,
+                changing,
+                ignores_choice,
+                requests: requests.clone(),
+                probes: probes.clone(),
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(Arc::new(FixtureTool {
+                name,
+                executions: executions.clone(),
+                changing,
+            }))
+            .await;
+        let runner = AgenticLoop::new(
+            AgenticConfig {
+                api_url: format!("http://{address}"),
+                max_iterations: None,
+                ..AgenticConfig::default()
+            },
+            registry,
+        );
+        let context = ToolContext {
+            working_directory: "/tmp".into(),
+            username: "fixture".into(),
+            conversation_id: None,
+            autonomous: false,
+            auto_approve_local: false,
+            allowed_tools: None,
+            disallowed_tools: vec![],
+            outbound_action_rate_limit: None,
+            generation_observer: None,
+        };
+        let updates = std::sync::Mutex::new(Vec::new());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runner.run_with_history_streaming("fixture", vec![], "test", &context, &|update| {
+                updates.lock().unwrap().push(update.clone());
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+        assert!(!runner.logprobs_supported.load(Ordering::Relaxed));
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "Unsupported metric fields should be probed only once per executor"
+        );
+        // No synthetic blank completion between tool rounds.
+        assert!(!updates
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|update| update.done && update.content.is_empty()));
+        (
+            result,
+            executions.load(Ordering::SeqCst),
+            requests.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn repeated_handoff_writes_once_and_gets_one_final_reply() {
+        let (result, executions, requests) = exercise_tool_loop(true, false, false).await;
+        assert_eq!(executions, 1);
+        assert_eq!(requests, 2);
+        assert_eq!(result.response.as_deref(), Some("Final reply"));
+        assert_eq!(result.termination, AgenticTermination::Completed);
+    }
+
+    #[tokio::test]
+    async fn unlimited_loop_stops_unchanged_tool_work() {
+        let (result, executions, requests) = exercise_tool_loop(false, false, false).await;
+        assert_eq!((executions, requests), (3, 4));
+        assert_eq!(result.termination, AgenticTermination::RepetitionLimit);
+    }
+
+    #[tokio::test]
+    async fn provider_ignoring_tool_choice_cannot_restart_repeated_work() {
+        let (result, executions, requests) = exercise_tool_loop(false, false, true).await;
+        assert_eq!((executions, requests), (3, 4));
+        assert_eq!(result.termination, AgenticTermination::RepetitionLimit);
+    }
+
+    #[tokio::test]
+    async fn changing_tool_results_are_allowed_to_make_progress() {
+        let (result, executions, requests) = exercise_tool_loop(false, true, false).await;
+        assert_eq!((executions, requests), (4, 5));
+        assert_eq!(result.termination, AgenticTermination::Completed);
+    }
+
+    #[test]
+    fn repeated_cycles_reset_on_meaningful_work() {
+        let record = |name: &str| ToolCallRecord {
+            tool_name: name.into(),
+            arguments: serde_json::json!({}),
+            output: ToolOutput::Text("same".into()),
+        };
+        let mut cycle = vec![
+            record("a"),
+            record("b"),
+            record("a"),
+            record("b"),
+            record("a"),
+            record("b"),
+        ];
+        assert!(repeated_tool_work(&cycle));
+        cycle.push(record("progress"));
+        assert!(!repeated_tool_work(&cycle));
+    }
 
     #[test]
     fn test_message_serialization() {

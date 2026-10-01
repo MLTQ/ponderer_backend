@@ -250,8 +250,9 @@ impl Tool for WriteSessionHandoffTool {
         "Write a one-shot handoff note for your next session. Use this when wrapping up work to \
          capture: what you were doing, how far you got, the immediate next step, and any open \
          questions or blockers. The note is injected at the very top of your next session's context \
-         and then automatically cleared — so if you want continuity across sessions, you must call \
-         this tool again at the end of each session. One clean note per wrap-up; do not call mid-task."
+         and then automatically cleared. Use only for an explicit session wrap-up/requested handoff \
+         or substantial unfinished work that must pause. An ordinary conversational reply is not \
+         a session wrap-up. Write once, then give your final reply and yield; do not call mid-task."
     }
 
     fn parameters_schema(&self) -> Value {

@@ -18,12 +18,15 @@ import queue
 from pathlib import Path
 import re
 import signal
+import select
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -38,6 +41,20 @@ INFERENCE_TIMEOUT = 3600
 CACHE_TYPES = ("f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1")
 MAX_STRENGTH = 1.0
 RECIPE_VERSION = "matched-assistant-reflection-v2"
+
+
+@contextmanager
+def live_request_lock(lock, check_client=None):
+    """Don't dispatch queued inference for a caller that has already left."""
+    while not lock.acquire(timeout=0.1):
+        if check_client:
+            check_client()
+    try:
+        if check_client:
+            check_client()
+        yield
+    finally:
+        lock.release()
 
 # Same situations in both conditions; differences are in the candidate state.
 # These are small bootstrap datasets, intentionally not labeled validated emotions.
@@ -724,12 +741,12 @@ class AffectLab(AffectDiscovery):
             self.profile = validate_profile(value, self.model["layers"], self.artifacts)
         return self.status()
 
-    def completion(self, body):
+    def completion(self, body, check_client=None):
         if body.get("model", ALIAS) != ALIAS:
             raise ValueError(f"This provider serves only {ALIAS}; use another provider for other models")
         if not isinstance(body.get("messages"), list):
             raise ValueError("messages must be an array")
-        with self.inference_lock:
+        with live_request_lock(self.inference_lock, check_client):
             self.cancel.clear()
             self.check_cancel()
             with self.state_lock:
@@ -881,6 +898,11 @@ class LabHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
+    def check_client(self):
+        readable, _, _ = select.select([self.connection], [], [], 0)
+        if readable and self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b"":
+            raise ConnectionResetError("Inference caller disconnected before dispatch")
+
     def authorized(self):
         expected = "Bearer " + self.server.token
         if not hmac.compare_digest(self.headers.get("Authorization", ""), expected):
@@ -933,7 +955,7 @@ class LabHandler(BaseHTTPRequestHandler):
                 if values.get("stream"):
                     self.stream_completion(values)
                 else:
-                    self.reply(200, lab.completion(values))
+                    self.reply(200, lab.completion(values, self.check_client))
             else:
                 self.reply(404, {"error": "Unknown route"})
         except (ValueError, KeyError, TypeError) as error:
@@ -951,7 +973,7 @@ class LabHandler(BaseHTTPRequestHandler):
             raise ValueError("messages must be an array")
         # Hold the same lock through the entire stream. Settings are snapshotted at
         # request boundaries and native KV/recurrent state is discarded on changes.
-        with lab.inference_lock:
+        with live_request_lock(lab.inference_lock, self.check_client):
             lab.cancel.clear()
             lab.check_cancel()
             with lab.state_lock:

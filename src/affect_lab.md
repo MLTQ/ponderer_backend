@@ -1,5 +1,11 @@
 # affect_lab.rs
 
+The Python proxy now checks caller liveness while waiting for its serialized
+inference lane and immediately before dispatch. Both streaming and non-streaming
+abandoned queued requests leave without loading or calling the native model.
+An already-dispatched non-streaming generation can still finish; orientation
+preemption/cooldowns bound that tail rather than accumulating orphan requests.
+
 Supervises the optional local GGUF provider and its experimental vector compiler.
 The manager embeds the standard-library Python host, discovery module and public-API C++ extractor,
 deploys them into the artifact directory, and starts the worker with a private token.

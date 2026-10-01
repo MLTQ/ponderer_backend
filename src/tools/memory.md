@@ -1,5 +1,9 @@
 # memory.rs
 
+The handoff description now explicitly excludes ordinary conversation and asks
+for one write followed by a final reply/yield. The agentic executor enforces
+single-write finalization per pass even when a provider emits duplicates.
+
 ## Purpose
 Adds memory-management tools the agent can call during the tool loop: searching persisted working memory, writing notes, a cross-session handoff note, private-chat mode control, and a task-scoped scratchpad. Gives private chat turns explicit long-term recall/update abilities with distinct tools for different time horizons.
 

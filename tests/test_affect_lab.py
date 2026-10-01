@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -393,6 +394,35 @@ class AffectLabTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_disconnected_queued_requests_never_load_or_infer(self):
+        # Hold the inference lane occupied while a caller times out. Both
+        # streaming and non-streaming handlers must leave before dispatch.
+        for streaming in (False, True):
+            completed = threading.Event()
+            class TrackingHandler(worker.LabHandler):
+                def do_POST(self):
+                    try:
+                        super().do_POST()
+                    finally:
+                        completed.set()
+            server = worker.LabHTTPServer(("127.0.0.1", 0), TrackingHandler)
+            server.lab, server.token = self.lab, "fixture-token"
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.lab.inference_lock.acquire()
+            try:
+                body = json.dumps({"messages": [], "stream": streaming}).encode()
+                call = socket.create_connection(server.server_address, timeout=2)
+                call.sendall((f"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {server.token}\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body)
+                call.close()
+                self.assertTrue(completed.wait(2), "Disconnected caller stayed queued for inference")
+                self.assertIsNone(self.lab.child, "Abandoned request loaded a native engine")
+            finally:
+                self.lab.inference_lock.release()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux parent-death safeguard")
     def test_native_child_dies_if_owning_worker_is_killed(self):

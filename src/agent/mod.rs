@@ -102,6 +102,8 @@ const OODA_PACKET_CONTEXT_MAX_CHARS: usize = 1400;
 const CHAT_WORKING_MEMORY_MAX_CHARS: usize = 2200;
 const PROMPT_CONTRIBUTION_TIMEOUT_MS: u64 = 350;
 const ORIENTATION_MODEL_TIMEOUT_SECS: u64 = 8;
+const LOCAL_ORIENTATION_MODEL_TIMEOUT_SECS: u64 = 120;
+const ORIENTATION_ATTEMPT_COOLDOWN_SECS: u64 = 60;
 const ORIENTATION_VISION_TIMEOUT_SECS: u64 = 8;
 const DREAM_MODEL_TIMEOUT_SECS: u64 = 90;
 const SCHEDULED_CHAT_MAX_TURNS: usize = 2;
@@ -276,6 +278,7 @@ pub struct Agent {
     dream_engine: Arc<RwLock<DreamEngine>>,
     presence_monitor: Arc<Mutex<PresenceMonitor>>,
     last_orientation_signature: Arc<RwLock<Option<String>>>,
+    last_orientation_attempt: Arc<Mutex<Option<std::time::Instant>>>,
     last_orientation: Arc<RwLock<Option<Orientation>>>,
     stop_generation: Arc<AtomicU64>,
     wake_generation: Arc<AtomicU64>,
@@ -413,6 +416,7 @@ impl Agent {
             dream_engine: Arc::new(RwLock::new(dream_engine)),
             presence_monitor: Arc::new(Mutex::new(PresenceMonitor::new())),
             last_orientation_signature: Arc::new(RwLock::new(None)),
+            last_orientation_attempt: Arc::new(Mutex::new(None)),
             last_orientation: Arc::new(RwLock::new(None)),
             stop_generation: Arc::new(AtomicU64::new(0)),
             wake_generation: Arc::new(AtomicU64::new(0)),
@@ -426,6 +430,8 @@ impl Agent {
     /// Reload config and recreate reasoning engine and image generator
     pub async fn reload_config(&self, new_config: AgentConfig) {
         tracing::info!("Reloading agent configuration...");
+        // Release an orientation reader before waiting to replace its engine.
+        self.request_wake("config_reload_requested");
         let mut new_config = new_config;
         new_config.private_chat_mode = normalize_private_chat_mode(&new_config.private_chat_mode);
 
@@ -2867,6 +2873,23 @@ impl Agent {
 
     async fn maybe_update_orientation(&self, pending_events: &[SkillEvent]) -> Option<Orientation> {
         let config_snapshot = { self.config.read().await.clone() };
+        // Disabled ambient cognition must not sneak in through legacy polling.
+        // Failures and preemption count as attempts, preventing retry storms
+        // while the local host finishes one already-dispatched generation.
+        let pending_chat = self.has_pending_operator_messages().await;
+        if !config_snapshot.enable_ambient_loop || pending_chat {
+            return None;
+        }
+        let mut last_attempt = self.last_orientation_attempt.lock().await;
+        if !orientation_attempt_allowed(
+            &config_snapshot,
+            pending_chat,
+            last_attempt.map(|at| at.elapsed()),
+        ) {
+            return self.last_orientation.read().await.clone();
+        }
+        *last_attempt = Some(std::time::Instant::now());
+        drop(last_attempt);
 
         let presence = {
             let mut monitor = self.presence_monitor.lock().await;
@@ -2969,12 +2992,19 @@ impl Agent {
 
         let orientation = {
             let engine = self.orientation_engine.read().await;
-            match timeout(
-                Duration::from_secs(ORIENTATION_MODEL_TIMEOUT_SECS),
-                engine.orient(context),
-            )
-            .await
-            {
+            let deadline = if config_snapshot.llm_model == crate::affect_lab::LOCAL_MODEL_ALIAS {
+                LOCAL_ORIENTATION_MODEL_TIMEOUT_SECS
+            } else {
+                ORIENTATION_MODEL_TIMEOUT_SECS
+            };
+            let result = tokio::select! {
+                result = timeout(Duration::from_secs(deadline), engine.orient(context)) => result,
+                _ = self.wait_for_wake_or_timeout(Duration::from_secs(deadline)) => {
+                    tracing::debug!("Orientation preempted by operator/config wake");
+                    return self.last_orientation.read().await.clone();
+                }
+            };
+            match result {
                 Ok(Ok(value)) => value,
                 Ok(Err(error)) => {
                     tracing::warn!("Orientation update failed: {}", error);
@@ -2986,10 +3016,7 @@ impl Agent {
                     return None;
                 }
                 Err(_) => {
-                    tracing::warn!(
-                        "Orientation update timed out after {}s",
-                        ORIENTATION_MODEL_TIMEOUT_SECS
-                    );
+                    tracing::warn!("Orientation update timed out after {}s", deadline);
                     return None;
                 }
             }
@@ -4493,7 +4520,7 @@ impl Agent {
         let configured_private_chat_mode = self.private_chat_execution_mode(&config_snapshot).await;
 
         let chat_system_prompt = format!(
-            "{}\n\n{}\n\nYou are in direct operator chat mode. Use tools when they improve correctness or save effort.\nYou may run multiple internal turns before yielding back to the operator.\nFocus on the operator's request; do not publish to external services unless explicitly asked.\nIf you detect persistent topics/projects/reminders, append a concerns block:\n{}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[\"optional-key\"]}}]\n{}\nUse an empty array when there are no concern updates.\nWrite the operator-facing reply as ordinary text, then end every response with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"fallback operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nThe user_message field is fallback-only. Leave it empty whenever ordinary reply text is present; populate it only when there is no ordinary reply text.\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.\nWhen genuinely wrapping up a work session (decision=yield, task complete or naturally pausing), call write_session_handoff once with a concise note: what you worked on, how far you got, the immediate next step, and open questions. The note is one-shot: it will be injected at the top of the next session's context and then cleared automatically. Do NOT call it mid-task or on every turn.",
+            "{}\n\n{}\n\nYou are in operator chat mode. Use tools when they improve correctness or save effort. Ordinary conversation, greetings and creative replies normally need no tools. Respect requests not to use tools.\nYou may run multiple internal turns before yielding back to the operator.\nFocus on the operator's request; do not publish to external services unless explicitly asked.\nIf you detect persistent topics/projects/reminders, append a concerns block:\n{}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[\"optional-key\"]}}]\n{}\nUse an empty array when there are no concern updates.\nWrite the operator-facing reply as ordinary text, then end every response with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"fallback operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nThe user_message field is fallback-only. Leave it empty whenever ordinary reply text is present; populate it only when there is no ordinary reply text.\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.\nA yielded reply is NOT the end of a work session. Do not write handoffs for ordinary conversation or on every turn. Use write_session_handoff only when the operator explicitly ends a work session, requests a handoff, or substantial multi-step work must pause with unfinished state to resume. In that case write once, then give your final reply and yield. The note should capture progress, next step and open questions. It is injected once into the next session's context and then cleared.",
             system_prompt,
             HISTORICAL_CONTEXT_SAFETY_INSTRUCTION,
             CHAT_CONCERNS_BLOCK_START,
@@ -5024,11 +5051,12 @@ impl Agent {
                 self.record_successful_outbound_actions(&result.tool_calls_made)
                     .await;
 
+                let tool_loop_must_yield = must_yield_after_tool_loop(&result);
                 let base_response = result.response.unwrap_or_default();
                 let tool_count = result.tool_calls_made.len();
                 let (response_without_concerns, concern_signals) =
                     parse_concern_signals(&base_response);
-                let turn_control = parse_turn_control(&response_without_concerns, tool_count);
+                let mut turn_control = parse_turn_control(&response_without_concerns, tool_count);
                 let mut should_continue = should_continue_autonomous_turn(
                     &turn_control,
                     tool_count,
@@ -5069,6 +5097,17 @@ impl Agent {
                     should_offload_to_background = false;
                     effective_status = "loop_break".to_string();
                     operator_visible_response = build_loop_heat_shock_message(&heat_update);
+                }
+                // A wrap-up tool is a terminal action, not evidence to start
+                // another outer pass. Inner repetition/cancellation/budget stops
+                // must also remain stops even if the model says "continue".
+                if tool_loop_must_yield {
+                    turn_control.decision = TurnDecision::Yield;
+                    should_continue = false;
+                    should_offload_to_background = false;
+                    if result.termination == AgenticTermination::RepetitionLimit {
+                        effective_status = "loop_break".into();
+                    }
                 }
 
                 // When the turn is ending as blocked (not simply awaiting user approval),
@@ -5495,16 +5534,11 @@ impl Agent {
                                 .to_string(),
                         ))
                         .await;
-                        // Don't clear the goal so the self-directive can try.
-                    } else {
-                        goal_completed = true;
-                    }
-                } else {
-                    // Mark goal complete only when turn ended normally (not blocked/heat-break).
-                    if effective_status == "done" {
-                        goal_completed = true;
                     }
                 }
+                // A lexical guess cannot leave an answered creative/conversation
+                // request queued for autonomous retry. The warning is observational.
+                goal_completed = effective_status == "done";
                 break;
             }
 
@@ -6674,6 +6708,9 @@ fn plugin_event_batch_acceptance(result: &AgenticResult) -> Result<(), &'static 
         AgenticTermination::IterationLimit => {
             return Err("the cognition pass exhausted its iteration budget")
         }
+        AgenticTermination::RepetitionLimit => {
+            return Err("the cognition pass stopped repeated tool work")
+        }
         AgenticTermination::Completed => {}
     }
 
@@ -7006,12 +7043,13 @@ async fn run_background_chat_subtask(
             }
         };
 
+        let tool_loop_must_yield = must_yield_after_tool_loop(&result);
         let base_response = result.response.unwrap_or_default();
         let tool_count = result.tool_calls_made.len();
         total_tool_calls += tool_count;
 
         let (response_without_concerns, concern_signals) = parse_concern_signals(&base_response);
-        let turn_control = parse_turn_control(&response_without_concerns, tool_count);
+        let mut turn_control = parse_turn_control(&response_without_concerns, tool_count);
         let mut should_continue =
             should_continue_autonomous_turn(&turn_control, tool_count, turn, background_turn_limit);
 
@@ -7035,6 +7073,14 @@ async fn run_background_chat_subtask(
             should_continue = false;
             effective_status = "loop_break".to_string();
             operator_visible_response = build_loop_heat_shock_message(&heat_update);
+        }
+
+        if tool_loop_must_yield {
+            turn_control.decision = TurnDecision::Yield;
+            should_continue = false;
+            if result.termination == AgenticTermination::RepetitionLimit {
+                effective_status = "loop_break".into();
+            }
         }
 
         apply_background_concern_updates(
@@ -8196,6 +8242,26 @@ fn agentic_api_url(base_url: &str) -> String {
     }
 }
 
+fn must_yield_after_tool_loop(result: &AgenticResult) -> bool {
+    result.termination != AgenticTermination::Completed
+        || result
+            .tool_calls_made
+            .iter()
+            .any(|record| record.tool_name == "write_session_handoff" && record.output.is_success())
+}
+
+fn orientation_attempt_allowed(
+    config: &AgentConfig,
+    pending_chat: bool,
+    elapsed: Option<Duration>,
+) -> bool {
+    config.enable_ambient_loop
+        && !pending_chat
+        && elapsed.is_none_or(|duration| {
+            duration >= Duration::from_secs(ORIENTATION_ATTEMPT_COOLDOWN_SECS)
+        })
+}
+
 fn configured_agentic_max_iterations(config: &AgentConfig) -> Option<usize> {
     if config.disable_tool_iteration_limit {
         None
@@ -8309,6 +8375,76 @@ fn format_turn_progress(turn: usize, turn_limit: Option<usize>) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn orientation_attempts_honor_disable_pending_chat_and_failure_cooldown() {
+        let mut config = AgentConfig::default();
+        assert!(orientation_attempt_allowed(&config, false, None));
+        assert!(!orientation_attempt_allowed(&config, true, None));
+        assert!(!orientation_attempt_allowed(
+            &config,
+            false,
+            Some(Duration::from_secs(59))
+        ));
+        assert!(orientation_attempt_allowed(
+            &config,
+            false,
+            Some(Duration::from_secs(60))
+        ));
+        config.enable_ambient_loop = false;
+        assert!(!orientation_attempt_allowed(&config, false, None));
+    }
+
+    #[tokio::test]
+    async fn operator_wake_preempts_orientation_and_prevents_immediate_retry() {
+        use axum::{extract::State, routing::post, Json, Router};
+        let started = Arc::new(Notify::new());
+        let requests = Arc::new(AtomicU64::new(0));
+        async fn delayed(
+            State((started, requests)): State<(Arc<Notify>, Arc<AtomicU64>)>,
+        ) -> Json<serde_json::Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            started.notify_one();
+            sleep(Duration::from_secs(5)).await;
+            Json(serde_json::json!({"choices":[{"message":{"content":"{}"}}]}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route("/v1/chat/completions", post(delayed))
+            .with_state((started.clone(), requests.clone()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            database_path: temporary.path().join("fixture.db").display().to_string(),
+            llm_api_url: format!("http://{address}"),
+            llm_model: crate::affect_lab::LOCAL_MODEL_ALIAS.into(),
+            ..Default::default()
+        };
+        let (event_tx, _) = flume::unbounded();
+        let agent = Arc::new(Agent::new(
+            Arc::new(ToolRegistry::new()),
+            Arc::new(RuntimePluginHost::new()),
+            config,
+            event_tx,
+        ));
+        let running = agent.clone();
+        let task = tokio::spawn(async move { running.maybe_update_orientation(&[]).await });
+        timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        agent.notify_operator_message_queued("fixture");
+        assert!(timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert!(agent.maybe_update_orientation(&[]).await.is_none());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     fn plugin_event_result(
         termination: AgenticTermination,
         response: Option<&str>,
@@ -8330,6 +8466,28 @@ mod tests {
             arguments: serde_json::json!({"event_id": "event-1"}),
             output,
         }
+    }
+
+    #[test]
+    fn inner_stops_and_saved_handoffs_cannot_restart_outer_turns() {
+        for termination in [
+            AgenticTermination::Cancelled,
+            AgenticTermination::IterationLimit,
+            AgenticTermination::RepetitionLimit,
+        ] {
+            let result = plugin_event_result(termination, Some("continue"), vec![]);
+            assert!(must_yield_after_tool_loop(&result));
+            assert!(plugin_event_batch_acceptance(&result).is_err());
+        }
+        let mut result =
+            plugin_event_result(AgenticTermination::Completed, Some("continue"), vec![]);
+        assert!(!must_yield_after_tool_loop(&result));
+        let mut handoff = plugin_tool_call(ToolOutput::Error("not saved".into()));
+        handoff.tool_name = "write_session_handoff".into();
+        result.tool_calls_made.push(handoff);
+        assert!(!must_yield_after_tool_loop(&result));
+        result.tool_calls_made[0].output = ToolOutput::Text("saved".into());
+        assert!(must_yield_after_tool_loop(&result));
     }
 
     #[test]
