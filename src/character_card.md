@@ -44,6 +44,7 @@ Parses character cards in multiple formats (TavernAI V2 JSON, TavernAI V2 PNG, W
 
 ## Notes
 - PNG character-card chunk parsing is done manually without an extra PNG metadata dependency.
+- Truncated PNG chunks are bounds-checked before slicing. Tavern V2 `system_prompt` and `post_history_instructions` are retained together as character instructions; the UI stores them separately from operator policy and uses the canonical backend identity compiler. Example dialogue remains illustrative, not real conversation history.
 - W++ parser is basic -- only extracts `character()`, `Personality()`, `Mind()`, and `Description()` blocks. Nested or multi-line W++ may not parse correctly.
 - Boostyle parser is line-based and does not support multi-line field values.
 - Format detection is sequential: first match wins. A file that happens to be valid TavernAI V2 JSON will never be tried as W++.

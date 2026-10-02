@@ -33,3 +33,11 @@ Defines the transport-neutral observability contract for every model generation.
 - Telemetry is observational only and never persists model content.
 - Non-streaming callers emit their metrics after completion; streaming callers emit incrementally.
 - Failed requests can emit lifecycle events without samples, allowing clients to ignore empty paths while retaining truthful diagnostics.
+# Raw output lane
+
+`GenerationEvent::Text` preserves provider-visible content, reasoning fields and
+tool-name/argument fragments independently of lexical metrics. It is emitted
+before cleanup, forwarded as `generation_text`, and retained by the frontend
+across completion. SSE parsers buffer bytes through complete lines to preserve
+Unicode split across network chunks. Non-streaming output is emitted once at
+completion. This is API-visible output, not a reconstruction of hidden tokens.

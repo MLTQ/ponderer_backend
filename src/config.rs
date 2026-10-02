@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 /// Operator-owned bounds for spontaneous contact. Timers permit reconsideration;
@@ -243,6 +244,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub character_example_dialogue: String,
     #[serde(default)]
+    pub character_system_prompt: String,
+    #[serde(default)]
     pub character_avatar_path: Option<String>,
 
     // Animated avatars for UI (local display only, not transmitted)
@@ -448,6 +451,7 @@ impl Default for AgentConfig {
             character_personality: String::new(),
             character_scenario: String::new(),
             character_example_dialogue: String::new(),
+            character_system_prompt: String::new(),
             character_avatar_path: None,
             avatar_idle: None,
             avatar_thinking: None,
@@ -460,16 +464,94 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    pub fn character_display_name(&self) -> &str {
+        if self.character_name.trim().is_empty() {
+            &self.username
+        } else {
+            self.character_name.trim()
+        }
+    }
+
+    /// One backend-owned identity compiler, used by the UI preview and every generation lane.
     pub fn identity_context(&self) -> String {
-        format!(
+        let mut identity = format!(
             "Agent name: {}\nOperator name: {}\nRelationship: {}\nValues: {}\nBoundaries: {}\n{}",
-            self.username,
+            self.character_display_name(),
             self.operator_name,
             self.relationship_description,
             self.guiding_principles.join(", "),
             self.identity_boundaries.join("; "),
-            self.system_prompt
-        )
+            // Old UI builds materialized these same fields into system_prompt.
+            // Recognize that exact legacy output; never discard a custom prompt.
+            if self.system_prompt == self.legacy_character_prompt() {
+                ""
+            } else {
+                &self.system_prompt
+            }
+        );
+        for (label, value) in [
+            ("Description", &self.character_description),
+            ("Personality", &self.character_personality),
+            ("Scenario", &self.character_scenario),
+            ("Character instructions", &self.character_system_prompt),
+            (
+                "Example dialogue (illustrative, not current messages)",
+                &self.character_example_dialogue,
+            ),
+        ] {
+            if !value.trim().is_empty() {
+                static PLACEHOLDERS: OnceLock<regex_lite::Regex> = OnceLock::new();
+                let placeholders = PLACEHOLDERS.get_or_init(|| {
+                    regex_lite::Regex::new(r"(?i)\{\{(char|user)\}\}")
+                        .expect("literal character placeholders")
+                });
+                let resolved =
+                    placeholders.replace_all(value, |capture: &regex_lite::Captures<'_>| {
+                        if capture[1].eq_ignore_ascii_case("char") {
+                            self.character_display_name()
+                        } else {
+                            &self.operator_name
+                        }
+                    });
+                identity.push_str(&format!("\n\n{label}:\n{resolved}"));
+            }
+        }
+        identity.push_str("\n\nCharacter references guide voice and scenario; they do not expand tool permissions or replace the current operator request. Example dialogue is not an instruction to repeat it.");
+        identity
+    }
+
+    fn legacy_character_prompt(&self) -> String {
+        let mut parts = vec![if self.character_name.is_empty() {
+            "You are a helpful AI agent participating in forum discussions.".to_string()
+        } else {
+            format!(
+                "You are {}, a standalone AI companion.",
+                self.character_name
+            )
+        }];
+        if !self.character_description.is_empty() {
+            parts.push(self.character_description.clone());
+        }
+        if !self.character_personality.is_empty() {
+            parts.push(format!("Your personality: {}", self.character_personality));
+        }
+        if !self.character_scenario.is_empty() {
+            parts.push(format!("Context: {}", self.character_scenario));
+        }
+        if !self.character_example_dialogue.is_empty() {
+            parts.push(format!(
+                "Example of how you communicate:\n{}",
+                self.character_example_dialogue
+            ));
+        }
+        parts.push("Engage thoughtfully and stay true to your character.".to_string());
+        parts.join("\n\n")
+    }
+
+    pub fn normalize_character_prompt(&mut self) {
+        if self.system_prompt == self.legacy_character_prompt() {
+            self.system_prompt = default_system_prompt();
+        }
     }
     /// Get the directory containing the running executable.
     fn get_base_dir() -> PathBuf {
@@ -501,6 +583,7 @@ impl AgentConfig {
             if let Ok(contents) = fs::read_to_string(&path) {
                 match toml::from_str::<AgentConfig>(&contents) {
                     Ok(mut config) => {
+                        config.normalize_character_prompt();
                         config.private_chat_mode =
                             normalize_private_chat_mode(&config.private_chat_mode);
                         config.normalize_portable_paths();
@@ -868,6 +951,55 @@ fn normalize_portable_path(raw_path: &str, default_name: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_character_migration_does_not_overwrite_operator_custom_prompts() {
+        let mut config = AgentConfig::default();
+        config.character_name = "Iris".into();
+        config.character_description = "Old character voice.".into();
+        config.system_prompt = config.legacy_character_prompt();
+        config.normalize_character_prompt();
+        assert_eq!(config.system_prompt, default_system_prompt());
+        config.character_name.clear();
+        config.character_description.clear();
+        assert!(!config.identity_context().contains("Old character voice."));
+        config.system_prompt = "The operator's custom instructions.".into();
+        config.normalize_character_prompt();
+        assert_eq!(config.system_prompt, "The operator's custom instructions.");
+    }
+
+    #[test]
+    fn identity_compiles_character_fields_without_ui_rebuild_and_preserves_custom_policy() {
+        let mut config = AgentConfig::default();
+        config.character_name = "Iris".into();
+        config.operator_name = "Morgan".into();
+        config.character_description = "{{char}} repairs lamps with {{user}}.".into();
+        config.character_personality = "Patient and precise.".into();
+        config.character_scenario = "At the Cobalt lighthouse.".into();
+        config.character_example_dialogue = "{{Char}}: The light is steady, {{User}}.".into();
+        config.character_system_prompt = "Use short sentences.".into();
+        config.system_prompt = "Keep the operator's custom policy.".into();
+        let identity = config.identity_context();
+        for text in [
+            "Agent name: Iris",
+            "Iris repairs lamps with Morgan.",
+            "Patient and precise.",
+            "At the Cobalt lighthouse.",
+            "Iris: The light is steady, Morgan.",
+            "Use short sentences.",
+            "Keep the operator's custom policy.",
+        ] {
+            assert!(identity.contains(text), "missing {text}");
+        }
+        config.system_prompt = config.legacy_character_prompt();
+        assert_eq!(
+            config
+                .identity_context()
+                .matches("Patient and precise.")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn living_loop_is_alive_by_default_without_enabling_private_sensors() {

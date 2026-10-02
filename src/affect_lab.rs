@@ -367,6 +367,10 @@ impl AffectLabManager {
         if worker.child.try_wait()?.is_some() {
             bail!("Local provider has exited");
         }
+        let status = self
+            .send(worker, reqwest::Method::GET, "/control/status", None)
+            .await?;
+        validate_loaded_provider(&status)?;
         let mut previous = self.previous_provider.lock().await;
         if previous.is_none() {
             *previous = Some(ProviderSelection::capture(config));
@@ -429,6 +433,21 @@ pub struct GpuDevice {
     pub name: String,
     pub memory_total_mib: Option<u64>,
     pub memory_free_mib: Option<u64>,
+}
+
+fn validate_loaded_provider(status: &Value) -> Result<()> {
+    if status["job"]["phase"].as_str() == Some("running") {
+        bail!("Wait for the local model operation to finish before using it for this session");
+    }
+    if !status["native_pid"].is_number() || !status["applied_profile"].is_object() {
+        bail!(
+            "Load the local model successfully before using it for this session. {}",
+            status["job"]["error"]
+                .as_str()
+                .unwrap_or("The inference engine is not ready.")
+        );
+    }
+    Ok(())
 }
 
 fn valid_device_id(id: &str) -> bool {
@@ -567,6 +586,19 @@ fn set_parent_death_signal(command: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_selection_requires_a_successfully_loaded_engine() {
+        assert!(validate_loaded_provider(&json!({"running":true,"native_pid":null,"job":{"phase":"failed","error":"Incompatible CUDA engine"}})).unwrap_err().to_string().contains("Incompatible CUDA engine"));
+        assert!(validate_loaded_provider(
+            &json!({"native_pid":123,"applied_profile":{},"job":{"phase":"running"}})
+        )
+        .is_err());
+        assert!(validate_loaded_provider(
+            &json!({"native_pid":123,"applied_profile":{},"job":{"phase":"complete"}})
+        )
+        .is_ok());
+    }
 
     #[test]
     fn experiment_settings_reject_invalid_resources() {

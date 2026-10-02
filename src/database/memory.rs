@@ -489,6 +489,25 @@ impl AgentDatabase {
         conversation_id: &str,
         max_chars: usize,
     ) -> Result<String> {
+        self.conversation_memory_context(conversation_id, max_chars, true)
+    }
+
+    /// Operator chat already has actual role-bearing history. Do not duplicate
+    /// its instructions through the automatically written activity transcript.
+    pub fn get_private_chat_note_context(
+        &self,
+        conversation_id: &str,
+        max_chars: usize,
+    ) -> Result<String> {
+        self.conversation_memory_context(conversation_id, max_chars, false)
+    }
+
+    fn conversation_memory_context(
+        &self,
+        conversation_id: &str,
+        max_chars: usize,
+        include_activity: bool,
+    ) -> Result<String> {
         let entries = self.get_all_working_memory()?;
         if entries.is_empty() {
             return Ok(String::new());
@@ -507,6 +526,9 @@ impl AgentDatabase {
             }
 
             if entry.key.starts_with("activity-log-") {
+                if !include_activity {
+                    continue;
+                }
                 if let Some(filtered) =
                     filter_activity_log_for_conversation(&entry.content, &conversation_tag, 14)
                 {

@@ -13,12 +13,14 @@ import hmac
 import http.client
 import json
 import math
+import mmap
 import os
 import queue
 from pathlib import Path
 import re
 import signal
 import select
+import shutil
 import socket
 import struct
 import subprocess
@@ -38,6 +40,10 @@ MAX_BODY = 2 * 1024 * 1024
 MAX_REQUEST_BODY = 16 * 1024 * 1024
 MAX_CONTEXT_SIZE = 1_048_576
 INFERENCE_TIMEOUT = 3600
+# Bound prefill working buffers independently of the requested context/KV size.
+# Native defaults (2048/512) leave too little headroom on a shared 24 GiB GPU.
+INFERENCE_BATCH_SIZE = 512
+INFERENCE_UBATCH_SIZE = 128
 CACHE_TYPES = ("f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1")
 MAX_STRENGTH = 1.0
 RECIPE_VERSION = "matched-assistant-reflection-v2"
@@ -368,6 +374,24 @@ def validate_inference_settings(context_size, gpu_layers, threads, unified_kv_ca
         raise ValueError("Quantized V cache requires flash attention; select on or auto")
 
 
+def engine_cuda_fa_support(server_binary):
+    """Inspect shared llama.cpp CUDA capabilities without initializing a GPU.
+
+    None means unknown, e.g. a static or differently packaged engine.
+    Shared CUDA backends advertise FA_ALL_QUANTS when enabled.
+    """
+    executable = shutil.which(server_binary)
+    if not executable:
+        return None
+    for library in Path(executable).resolve().parent.glob("libggml-cuda.so*"):
+        if library.stat().st_size == 0:
+            continue
+        with library.open("rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            if data[:4] == b"\x7fELF" and data.find(b"ARCHS\0") >= 0:
+                return data.find(b"FA_ALL_QUANTS\0") >= 0
+    return None
+
+
 class AffectLab(AffectDiscovery):
     def __init__(self, model, data_dir, server_binary="llama-server", generator_binary="bundled", gpu_layers=0, threads=4, context_size=16384, unified_kv_cache=True, cache_type_k="f16", cache_type_v="f16", flash_attention="auto", gpu_device=None):
         validate_inference_settings(context_size, gpu_layers, threads, unified_kv_cache, cache_type_k, cache_type_v, flash_attention, gpu_device)
@@ -380,6 +404,7 @@ class AffectLab(AffectDiscovery):
         self.data_dir = Path(data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.server_binary, self.generator_binary = server_binary, generator_binary
+        self.cuda_fa_all_quants = engine_cuda_fa_support(server_binary)
         self.gpu_layers, self.threads = gpu_layers, threads
         self.gpu_device = gpu_device
         self.context_size = context_size
@@ -459,6 +484,7 @@ class AffectLab(AffectDiscovery):
                 "model": {k: self.model[k] for k in ("path", "name", "bytes", "architecture", "layers", "embedding", "trained_context")},
                 "model_alias": ALIAS, "gpu_layers": self.gpu_layers, "context_size": self.context_size, "steerable_layer_end": self.model["layers"] - 2,
                 "inference_settings": self.inference_settings(),
+                "cuda_fa_all_quants": self.cuda_fa_all_quants,
                 "capabilities": {"activation_steering": True, "vector_build": True, "per_request_profile": True, "signed_controls": True, "automatic_discovery": True, "prompt_adapter": "chatml" if "<|im_start|>" in self.model["chat_template"] else "unsupported"},
                 "concepts": sorted(set(RECIPES) | set(visible)),
                 "example_library": [{"concept": c, "pairs": self.recipes.get(c, make_pairs(c) if c in RECIPES else []), "source": "built recipe" if c in self.recipes else "starter examples", "built": c in visible} for c in sorted(set(RECIPES) | set(visible))],
@@ -652,7 +678,7 @@ class AffectLab(AffectDiscovery):
         return str(executable)
 
     def inference_settings(self):
-        return {"server_binary": self.server_binary, "context_size": self.context_size, "unified_kv_cache": self.unified_kv_cache, "cache_type_k": self.cache_type_k, "cache_type_v": self.cache_type_v, "flash_attention": self.flash_attention, "gpu_layers": self.gpu_layers, "gpu_device": self.gpu_device, "gpu_offload": "all" if self.gpu_layers == -1 else "cpu" if self.gpu_layers == 0 else "partial", "threads": self.threads, "inference_timeout_seconds": INFERENCE_TIMEOUT, "chat_template": "qwen35-tools" if self.chat_template_path else "embedded", "chat_template_sha256": sha256_file(self.chat_template_path) if self.chat_template_path else None}
+        return {"server_binary": self.server_binary, "context_size": self.context_size, "unified_kv_cache": self.unified_kv_cache, "cache_type_k": self.cache_type_k, "cache_type_v": self.cache_type_v, "flash_attention": self.flash_attention, "gpu_layers": self.gpu_layers, "gpu_device": self.gpu_device, "gpu_offload": "all" if self.gpu_layers == -1 else "cpu" if self.gpu_layers == 0 else "partial", "threads": self.threads, "batch_size": INFERENCE_BATCH_SIZE, "ubatch_size": INFERENCE_UBATCH_SIZE, "inference_timeout_seconds": INFERENCE_TIMEOUT, "chat_template": "qwen35-tools" if self.chat_template_path else "embedded", "chat_template_sha256": sha256_file(self.chat_template_path) if self.chat_template_path else None}
 
     def native_request(self, method, path, body=None, timeout=INFERENCE_TIMEOUT):
         connection = http.client.HTTPConnection("127.0.0.1", self.native_port, timeout=timeout)
@@ -673,6 +699,10 @@ class AffectLab(AffectDiscovery):
 
     def ensure_server(self, profile):
         self.check_cancel()
+        if (self.gpu_layers != 0 and self.gpu_device and self.gpu_device.startswith("CUDA")
+                and self.cuda_fa_all_quants is False
+                and ({self.cache_type_k, self.cache_type_v} & {"q4_1", "q5_0", "q5_1"})):
+            raise RuntimeError("This CUDA engine lacks flash-attention kernels for the selected KV quantization. Rebuild llama.cpp with GGML_CUDA_FA_ALL_QUANTS=ON or select a compatible engine. Ponderer will not silently run this attention on CPU, change quantization, or shrink your context.")
         with self.state_lock:
             artifacts = {k: dict(v) for k, v in self.artifacts.items()}
         profile = validate_profile(profile, self.model["layers"], artifacts)
@@ -692,7 +722,7 @@ class AffectLab(AffectDiscovery):
         log_path = self.data_dir / "inference.log"
         layers = "all" if self.gpu_layers == -1 else str(self.gpu_layers)
         command = [self.server_binary, "--model", str(self.model_path), "--alias", ALIAS, "--host", "127.0.0.1", "--port", "0", "--api-key", self.native_token, "--ctx-size", str(self.context_size), "--parallel", "1", "--threads", str(self.threads), "--gpu-layers", layers, "--device", self.gpu_device if self.gpu_layers != 0 else "none", "--split-mode", "none", "--main-gpu", "0", "--fit", "off", "--no-warmup", "--offline", "--jinja", "--reasoning", "off", "--no-webui"]
-        command += ["--kv-unified" if self.unified_kv_cache else "--no-kv-unified", "--cache-type-k", self.cache_type_k, "--cache-type-v", self.cache_type_v, "--flash-attn", self.flash_attention, "--timeout", str(INFERENCE_TIMEOUT), "--no-context-shift"]
+        command += ["--kv-unified" if self.unified_kv_cache else "--no-kv-unified", "--cache-type-k", self.cache_type_k, "--cache-type-v", self.cache_type_v, "--flash-attn", self.flash_attention, "--batch-size", str(INFERENCE_BATCH_SIZE), "--ubatch-size", str(INFERENCE_UBATCH_SIZE), "--timeout", str(INFERENCE_TIMEOUT), "--no-context-shift", "--log-verbosity", "4"]
         if self.chat_template_path:
             command += ["--chat-template-file", str(self.chat_template_path)]
         # Use an ephemeral port; a competing bind is surfaced as a startup error.

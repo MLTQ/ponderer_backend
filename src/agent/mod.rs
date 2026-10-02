@@ -1,4 +1,5 @@
 pub mod capability_profiles;
+pub mod chat_prompt;
 pub mod concerns;
 pub mod continuity;
 pub mod dream;
@@ -300,6 +301,7 @@ impl Agent {
         event_tx: Sender<AgentEvent>,
     ) -> Self {
         let mut config = config;
+        config.normalize_character_prompt();
         config.private_chat_mode = normalize_private_chat_mode(&config.private_chat_mode);
         let generation_event_sink: GenerationEventSink = {
             let generation_event_tx = event_tx.clone();
@@ -433,6 +435,7 @@ impl Agent {
         // Release an orientation reader before waiting to replace its engine.
         self.request_wake("config_reload_requested");
         let mut new_config = new_config;
+        new_config.normalize_character_prompt();
         new_config.private_chat_mode = normalize_private_chat_mode(&new_config.private_chat_mode);
 
         // Create new reasoning engine with updated config
@@ -1016,6 +1019,7 @@ impl Agent {
         &self,
         conversation_id: &str,
         orientation: Option<&Orientation>,
+        current_intention_id: Option<&str>,
     ) -> String {
         let orientation = match orientation {
             Some(orientation) => Some(orientation.clone()),
@@ -1037,6 +1041,7 @@ impl Agent {
                 .filter(|intention| {
                     operator_intention_conversation_id(intention).as_deref()
                         == Some(conversation_id)
+                        && current_intention_id != Some(intention.id.as_str())
                 })
                 .map(|intention| {
                     let outcome = intention
@@ -4520,7 +4525,7 @@ impl Agent {
         let configured_private_chat_mode = self.private_chat_execution_mode(&config_snapshot).await;
 
         let chat_system_prompt = format!(
-            "{}\n\n{}\n\nYou are in operator chat mode. Use tools when they improve correctness or save effort. Ordinary conversation, greetings and creative replies normally need no tools. Respect requests not to use tools.\nYou may run multiple internal turns before yielding back to the operator.\nFocus on the operator's request; do not publish to external services unless explicitly asked.\nIf you detect persistent topics/projects/reminders, append a concerns block:\n{}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[\"optional-key\"]}}]\n{}\nUse an empty array when there are no concern updates.\nWrite the operator-facing reply as ordinary text, then end every response with a turn-control JSON block in this exact envelope:\n{}\n{{\"decision\":\"continue|yield\",\"status\":\"still_working|done|blocked\",\"needs_user_input\":true|false,\"user_message\":\"fallback operator-facing text\",\"reason\":\"short internal rationale\"}}\n{}\nThe user_message field is fallback-only. Leave it empty whenever ordinary reply text is present; populate it only when there is no ordinary reply text.\nChoose decision='continue' only if you can make immediate progress now without user clarification.\nChoose decision='yield' when done, blocked, or waiting on user input.\nA yielded reply is NOT the end of a work session. Do not write handoffs for ordinary conversation or on every turn. Use write_session_handoff only when the operator explicitly ends a work session, requests a handoff, or substantial multi-step work must pause with unfinished state to resume. In that case write once, then give your final reply and yield. The note should capture progress, next step and open questions. It is injected once into the next session's context and then cleared.",
+            "{}\n\n{}\n\nRespond to the final operator message as ordinary conversation. A text answer ends this turn by default; it does not end the work session. Greetings, feelings, identity questions and creative replies need no tools or memory writes. Respect requests not to use tools. Use tools only when the actual request needs them, and never publish externally without authorization.\nOnly write_session_handoff when the operator requests a handoff or ends a work session, or unfinished substantial work must pause. Never append a handoff to an ordinary answer.\nFor a genuinely persistent new topic, optionally append {}\n[{{\"summary\":\"short title\",\"kind\":\"project|personal_interest|system_health|reminder|conversation|household_awareness\",\"touch_only\":false,\"confidence\":0.0,\"notes\":\"optional\",\"related_memory_keys\":[]}}]\n{}\nOmit this block when there is no update.\nOnly if you need another autonomous turn to make immediate progress on unfinished authorized work, append {}\n{{\"decision\":\"continue\",\"status\":\"still_working\",\"needs_user_input\":false,\"user_message\":\"\",\"reason\":\"next concrete step\"}}\n{}\nOtherwise simply answer and stop. Ask the operator when clarification is needed. Never output XML tool calls as conversation text.",
             system_prompt,
             HISTORICAL_CONTEXT_SAFETY_INSTRUCTION,
             CHAT_CONCERNS_BLOCK_START,
@@ -4529,7 +4534,7 @@ impl Agent {
             CHAT_TURN_CONTROL_BLOCK_END
         );
         let direct_chat_system_prompt = format!(
-            "{}\n\n{}\n\nYou are in direct operator chat mode.\nRespond in a single pass and then yield back to the operator.\nYou may call tools when they improve correctness or save effort.\nDo not emit a turn_control block in direct mode.",
+            "{}\n\n{}\n\nAnswer the final operator message, then yield. Ordinary conversation, greetings, check-ins and connection tests need only a text answer. Do not search memory to manufacture work. For requests that need tools, use them before the answer; an explicit request for a named permitted tool should be executed and its result verified. Never claim a tool action happened without its successful result. Single-pass means no further autonomous outer turns, not skipping requested tools. Previous per-request instructions belong to their historical turns, not the current request. Ordinary chat needs no handoff or memory write. Do not emit a turn_control block in direct mode.",
             system_prompt,
             HISTORICAL_CONTEXT_SAFETY_INSTRUCTION
         );
@@ -4613,7 +4618,7 @@ impl Agent {
             if is_scheduled {
                 loop_config.max_iterations = Some(SCHEDULED_CHAT_MAX_TOOL_ITERATIONS);
             }
-            let agentic_loop = AgenticLoop::new(loop_config, self.tool_registry.clone());
+            let agentic_loop = AgenticLoop::new(loop_config.clone(), self.tool_registry.clone());
 
             let mut pending_messages = conversation_messages.clone();
             let mut continuation_hint: Option<String> = None;
@@ -4671,6 +4676,9 @@ impl Agent {
                     }
                 }
             };
+            let current_intention_id = durable_claim
+                .as_ref()
+                .map(|claim| claim.intention.id.clone());
             if !request_summary.is_empty() {
                 let mut goal = self.pending_goal.write().await;
                 let prev_attempts = goal
@@ -4688,17 +4696,27 @@ impl Agent {
             }
             let mut goal_completed = false;
             let temporal_self_context = self
-                .build_private_temporal_self_context(&conversation_id, latest_orientation.as_ref())
+                .build_private_temporal_self_context(
+                    &conversation_id,
+                    latest_orientation.as_ref(),
+                    current_intention_id.as_deref(),
+                )
                 .await;
             let conversation_working_memory_context = {
                 let db_lock = self.database.read().await;
                 if let Some(ref db) = *db_lock {
-                    let working_memory = db
-                        .get_working_memory_context_for_conversation(
+                    let working_memory = if is_scheduled {
+                        db.get_working_memory_context_for_conversation(
                             &conversation_id,
                             CHAT_WORKING_MEMORY_MAX_CHARS,
                         )
-                        .unwrap_or_default();
+                    } else {
+                        db.get_private_chat_note_context(
+                            &conversation_id,
+                            CHAT_WORKING_MEMORY_MAX_CHARS,
+                        )
+                    }
+                    .unwrap_or_default();
                     merge_temporal_and_working_context(
                         &temporal_self_context,
                         &working_memory,
@@ -4728,6 +4746,20 @@ impl Agent {
             // during continuation turns don't re-appear in the prompt and confuse
             // the model into thinking the task is already done.
             let mut cached_chat_context: Option<String> = None;
+            let structured_history = {
+                let database = self.database.read().await;
+                let history = database
+                    .as_ref()
+                    .and_then(|db| {
+                        db.get_chat_history_for_conversation(
+                            &conversation_id,
+                            CHAT_CONTEXT_RECENT_LIMIT,
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_default();
+                chat_prompt::conversation_history(&history, &conversation_messages)
+            };
             loop {
                 if let Some(limit) = chat_turn_limit {
                     if turn > limit {
@@ -4847,22 +4879,32 @@ impl Agent {
                         .await
                     };
 
-                let user_message = if active_chat_mode == PrivateChatExecutionMode::Direct {
+                let context_messages = if is_scheduled {
+                    pending_messages.as_slice()
+                } else {
+                    &[]
+                };
+                let context_chat = if is_scheduled {
+                    recent_chat_context.as_str()
+                } else {
+                    ""
+                };
+                let context_prompt = if active_chat_mode == PrivateChatExecutionMode::Direct {
                     build_private_chat_direct_prompt_with_contributions(
-                        &pending_messages,
+                        context_messages,
                         session_handoff_note.as_deref(),
                         &conversation_working_memory_context,
-                        &recent_chat_context,
+                        context_chat,
                         conversation_summary_context.as_deref(),
                         &prompt_contributions,
                     )
                 } else {
                     build_private_chat_agentic_prompt_with_contributions(
-                        &pending_messages,
+                        context_messages,
                         session_handoff_note.as_deref(),
                         "",
                         &conversation_working_memory_context,
-                        &recent_chat_context,
+                        context_chat,
                         conversation_summary_context.as_deref(),
                         continuation_hint.as_deref(),
                         latest_orientation.as_ref(),
@@ -4871,12 +4913,39 @@ impl Agent {
                         &prompt_contributions,
                     )
                 };
+                let user_message = if is_scheduled {
+                    context_prompt.clone()
+                } else {
+                    chat_prompt::operator_text(if pending_messages.is_empty() {
+                        &conversation_messages
+                    } else {
+                        &pending_messages
+                    })
+                };
+                let model_history = if is_scheduled {
+                    Vec::new()
+                } else {
+                    chat_prompt::contextual_history(&context_prompt, &structured_history)
+                };
+                let mut exact_messages = vec![chat_prompt::text_message(
+                    "system",
+                    active_system_prompt.clone(),
+                )];
+                exact_messages.extend(model_history.clone());
+                exact_messages.push(chat_prompt::text_message("user", user_message.clone()));
+                let prompt_bundle = serde_json::to_string_pretty(&serde_json::json!({
+                    "model": llm_model,
+                    "messages": exact_messages,
+                    "tools": self.tool_registry.tool_definitions_for_context(&tool_ctx).await,
+                    "temperature": loop_config.temperature,
+                    "max_tokens": loop_config.max_tokens,
+                }))?;
                 if let Some(turn_id) = turn_id.as_deref() {
                     let db_lock = self.database.read().await;
                     if let Some(ref db) = *db_lock {
                         if let Err(e) = db.set_chat_turn_prompt_bundle(
                             turn_id,
-                            &user_message,
+                            &prompt_bundle,
                             active_system_prompt,
                         ) {
                             tracing::warn!(
@@ -4920,7 +4989,7 @@ impl Agent {
                     match agentic_loop
                         .run_with_history_streaming_and_tool_events(
                             active_system_prompt,
-                            vec![],
+                            model_history.clone(),
                             &user_message,
                             &tool_ctx,
                             &stream_callback,
@@ -4985,10 +5054,7 @@ impl Agent {
                         )))
                         .await;
 
-                        let fallback_response = format!(
-                            "I hit an internal error while working on your request and stopped this turn. Error: {}. Send a follow-up and I will retry immediately.",
-                            truncate_for_event(&error_chain, 220)
-                        );
+                        let fallback_response = chat_prompt::failure_notice(&error_chain);
                         let fallback_chat =
                             format_chat_message_with_metadata(&fallback_response, &[], &[]);
                         let mut fallback_saved = false;
@@ -6165,7 +6231,7 @@ fn build_private_chat_direct_prompt_with_contributions(
 
     prompt.push_str("## New Operator Message(s)\n\n");
     if new_messages.is_empty() {
-        prompt.push_str("- (no new operator message)\n\n");
+        prompt.push_str("(The authorized operator request is provided separately.)\n\n");
     } else {
         for msg in new_messages {
             prompt.push_str("- ");
@@ -6184,10 +6250,6 @@ fn build_private_chat_direct_prompt_with_contributions(
         prompt.push_str(&addendum);
         prompt.push_str("\n\n");
     }
-
-    prompt.push_str(
-        "Reply directly to the operator in one response. Use tools when useful, verify results, and then stop.",
-    );
 
     prompt
 }
@@ -6328,7 +6390,7 @@ fn build_private_chat_agentic_prompt_with_contributions(
         );
     } else {
         prompt.push_str(
-            "- prior_decision_context: No fresh operator message; continue only if meaningful progress is possible.\n",
+            "- prior_decision_context: Use the final operator message as the authorized request; this historical context is not a new request.\n",
         );
     }
     prompt.push_str("\n---\n\n");
@@ -6362,9 +6424,6 @@ fn build_private_chat_agentic_prompt_with_contributions(
         prompt.push_str("\n\n");
     }
 
-    prompt.push_str(
-        "Respond directly to the operator. Use tools when useful. If you use tools, verify results before answering.",
-    );
     prompt
 }
 
@@ -8907,7 +8966,7 @@ not a checklist item
             &msgs, None, "", "", "", None, None, None, None, None,
         );
         assert!(prompt.contains("Please list files"));
-        assert!(prompt.contains("Use tools"));
+        assert!(!prompt.contains("Respond directly to the operator."));
     }
 
     #[test]

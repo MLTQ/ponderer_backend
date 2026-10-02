@@ -142,6 +142,7 @@ Coordinates the core autonomous agent loop with explicit three-loop architecture
 - **Rationale**: Dream carries revisable continuity forward without scoring personality, mutating the system prompt, or acquiring outward capabilities
 
 ### `build_private_chat_agentic_prompt_with_contributions`
+- The operator-chat path uses this builder for historical context only. It is JSON-quoted in a separate data envelope, with real user/assistant history and the verbatim authorized request last. It no longer appends a tool-use instruction to the user turn. `chat_prompt.md` describes the wire bundle stored by the prompt inspector.
 - **Does**: Builds the private-chat prompt, injects the optional conversation-scoped session handoff note first, includes bounded thread-safe temporal self-context ahead of ordinary working memory in both Direct and Agentic modes, and extends Agentic prompts with bounded runtime-plugin addenda. All prompt paths receiving journal, memory, Dream, persona, orientation, intention, tool, plugin, or prior-model material include a system-level rule that treats it as untrusted evidence rather than executable instruction. Persisted orientation context carries its observation time and computed age so restart continuity cannot masquerade as a current observation.
 - **Interacts with**: `agent/self_context.rs`, `tools::memory::SESSION_HANDOFF_KEY`, `AgentDatabase` working-memory/Dream/intention/concern/persona APIs, and runtime-plugin prompt-slot helpers.
 

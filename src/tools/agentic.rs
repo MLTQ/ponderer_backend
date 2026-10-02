@@ -231,7 +231,10 @@ fn select_verified_response(message: Message) -> Result<Message> {
         if visible.eq_ignore_ascii_case("thinking:") {
             anyhow::bail!("The model returned only a thinking label, not an answer. Reset experimental steering to neutral and retry.");
         }
-        if visible.starts_with("<tool_call>") || visible.starts_with("<function=") {
+        if visible.starts_with("<tool_call>")
+            || visible.starts_with("<function=")
+            || (visible.contains("<tool_call>") && visible.contains("<function="))
+        {
             anyhow::bail!("The provider returned an unparsed tool call instead of structured tool_calls. Check its tool-capable chat template.");
         }
     }
@@ -285,6 +288,16 @@ fn repeated_tool_work(records: &[ToolCallRecord]) -> bool {
             && a.arguments == b.arguments
             && a.output.to_llm_string() == b.output.to_llm_string()
     };
+    // Query echoes are not new evidence. Otherwise an empty memory store can
+    // sustain hundreds of differently worded searches with unlimited turns.
+    let empty_memory = |record: &ToolCallRecord| {
+        record.tool_name == "search_memory"
+            && matches!(&record.output,
+            ToolOutput::Json(value) if value["status"] == "ok" && value["match_count"] == 0 && value["matches"].as_array().is_some_and(Vec::is_empty))
+    };
+    if records.len() >= 4 && records[records.len() - 4..].iter().all(empty_memory) {
+        return true;
+    }
     // Catch A/A/A and cycles such as A/B/A/B/A/B, but don't accumulate
     // unchanged checks across intervening meaningful work.
     (1..=8).any(|period| {
@@ -488,7 +501,7 @@ impl AgenticLoop {
                     Message {
                         role: "assistant".into(),
                         content: Some(if stopping_repetition {
-                            "I stopped because the same tool call kept returning the same result. Please send a follow-up to continue."
+                            "I stopped because repeated tool calls produced no new evidence or progress. Please send a follow-up to continue."
                         } else {
                             "The session handoff was saved, but I couldn't generate the final reply. Please send a follow-up to continue."
                         }.into()),
@@ -661,7 +674,7 @@ impl AgenticLoop {
                         messages.push(Message {
                             role: "user".into(),
                             content: Some(if stopping_repetition {
-                                "The same tool call and result have repeated without progress. Tools are now disabled for this pass. Explain the obstacle briefly, answer what you can, and yield to the operator. Do not claim the task succeeded."
+                                "Repeated tool calls have produced no new evidence or progress. Tools are now disabled for this pass. Explain the obstacle briefly, answer what you can, and yield to the operator. Do not claim the task succeeded."
                             } else {
                                 "The session handoff has been saved. Tools are now disabled for this pass. Give the operator your final reply and yield; do not continue autonomous work or write another handoff."
                             }.into()),
@@ -820,6 +833,9 @@ impl AgenticLoop {
             .context("Empty choices in LLM response")?;
 
         let message = &choice["message"];
+        if let Some(session) = telemetry.as_ref() {
+            session.emit_assistant_output(message);
+        }
 
         // Parse into our Message type
         let content = message["content"].as_str().map(String::from);
@@ -916,7 +932,7 @@ impl AgenticLoop {
 
         let mut content = String::new();
         let mut tool_calls: Vec<ToolCallAccumulator> = Vec::new();
-        let mut line_buffer = String::new();
+        let mut line_buffer = Vec::new();
         let mut saw_done = false;
         let mut novelty_tracker = TokenNoveltyTracker::default();
 
@@ -938,11 +954,15 @@ impl AgenticLoop {
                 }
                 return Ok(self.cancelled_message());
             }
-            line_buffer.push_str(&String::from_utf8_lossy(&chunk));
+            // Network chunks may split Unicode code points. Decode complete SSE lines.
+            line_buffer.extend_from_slice(&chunk);
 
-            while let Some(newline_idx) = line_buffer.find('\n') {
-                let line = line_buffer[..newline_idx].trim().to_string();
-                line_buffer = line_buffer[newline_idx + 1..].to_string();
+            while let Some(newline_idx) = line_buffer.iter().position(|byte| *byte == b'\n') {
+                let line = std::str::from_utf8(&line_buffer[..newline_idx])
+                    .context("Provider SSE line is not valid UTF-8")?
+                    .trim()
+                    .to_string();
+                line_buffer.drain(..=newline_idx);
 
                 if line.is_empty() || line.starts_with(':') {
                     continue;
@@ -966,6 +986,9 @@ impl AgenticLoop {
                 };
 
                 let token_metrics = parse_logprob_tokens(choice);
+                if let Some(session) = telemetry.as_ref() {
+                    session.emit_assistant_output(&choice["delta"]);
+                }
                 if let Some(delta_content) = choice["delta"]["content"].as_str() {
                     content.push_str(delta_content);
                     let token_metrics = if token_metrics.is_empty() {
@@ -1375,6 +1398,26 @@ mod tests {
     }
 
     #[test]
+    fn differently_worded_empty_memory_queries_do_not_count_as_progress() {
+        use serde_json::json;
+        let mut records: Vec<_> = (0..4).map(|index| ToolCallRecord {
+            tool_name: "search_memory".into(),
+            arguments: json!({"query":format!("topic-{index}")}),
+            output: ToolOutput::Json(json!({"status":"ok","query":format!("topic-{index}"),"match_count":0,"matches":[]})),
+        }).collect();
+        assert!(!repeated_tool_work(&records[..3]));
+        assert!(repeated_tool_work(&records));
+        records[2].output = ToolOutput::Json(
+            json!({"status":"ok","match_count":1,"matches":[{"key":"new evidence"}]}),
+        );
+        assert!(!repeated_tool_work(&records));
+        for record in &mut records {
+            record.tool_name = "write_memory".into();
+        }
+        assert!(!repeated_tool_work(&records));
+    }
+
+    #[test]
     fn test_message_serialization() {
         let msg = Message {
             role: "user".to_string(),
@@ -1481,6 +1524,7 @@ mod tests {
             "Thinking:",
             "<think>no answer</think>",
             "<tool_call>\n<function=unknown>\n</function>\n</tool_call>",
+            "Got it.\n\n<tool_call>\n<function=unknown>\n</function>\n</tool_call>",
         ] {
             let requests = Arc::new(AtomicUsize::new(0));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1616,6 +1660,115 @@ mod tests {
             .unwrap()
             .iter()
             .any(|update| update.done && update.content == "Hi!"));
+    }
+
+    #[tokio::test]
+    async fn raw_output_includes_reasoning_and_tool_fragments_with_split_unicode() {
+        use crate::generation_telemetry::{GenerationEvent, GenerationSource};
+        use axum::{
+            body::{Body, Bytes},
+            response::Response,
+            routing::post,
+            Router,
+        };
+        use std::sync::Mutex;
+        let deltas = [
+            serde_json::json!({"content":"  灯 café\n", "reasoning_content":"visible provider reasoning"}),
+            serde_json::json!({"tool_calls":[{"index":0,"function":{"name":"fixture","arguments":"{\"term\":"}}]}),
+            serde_json::json!({"tool_calls":[{"index":0,"function":{"arguments":"\"灯\"}"}}]}),
+        ];
+        let mut stream = deltas
+            .iter()
+            .map(|delta| {
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"choices":[{"delta":delta}]})
+                )
+            })
+            .collect::<String>();
+        stream.push_str("data: [DONE]\n\n");
+        let split = stream.find('灯').unwrap() + 1; // Deliberately inside a UTF-8 code point.
+        let chunks = vec![
+            stream.as_bytes()[..split].to_vec(),
+            stream.as_bytes()[split..].to_vec(),
+        ];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let chunks = chunks.clone();
+                async move {
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(futures_util::stream::iter(
+                            chunks
+                                .into_iter()
+                                .map(|bytes| Ok::<_, std::io::Error>(Bytes::from(bytes))),
+                        )))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let capture = events.clone();
+        let runner = AgenticLoop::new(
+            AgenticConfig {
+                api_url: format!("http://{address}"),
+                generation_observer: Some(GenerationObserver::new(
+                    GenerationSource::OperatorChat,
+                    Some("one".into()),
+                    Arc::new(move |event| capture.lock().unwrap().push(event)),
+                )),
+                ..AgenticConfig::default()
+            },
+            Arc::new(ToolRegistry::new()),
+        );
+        let result = runner
+            .call_llm_streaming(
+                &[Message {
+                    role: "user".into(),
+                    content: Some("test".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                &[],
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(result.content.as_deref(), Some("  灯 café\n"));
+        assert_eq!(
+            result.tool_calls.unwrap()[0].function.arguments,
+            "{\"term\":\"灯\"}"
+        );
+        let events = events.lock().unwrap();
+        let raw = |channel: &str| {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    GenerationEvent::Text {
+                        channel: c, text, ..
+                    } if c == channel => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+        assert_eq!(raw("content"), "  灯 café\n");
+        assert_eq!(raw("reasoning_content"), "visible provider reasoning");
+        assert_eq!(raw("tool_0_arguments"), "{\"term\":\"灯\"}");
+        assert!(matches!(
+            events.last(),
+            Some(GenerationEvent::Finished {
+                outcome: GenerationOutcome::Completed,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

@@ -347,6 +347,16 @@ fn map_agent_event(event: AgentEvent) -> ApiEventEnvelope {
                     "conversation_id": conversation_id
                 }),
             ),
+            GenerationEvent::Text {
+                generation_id,
+                source,
+                conversation_id,
+                channel,
+                text,
+            } => envelope(
+                "generation_text",
+                serde_json::json!({"generation_id":generation_id,"source":source,"conversation_id":conversation_id,"channel":channel,"text":text}),
+            ),
             GenerationEvent::Metrics {
                 generation_id,
                 source,
@@ -646,7 +656,7 @@ async fn affect_lab_use_for_agent(
         .affect_lab
         .select_for_agent(&mut config)
         .await
-        .map_err(internal_error)?;
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     state.agent.reload_config(config.clone()).await;
     Ok(Json(config.clone()))
 }

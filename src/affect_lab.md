@@ -30,6 +30,9 @@ none`, `--main-gpu 0` and `--fit off`. Zero selects CPU (`--device none`); posit
 counts permit explicit partial offload. No automatic device split or context/CPU
 fallback occurs. Device placement is retained across steering reloads and recorded
 in evidence signatures; startup OOM errors identify the requested device/settings.
+Prefill uses explicit logical/physical batches of 512/128 to bound compute-buffer
+allocation on shared GPUs. These settings are recorded in signatures/reports;
+they do not reduce context capacity or change KV quantization/device placement.
 Extraction remains an explicitly CPU-only separate runtime.
 
 For `qwen35` architecture the worker deploys a bundled, MIT-licensed upstream

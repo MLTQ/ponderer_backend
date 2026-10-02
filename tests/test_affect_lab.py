@@ -65,7 +65,7 @@ def fake_server():
     port = int(option("--port"))
     strength = option("--control-vector-scaled").rsplit(":", 1)[1] if "--control-vector-scaled" in sys.argv else "0"
     # Record only memory settings, never process arguments containing API tokens.
-    settings = {key: option(key) for key in ("--ctx-size", "--cache-type-k", "--cache-type-v", "--flash-attn", "--timeout")}
+    settings = {key: option(key) for key in ("--ctx-size", "--cache-type-k", "--cache-type-v", "--flash-attn", "--batch-size", "--ubatch-size", "--timeout")}
     settings["unified_kv_cache"] = "--kv-unified" in sys.argv
     settings["context_shift"] = "--no-context-shift" not in sys.argv
     placement = {key: option(key) for key in ("--gpu-layers", "--device", "--split-mode", "--main-gpu", "--fit")}
@@ -96,6 +96,29 @@ def fake_server():
 
 
 class AffectLabTests(unittest.TestCase):
+    def test_known_missing_quantized_cuda_kernels_fail_without_changing_settings(self):
+        self.lab.gpu_layers = -1
+        self.lab.gpu_device = "CUDA0"
+        self.lab.cache_type_k = self.lab.cache_type_v = "q4_1"
+        self.lab.context_size = 200000
+        self.lab.cuda_fa_all_quants = False
+        with self.assertRaisesRegex(RuntimeError, "FA_ALL_QUANTS=ON"):
+            self.lab.ensure_server({"strengths": {}})
+        self.assertIsNone(self.lab.child)
+        self.assertEqual(self.lab.context_size, 200000)
+        self.assertEqual(self.lab.cache_type_v, "q4_1")
+        # Unknown packages are not mislabeled as verified, nor assumed disabled.
+        self.lab.cuda_fa_all_quants = None
+        self.lab.ensure_server({"strengths": {}})
+        self.assertIsNotNone(self.lab.child)
+
+    def test_shared_cuda_capability_marker_is_inspected_without_launching_engine(self):
+        executable = self.path / "fake-server"
+        library = self.path / "libggml-cuda.so"
+        library.write_bytes(b"\x7fELF\0ARCHS\0USE_GRAPHS\0")
+        self.assertFalse(worker.engine_cuda_fa_support(str(executable)))
+        library.write_bytes(b"\x7fELF\0ARCHS\0FA_ALL_QUANTS\0")
+        self.assertTrue(worker.engine_cuda_fa_support(str(executable)))
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ponderer-affect-test-")
         self.path = Path(self.temp.name)
@@ -162,10 +185,12 @@ class AffectLabTests(unittest.TestCase):
         self.add_vector()
         self.completion()
         settings = self.lab.native_request("GET", "/health")["test_settings"]
-        self.assertEqual(settings, {"--ctx-size": "200000", "--cache-type-k": "q4_1", "--cache-type-v": "q4_1", "--flash-attn": "on", "--timeout": "3600", "unified_kv_cache": True, "context_shift": False})
+        self.assertEqual(settings, {"--ctx-size": "200000", "--cache-type-k": "q4_1", "--cache-type-v": "q4_1", "--flash-attn": "on", "--batch-size": "512", "--ubatch-size": "128", "--timeout": "3600", "unified_kv_cache": True, "context_shift": False})
         report = self.lab.compare("contentment", [0, 0.1], "test", 4)
         self.assertEqual(report["inference_settings"], self.lab.status()["inference_settings"])
         self.assertEqual(report["inference_settings"]["context_size"], 200_000)
+        self.assertEqual(report["inference_settings"]["batch_size"], 512)
+        self.assertEqual(report["inference_settings"]["ubatch_size"], 128)
         self.lab.unified_kv_cache = False
         self.completion()
         first = self.lab.child.pid

@@ -37,6 +37,8 @@ struct ChatCompletionRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,14 +81,15 @@ impl LlmClient {
 
     /// Generate a completion with a specific model
     pub async fn generate_with_model(&self, messages: Vec<Message>, model: &str) -> Result<String> {
-        let session = self.begin_generation();
+        let mut session = self.begin_generation();
         let url = chat_completions_url(&self.api_url);
 
-        let request = ChatCompletionRequest {
+        let mut request = ChatCompletionRequest {
             model: model.to_string(),
             messages,
             temperature: Some(0.7),
             max_tokens: Some(2000),
+            stream: session.is_some(),
         };
 
         let mut req = self.client.post(&url).json(&request);
@@ -96,7 +99,26 @@ impl LlmClient {
             req = req.header("Authorization", format!("Bearer {}", self.api_key));
         }
 
-        let response = req.send().await.context("Failed to send LLM request")?;
+        let mut response = req.send().await.context("Failed to send LLM request")?;
+        if request.stream && response.status() == reqwest::StatusCode::BAD_REQUEST {
+            let body = response.text().await.unwrap_or_default();
+            let lower = body.to_lowercase();
+            if lower.contains("stream")
+                && (lower.contains("not supported") || lower.contains("unsupported"))
+            {
+                request.stream = false;
+                let mut fallback = self.client.post(&url).json(&request);
+                if !self.api_key.is_empty() {
+                    fallback = fallback.bearer_auth(&self.api_key);
+                }
+                response = fallback
+                    .send()
+                    .await
+                    .context("Failed to send non-streaming LLM fallback")?;
+            } else {
+                anyhow::bail!("LLM API returned error 400: {body}");
+            }
+        }
 
         // Check for HTTP errors and include response body for debugging
         if !response.status().is_success() {
@@ -108,19 +130,91 @@ impl LlmClient {
             anyhow::bail!("LLM API returned error {}: {}", status, body);
         }
 
-        let completion: ChatCompletionResponse = response
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"))
+        {
+            return Self::read_text_stream(response, session.as_mut()).await;
+        }
+        let completion: Value = response
             .json()
             .await
             .context("Failed to parse LLM response")?;
-
-        let content = completion
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
+        let message = &completion["choices"][0]["message"];
+        if let Some(observer) = session.as_ref() {
+            observer.emit_assistant_output(message);
+        }
+        let content = message["content"]
+            .as_str()
+            .map(str::to_owned)
             .ok_or_else(|| anyhow::anyhow!("No response from LLM"))?;
+        if let Some(observer) = session.as_mut() {
+            let mut tracker = TokenNoveltyTracker::default();
+            observer.emit_samples(tracker.ingest_text_fragment(&content));
+            observer.emit_samples(tracker.finish_pending());
+            observer.finish(GenerationOutcome::Completed);
+        }
 
-        Self::complete_generation(session, &content);
+        Ok(content)
+    }
 
+    async fn read_text_stream(
+        mut response: reqwest::Response,
+        mut session: Option<&mut GenerationSession>,
+    ) -> Result<String> {
+        let mut pending = Vec::new();
+        let mut content = String::new();
+        let mut tracker = TokenNoveltyTracker::default();
+        let mut done = false;
+        let mut finished = false;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("Failed reading LLM output stream")?
+        {
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                let line = std::str::from_utf8(&pending[..end])
+                    .context("Invalid UTF-8 in LLM SSE line")?
+                    .trim()
+                    .to_string();
+                pending.drain(..=end);
+                let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                    continue;
+                };
+                if data == "[DONE]" {
+                    done = true;
+                    break;
+                }
+                let value: Value = serde_json::from_str(data).context("Invalid LLM SSE JSON")?;
+                finished |= value["choices"][0]["finish_reason"].is_string();
+                let delta = &value["choices"][0]["delta"];
+                if let Some(observer) = session.as_ref() {
+                    observer.emit_assistant_output(delta);
+                }
+                if let Some(text) = delta["content"].as_str() {
+                    content.push_str(text);
+                    if let Some(observer) = session.as_ref() {
+                        observer.emit_samples(tracker.ingest_text_fragment(text));
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        if !done && !finished {
+            anyhow::bail!("LLM stream closed before a completion marker");
+        }
+        if content.is_empty() {
+            anyhow::bail!("LLM stream ended without textual content");
+        }
+        if let Some(observer) = session.as_mut() {
+            observer.emit_samples(tracker.finish_pending());
+            observer.finish(GenerationOutcome::Completed);
+        }
         Ok(content)
     }
 
@@ -318,6 +412,7 @@ impl LlmClient {
             messages,
             temperature: Some(0.2),
             max_tokens: Some(1000),
+            stream: false,
         };
 
         let mut req = self.client.post(&url).json(&request);
@@ -359,11 +454,7 @@ impl LlmClient {
         let Some(session) = session.as_mut() else {
             return;
         };
-        let mut tracker = TokenNoveltyTracker::default();
-        let mut samples = tracker.ingest_text_fragment(content);
-        samples.extend(tracker.finish_pending());
-        session.emit_samples(samples);
-        session.finish(GenerationOutcome::Completed);
+        session.finish_with_text(content);
     }
 
     fn parse_json<T>(&self, response: &str) -> Result<T>
@@ -611,10 +702,141 @@ mod tests {
     use serde::Deserialize;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn background_generation_streams_raw_output_and_handles_explicit_stream_rejection() {
+        use crate::generation_telemetry::{GenerationEvent, GenerationObserver, GenerationSource};
+        use axum::{response::IntoResponse, routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        for fallback in [false, true] {
+            let router = Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| async move {
+                    if body["stream"] == true && fallback {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            "stream is not supported",
+                        )
+                            .into_response();
+                    }
+                    let text = "  灯 café\n";
+                    if body["stream"] == true {
+                        (
+                            [("content-type", "text/event-stream")],
+                            format!(
+                                "data: {}\n\ndata: [DONE]\n\n",
+                                json!({"choices":[{"delta":{"reasoning_content":"provider reasoning", "content":text}}]})
+                            ),
+                        )
+                            .into_response()
+                    } else {
+                        Json(json!({"choices":[{"message":{"role":"assistant","reasoning_content":"provider reasoning","content":text}}]}))
+                            .into_response()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let capture = events.clone();
+            let client =
+                super::LlmClient::new(format!("http://{address}"), "".into(), "fixture".into())
+                    .with_generation_observer(GenerationObserver::new(
+                        GenerationSource::Orientation,
+                        None,
+                        Arc::new(move |event| capture.lock().unwrap().push(event)),
+                    ));
+            let result = client
+                .generate(vec![super::Message {
+                    role: "user".into(),
+                    content: "test".into(),
+                }])
+                .await
+                .unwrap();
+            server.abort();
+            assert_eq!(result, "  灯 café\n");
+            let events = events.lock().unwrap();
+            let raw = events
+                .iter()
+                .filter_map(|event| match event {
+                    GenerationEvent::Text {
+                        text,
+                        source: GenerationSource::Orientation,
+                        channel,
+                        ..
+                    } if channel == "content" => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(raw, result);
+            assert!(events.iter().any(|event| matches!(event, GenerationEvent::Text { channel, text, .. } if channel == "reasoning_content" && text == "provider reasoning")));
+            assert!(matches!(
+                events.last(),
+                Some(GenerationEvent::Finished { .. })
+            ));
+        }
+    }
+
     #[derive(Debug, Deserialize, PartialEq)]
     struct JsonProbe {
         value: String,
         count: u32,
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_retains_raw_output_but_finishes_as_failed() {
+        use crate::generation_telemetry::{
+            GenerationEvent, GenerationObserver, GenerationOutcome, GenerationSource,
+        };
+        use axum::{routing::post, Router};
+        use std::sync::{Arc, Mutex};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial 灯\"}}]}\n\n",
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let capture = events.clone();
+        let client =
+            super::LlmClient::new(format!("http://{address}"), "".into(), "fixture".into())
+                .with_generation_observer(GenerationObserver::new(
+                    GenerationSource::Orientation,
+                    None,
+                    Arc::new(move |event| capture.lock().unwrap().push(event)),
+                ));
+        let result = client
+            .generate(vec![super::Message {
+                role: "user".into(),
+                content: "test".into(),
+            }])
+            .await;
+        server.abort();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("completion marker"));
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(
+            |event| matches!(event, GenerationEvent::Text { text, .. } if text == "partial 灯")
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(GenerationEvent::Finished {
+                outcome: GenerationOutcome::Failed,
+                ..
+            })
+        ));
     }
 
     #[test]

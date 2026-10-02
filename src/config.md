@@ -50,6 +50,7 @@ Defines all configuration for the Ponderer agent, including LLM connection, iden
 ## Notes
 
 - Identity distinguishes `username` (agent) from `operator_name`, `relationship_description`, and operator-owned `identity_boundaries`. Learned continuity never mutates these settings.
+- `identity_context()` compiles character fields for every model lane and the UI preview. The character name overrides the displayed identity, not the external account username. Card-only `{{char}}`/`{{user}}` expansion is case-insensitive; real operator messages are never templated. `character_system_prompt` preserves imported card instructions separately from custom operator policy. Only exact legacy UI-generated system prompts are migrated; custom policy is retained.
 - `outreach` is a serde-defaulted policy table, not a schedule: enabled/Telegram-enabled, one-hour minimum spacing, three contacts per rolling day, 24-hour topic cooldown, 22–08 local quiet hours, no urgent quiet-hour bypass, and 0.7 minimum confidence by default.
 - Telegram fails closed without both a token and a positive private owner ID. Credentials never appear in transport logs.
 - Config save path targets an executable-root directory; for Cargo `target/*/deps` runs, the `deps` parent is used so state lives in `target/{debug|release}` instead of hash subfolders.

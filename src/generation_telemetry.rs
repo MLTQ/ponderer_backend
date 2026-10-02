@@ -58,6 +58,13 @@ pub enum GenerationEvent {
         source: GenerationSource,
         conversation_id: Option<String>,
     },
+    Text {
+        generation_id: String,
+        source: GenerationSource,
+        conversation_id: Option<String>,
+        channel: String,
+        text: String,
+    },
     Metrics {
         generation_id: String,
         source: GenerationSource,
@@ -134,7 +141,26 @@ impl GenerationObserver {
 }
 
 impl GenerationSession {
+    pub fn emit_assistant_output(&self, message: &serde_json::Value) {
+        for channel in ["content", "reasoning_content", "reasoning"] {
+            if let Some(text) = message[channel].as_str() {
+                self.emit_text(channel, text);
+            }
+        }
+        if let Some(calls) = message["tool_calls"].as_array() {
+            for (position, call) in calls.iter().enumerate() {
+                let index = call["index"].as_u64().unwrap_or(position as u64);
+                for field in ["name", "arguments"] {
+                    if let Some(text) = call["function"][field].as_str() {
+                        self.emit_text(&format!("tool_{index}_{field}"), text);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn finish_with_text(&mut self, text: &str) {
+        self.emit_text("content", text);
         let mut tracker = TokenNoveltyTracker::default();
         let mut samples = tracker.ingest_text_fragment(text);
         samples.extend(tracker.finish_pending());
@@ -152,6 +178,20 @@ pub struct GenerationSession {
 }
 
 impl GenerationSession {
+    /// Provider-visible output before reply cleanup or lexical tokenization.
+    /// Whitespace is preserved and this lane does not require logprobs.
+    pub fn emit_text(&self, channel: &str, text: &str) {
+        if !text.is_empty() {
+            (self.sink)(GenerationEvent::Text {
+                generation_id: self.generation_id.clone(),
+                source: self.source,
+                conversation_id: self.conversation_id.clone(),
+                channel: channel.to_string(),
+                text: text.to_string(),
+            });
+        }
+    }
+
     pub fn emit_samples(&self, samples: Vec<GenerationMetricSample>) {
         if samples.is_empty() {
             return;
@@ -367,7 +407,10 @@ mod tests {
             Some(GenerationEvent::Started { .. })
         ));
         assert!(
-            matches!(events.get(1), Some(GenerationEvent::Metrics { samples, .. }) if !samples.is_empty())
+            matches!(events.get(1), Some(GenerationEvent::Text { text, .. }) if text == "A strange new pattern appears.")
+        );
+        assert!(
+            matches!(events.get(2), Some(GenerationEvent::Metrics { samples, .. }) if !samples.is_empty())
         );
         assert!(matches!(
             events.last(),

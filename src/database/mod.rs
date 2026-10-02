@@ -1117,8 +1117,17 @@ mod tests {
         assert!(scoped.contains("project-brief"));
         assert!(!scoped.contains("private continuation"));
 
+        let notes = db
+            .get_private_chat_note_context(conversation_id, 4000)
+            .expect("private chat notes");
+        assert!(notes.contains("project-brief"));
+        assert!(!notes.contains("activity-log"));
+        assert!(!notes.contains("first task"));
+        assert!(!notes.contains("private continuation"));
+
         let global = db.get_working_memory_context().expect("global context");
         assert!(!global.contains("private continuation"));
+        assert!(global.contains("first task")); // Logs remain intact for the background lanes.
 
         let _ = std::fs::remove_file(&path);
     }

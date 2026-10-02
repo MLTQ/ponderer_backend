@@ -92,3 +92,5 @@ for the executor lifetime, retaining streaming without repeated rejected probes.
 - HTTP client initialization now has a panic-safe fallback (`no_proxy`) if default system proxy discovery fails on host OS APIs.
 - Cancellation is re-checked after each LLM request because request helpers unwind with a synthetic assistant message; the outer result still reports `AgenticTermination::Cancelled` rather than `Completed`.
 - `AgenticConfig::generation_observer` emits one independently identified path per model request, including autonomous and tool-calling iterations; chat streaming callbacks no longer own monitor telemetry.
+- Raw telemetry publishes API-visible content/reasoning/tool fragments before cleanup, including non-streaming responses; SSE buffering preserves split UTF-8. Prose containing unparsed XML function calls is not accepted as a successful conversation reply.
+- Four consecutive empty memory searches are no progress even with different query wording. The independent guard also detects unchanged repeated/cyclic tool work with iteration limits disabled, then makes the final pass tool-free. Changing retrieved evidence and distinct writes remain permitted.

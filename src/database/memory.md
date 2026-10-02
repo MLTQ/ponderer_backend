@@ -22,6 +22,7 @@ Working memory CRUD, conversation-scoped memory context, memory design versionin
 - `append_daily_activity_log` — accumulates timestamped lines into date-keyed activity log entries
 - `get_working_memory_context` — formats ordinary entries as `## Your Working Memory` while excluding one-shot private handoff keys
 - `get_working_memory_context_for_conversation` — conversation-scoped variant: filters activity log lines to the conversation's tag, excludes every handoff key (handoffs have a separate exact-key injection path), and truncates to `max_chars`
+- `get_private_chat_note_context` — same durable notes without the automatic activity-log transcript, which would duplicate the role-bearing operator conversation. Does not delete logs or change background-context retrieval.
 
 ## Contracts
 | Dependent | Expects |

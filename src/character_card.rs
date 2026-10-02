@@ -126,6 +126,9 @@ fn extract_png_text_chunk(png_bytes: &[u8], keyword: &str) -> Result<String> {
 
         // Read chunk type (4 bytes)
         let chunk_type = &png_bytes[pos + 4..pos + 8];
+        if pos + 8 + length + 4 > png_bytes.len() {
+            anyhow::bail!("Truncated PNG character metadata chunk");
+        }
 
         // Check if it's a tEXt chunk
         if chunk_type == b"tEXt" {
@@ -154,6 +157,14 @@ fn extract_png_text_chunk(png_bytes: &[u8], keyword: &str) -> Result<String> {
 fn parse_tavernai_v2(content: &str) -> Result<ParsedCharacter> {
     let card: TavernAICardV2 =
         serde_json::from_str(content).context("Failed to parse as TavernAI V2 JSON")?;
+    let system_prompt = [
+        card.data.system_prompt.as_str(),
+        card.data.post_history_instructions.as_str(),
+    ]
+    .into_iter()
+    .filter(|text| !text.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n");
 
     Ok(ParsedCharacter {
         name: card.data.name,
@@ -161,7 +172,7 @@ fn parse_tavernai_v2(content: &str) -> Result<ParsedCharacter> {
         personality: card.data.personality,
         scenario: card.data.scenario,
         example_dialogue: card.data.mes_example,
-        system_prompt: card.data.system_prompt,
+        system_prompt,
     })
 }
 
@@ -328,4 +339,27 @@ pub fn character_to_system_prompt(character: &ParsedCharacter) -> String {
     parts.push("Engage thoughtfully and stay true to your character.".to_string());
 
     parts.join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_preserves_card_instructions_and_post_history_guidance() {
+        let card = parse_tavernai_v2(r#"{"spec":"chara_card_v2","spec_version":"2.0","data":{"name":"Iris","system_prompt":"Speak as {{char}}.","post_history_instructions":"Keep it concise, {{user}}."}}"#).unwrap();
+        assert_eq!(
+            card.system_prompt,
+            "Speak as {{char}}.\n\nKeep it concise, {{user}}."
+        );
+    }
+
+    #[test]
+    fn truncated_png_metadata_returns_an_error_without_panicking() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        bytes.extend_from_slice(b"tEXt");
+        bytes.extend_from_slice(&[0; 4]);
+        assert!(extract_png_text_chunk(&bytes, "chara").is_err());
+    }
 }
