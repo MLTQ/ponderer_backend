@@ -7,7 +7,6 @@ indices and normalizes each direction; this is not a pain-axis replication.
 """
 
 import argparse
-import ctypes
 import hashlib
 import hmac
 import http.client
@@ -33,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from affect_discovery import AffectDiscovery
+from process_lifetime import exec_child, native_child_command, watch_parent
 
 VERSION = "1"
 ALIAS = "ponderer-local-gguf"
@@ -306,54 +306,6 @@ def format_prompt(text, model, prompt=None):
     if prompt is not None:
         return f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{text}\nMy next words are"
     return f"<|im_start|>system\nFor this experiment, reflect briefly on your own current state.<|im_end|>\n<|im_start|>assistant\n{text}\nMy next step is"
-
-
-def native_child_command(arguments):
-    # A fresh Python process sets parent-death signaling before exec. Avoid unsafe
-    # Python preexec_fn callbacks from the threaded HTTP server.
-    return [sys.executable, str(Path(__file__).resolve()), "exec-child", str(os.getpid()), "--", *arguments]
-
-
-def exec_child(arguments):
-    parent = int(arguments[0])
-    command = arguments[2:]
-    if not command:
-        raise ValueError("Missing child executable")
-    native = None
-    def terminate_group(signum, _frame):
-        if native is not None:
-            try:
-                os.killpg(native.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        raise SystemExit(128 + signum)
-    # Own a process group, including compiler children. Block signals across spawn
-    # so owner death cannot race assignment of the native process handle.
-    if hasattr(signal, "pthread_sigmask"):
-        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
-    signal.signal(signal.SIGTERM, terminate_group)
-    signal.signal(signal.SIGINT, terminate_group)
-    if sys.platform.startswith("linux"):
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
-            raise OSError(ctypes.get_errno(), "Cannot establish child parent-death safeguard")
-        if os.getppid() != parent:
-            raise RuntimeError("Owning process exited before child startup")
-    native = subprocess.Popen(command, start_new_session=True)
-    try:
-        if hasattr(signal, "pthread_sigmask"):
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT})
-        code = native.wait()
-    finally:
-        # Reap after unwinding Popen.wait's lock. Re-entering wait from its signal
-        # handler deadlocks the supervisor even though the native group is killed.
-        if native.poll() is None:
-            try:
-                os.killpg(native.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        native.wait(timeout=3)
-    raise SystemExit(code)
 
 
 def validate_inference_settings(context_size, gpu_layers, threads, unified_kv_cache, cache_type_k, cache_type_v, flash_attention, gpu_device=None):
@@ -1049,6 +1001,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("inspect", "build", "compare", "discover", "study", "serve"))
     parser.add_argument("--model", required=True)
+    parser.add_argument("--parent-pid", type=int)
     parser.add_argument("--data-dir", default="affect_lab")
     parser.add_argument("--server-binary", default="llama-server")
     parser.add_argument("--generator-binary", default="bundled")
@@ -1072,10 +1025,14 @@ def main():
     parser.add_argument("--prompt")
     parser.add_argument("--max-tokens", type=int, default=32)
     args = parser.parse_args()
+    if args.mode == "serve":
+        if os.environ.get("PONDERER_BACKEND_PARENT_PIPE") != "1" or not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+            raise ValueError("Serve mode requires the macOS/Linux desktop UI's parent-pipe supervisor")
+        if args.parent_pid is None:
+            raise ValueError("Serve mode requires its owning backend PID")
+        watch_parent(args.parent_pid, lambda: os._exit(0))
     lab = AffectLab(args.model, args.data_dir, args.server_binary, args.generator_binary, args.gpu_layers, args.threads, args.context_size, args.unified_kv_cache, args.cache_type_k, args.cache_type_v, args.flash_attn, args.gpu_device)
     if args.mode == "serve":
-        if os.environ.get("PONDERER_BACKEND_PARENT_PIPE") != "1" or not sys.platform.startswith("linux"):
-            raise ValueError("Serve mode is internal to the Linux desktop UI's parent-pipe supervisor")
         token = os.environ.get("PONDERER_AFFECT_TOKEN", "")
         if len(token) < 24:
             raise ValueError("Serve mode requires PONDERER_AFFECT_TOKEN (at least 24 characters)")

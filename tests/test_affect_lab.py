@@ -49,6 +49,9 @@ def make_gguf(path, vector=False, values=(1.0, 0.0, 0.0), architecture="qwen35")
 
 
 def inactive(pid):
+    if sys.platform == "darwin":
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True)
+        return not result.stdout.strip() or result.stdout.strip().startswith("Z")
     try:
         state = Path(f"/proc/{pid}/stat").read_text().split(")", 1)[1].split()[0]
         return state == "Z"
@@ -121,7 +124,7 @@ class AffectLabTests(unittest.TestCase):
         self.assertTrue(worker.engine_cuda_fa_support(str(executable)))
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ponderer-affect-test-")
-        self.path = Path(self.temp.name)
+        self.path = Path(self.temp.name).resolve()
         self.model = self.path / "model.gguf"
         make_gguf(self.model)
         self.lab = worker.AffectLab(self.model, self.path / "lab", server_binary=str(self.make_fake_server()))
@@ -449,7 +452,7 @@ class AffectLabTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux parent-death safeguard")
+    @unittest.skipUnless(sys.platform.startswith("linux") or sys.platform == "darwin", "macOS/Linux process supervision")
     def test_native_child_dies_if_owning_worker_is_killed(self):
         marker = self.path / "native-ready"
         code = f"import importlib.util,subprocess,sys,time; s=importlib.util.spec_from_file_location('w',{str(WORKER)!r}); w=importlib.util.module_from_spec(s); s.loader.exec_module(w); p=subprocess.Popen(w.native_child_command([sys.executable,'-c',\"from pathlib import Path; import os,time; Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(60)\"]),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); print(p.pid,flush=True); time.sleep(60)"

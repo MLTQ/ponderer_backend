@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::config::AgentConfig;
 
 const WORKER: &str = include_str!("../resources/affect_lab/worker.py");
+const PROCESS_LIFETIME: &str = include_str!("../resources/affect_lab/process_lifetime.py");
 const DISCOVERY: &str = include_str!("../resources/affect_lab/affect_discovery.py");
 const EXTRACTOR: &str = include_str!("../resources/affect_lab/extractor.cpp");
 const QWEN35_TEMPLATE: &str = include_str!("../resources/affect_lab/qwen35-tools.jinja");
@@ -118,7 +119,7 @@ struct ManagedWorker {
 impl Drop for ManagedWorker {
     fn drop(&mut self) {
         // kill_on_drop and Linux parent-death signaling cover both orderly and
-        // abrupt backend exits. Python gives the same guarantee to native children.
+        // abrupt Linux backend exits. Python parent watchers cover macOS and native children.
         let _ = self.child.start_kill();
     }
 }
@@ -188,8 +189,8 @@ impl AffectLabManager {
         if std::env::var("PONDERER_BACKEND_PARENT_PIPE").as_deref() != Ok("1") {
             bail!("Start Affect Lab from the desktop UI; managed inference requires its backend parent-pipe safeguard");
         }
-        if !cfg!(target_os = "linux") {
-            bail!("This managed local provider currently requires Linux parent-death signaling");
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            bail!("Managed local inference requires macOS or Linux process supervision");
         }
         let mut guard = self.worker.lock().await;
         if let Some(worker) = guard.as_mut() {
@@ -203,6 +204,7 @@ impl AffectLabManager {
         tokio::fs::create_dir_all(&resources).await?;
         let worker_path = resources.join("worker.py");
         tokio::fs::write(&worker_path, WORKER).await?;
+        tokio::fs::write(resources.join("process_lifetime.py"), PROCESS_LIFETIME).await?;
         tokio::fs::write(resources.join("affect_discovery.py"), DISCOVERY).await?;
         tokio::fs::write(resources.join("extractor.cpp"), EXTRACTOR).await?;
         tokio::fs::write(resources.join("qwen35-tools.jinja"), QWEN35_TEMPLATE).await?;
@@ -214,6 +216,8 @@ impl AffectLabManager {
             .arg("-u")
             .arg(&worker_path)
             .arg("serve")
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string())
             .arg("--model")
             .arg(settings.model_path)
             .arg("--data-dir")
@@ -294,7 +298,7 @@ impl AffectLabManager {
     pub async fn control(&self, action: &str, values: Value) -> Result<Value> {
         if action == "devices" {
             if std::env::var("PONDERER_BACKEND_PARENT_PIPE").as_deref() != Ok("1")
-                || !cfg!(target_os = "linux")
+                || !cfg!(any(target_os = "linux", target_os = "macos"))
             {
                 bail!("Scan GPUs from the desktop UI; device probes require its process-lifetime safeguard");
             }
@@ -411,7 +415,7 @@ impl AffectLabManager {
         let worker = self.worker.lock().await.take();
         if let Some(mut worker) = worker {
             // Ask Python to reap native children, then terminate the worker. Abrupt
-            // death still kills every native child through PR_SET_PDEATHSIG.
+            // death is covered by native parent watchers (plus Linux PR_SET_PDEATHSIG).
             let _ = self
                 .send(
                     &worker,
@@ -525,17 +529,31 @@ async fn probe_devices_with_timeout(executable: &str, timeout: Duration) -> Resu
     if executable.trim().is_empty() || executable.contains('\0') {
         bail!("Choose a llama-server executable");
     }
-    let mut command = Command::new(executable);
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("python3");
+        command
+            .arg("-c")
+            .arg(PROCESS_LIFETIME)
+            .arg(std::process::id().to_string())
+            .arg("--")
+            .arg(executable);
+        command
+    } else {
+        Command::new(executable)
+    };
     command
         .arg("--list-devices")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(!cfg!(target_os = "macos"));
     set_parent_death_signal(&mut command);
-    let mut child = command
-        .spawn()
-        .context("Cannot scan GPUs with this llama-server")?;
+    let mut probe = DeviceProbe(
+        command
+            .spawn()
+            .context("Cannot scan GPUs with this llama-server")?,
+    );
+    let child = &mut probe.0;
     let stdout = child.stdout.take().context("Missing device probe stdout")?;
     let stderr = child.stderr.take().context("Missing device probe stderr")?;
     let (stdout, stderr, status) = tokio::time::timeout(timeout, async {
@@ -562,12 +580,26 @@ async fn probe_devices_with_timeout(executable: &str, timeout: Duration) -> Resu
     Ok(json!({"server_binary":executable,"devices":parse_devices(&text)}))
 }
 
-fn set_parent_death_signal(command: &mut Command) {
+struct DeviceProbe(Child);
+
+impl Drop for DeviceProbe {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(pid) = self.0.id() {
+            // TERM lets the supervisor kill and reap the native probe's group.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+    }
+}
+
+fn set_parent_death_signal(_command: &mut Command) {
     #[cfg(target_os = "linux")]
     {
         let parent = unsafe { libc::getpid() };
         unsafe {
-            command.pre_exec(move || {
+            _command.pre_exec(move || {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -674,6 +706,11 @@ mod tests {
         assert_eq!(devices[0].memory_total_mib, Some(24107));
         assert_eq!(devices[1].memory_free_mib, Some(2212));
         assert!(parse_devices("Available devices:\n(none)").is_empty());
+        let metal =
+            parse_devices("Available devices:\n  MTL0: Apple M1 (16384 MiB, 12000 MiB free)\n");
+        assert_eq!(metal[0].id, "MTL0");
+        assert_eq!(metal[0].name, "Apple M1");
+        assert_eq!(metal[0].memory_free_mib, Some(12000));
     }
 
     #[cfg(unix)]
@@ -696,7 +733,7 @@ mod tests {
         assert!(probe_devices("").await.is_err());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn timed_out_gpu_probe_is_terminated() {
         use std::os::unix::fs::PermissionsExt;
@@ -713,13 +750,15 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let error =
-            probe_devices_with_timeout(executable.to_str().unwrap(), Duration::from_millis(200))
+            probe_devices_with_timeout(executable.to_str().unwrap(), Duration::from_secs(2))
                 .await
                 .unwrap_err();
         assert!(error.to_string().contains("timed out"));
         let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
         for _ in 0..100 {
-            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

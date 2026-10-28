@@ -17,8 +17,11 @@ descendants on owner death, including compiler subprocesses. Children are spawne
 by a worker-lifetime thread: Linux's parent-death signal tracks the spawning thread,
 so an HTTP/load job ending must not terminate an otherwise UI-owned engine.
 
-`start` requires the desktop backend parent-pipe marker and Linux parent-death
-signaling. Worker startup loads metadata only; the cancellable `load` job allocates
+`start` requires the desktop backend parent-pipe marker on macOS or Linux.
+The worker watches the expected backend PID; native supervisors watch the worker
+and kill/reap their entire process group on owner death. Linux also retains
+parent-death signaling. macOS GPU probes use the same supervisor; cancellation
+sends SIGTERM so the probe group is reaped rather than orphaned. Worker startup loads metadata only; the cancellable `load` job allocates
 weights explicitly, or inference loads them on demand. Cancelling a queued job
 remains effective even if a later completion clears the global cancellation flag.
 Startup options include context (1,024..1,048,576 tokens), unified KV, separate K/V
@@ -45,7 +48,7 @@ Old-format evidence becomes historical and must be retested before adoption.
 
 `POST /v1/affect-lab/devices` accepts `server_binary`, runs only `--list-devices`,
 and returns that engine's IDs/names and optional total/free MiB. It requires the same
-UI-parent/Linux safeguard, loads no weights, is limited to ten seconds and 64 KiB
+UI-parent/macOS-or-Linux safeguard, loads no weights, is limited to ten seconds and 64 KiB
 per output stream, and kills the probe on timeout/drop/owner death. The UI does not
 query GPUs periodically. Engine inventory IDs are not `nvidia-smi` indices.
 The private proxy accepts bounded 16 MiB request bodies; inference clients use a
